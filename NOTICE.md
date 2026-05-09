@@ -1,33 +1,22 @@
-# chatgpt-web-gateway Notice
+# Notice
 
-This repository is a customized workflow and configuration layer built on top of
-the upstream **WebAI2API** project.
+本项目是基于 WebAI2API 开源项目构建的自定义工作流和配置层。
 
-## Upstream Attribution
+## 上游引用
 
-- Upstream project name: WebAI2API
-- Upstream author in package metadata and license: foxhui
-- Upstream license: MIT
-- The original `README.md`, `README_EN.md`, `CHANGELOG.md`, `Dockerfile`,
-  source tree, and `LICENSE` are preserved unless a future commit explicitly
-  documents otherwise.
+- 上游项目：WebAI2API
+- 上游许可证：MIT
+- 原始 `README.md`、`README_EN.md`、`CHANGELOG.md`、`Dockerfile`、源码目录和 `LICENSE` 均已保留
 
-The custom additions in this fork focus on using the existing ChatGPT web
-adapter as an OpenAI-compatible local gateway, including conversation reuse,
-GitHub connector workflows, deployment notes, and privacy-safe configuration
-examples.
+本项目的自定义部分聚焦于将 ChatGPT 网页适配器作为 OpenAI 兼容的本地网关使用，包括会话复用、GitHub Connector 工作流、部署说明和隐私安全的配置示例。
 
-## Third-Party Components
+## 第三方组件
 
-This project depends on the same third-party runtime stack as WebAI2API,
-including Node.js, Playwright, Camoufox, and the npm dependencies declared in
-`package.json` and lockfiles. Downloaded browser binaries, local browser
-profiles, generated SQLite databases, logs, and debug dumps are intentionally
-excluded from the public repository.
+本项目依赖与 WebAI2API 相同的运行时栈，包括 Node.js、Playwright、Camoufox 及 `package.json` 中声明的 npm 依赖。下载的浏览器二进制文件、本地浏览器 profile、生成的 SQLite 数据库、日志和 debug dump 均不包含在公开仓库中。
 
-## Privacy Boundary
+## 隐私边界
 
-Do not publish:
+不要发布以下内容：
 
 - `data/`
 - `camoufox/`
@@ -35,6 +24,5 @@ Do not publish:
 - `node_modules/`
 - `.mcp.json`
 - `.env*`
-- local start scripts containing absolute paths
-- ChatGPT session tokens, cookies, browser profiles, prompts, responses, or
-  debug screenshots
+- 包含绝对路径的本地启动脚本
+- ChatGPT session token、Cookie、浏览器 profile、prompt、响应或 debug 截图

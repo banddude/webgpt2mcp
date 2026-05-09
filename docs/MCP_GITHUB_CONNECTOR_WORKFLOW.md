@@ -1,49 +1,44 @@
-# MCP And GitHub Connector Workflow
+# MCP 与 GitHub Connector 工作流
 
-This workflow lets a local coding agent call ChatGPT through the
-OpenAI-compatible WebAI2API endpoint, while ChatGPT itself uses the GitHub
-connector authorized in the ChatGPT web session.
+本工作流让本地编码代理通过 OpenAI 兼容接口调用 ChatGPT，同时 ChatGPT 通过网页端已授权的 GitHub Connector 访问代码仓库。
 
-## Architecture
+## 架构
 
 ```text
-Local coding agent / MCP client
-  -> local MCP wrapper or OpenAI-compatible client
-  -> http://127.0.0.1:3000/v1/chat/completions
-  -> WebAI2API ChatGPT text adapter
-  -> logged-in ChatGPT browser session
-  -> ChatGPT GitHub connector
-  -> GitHub repository / PR / files
+本地编码代理 / MCP 客户端
+  → 本地 MCP Server 或 OpenAI 兼容客户端
+  → http://127.0.0.1:3000/v1/chat/completions
+  → WebAI2API ChatGPT 文本适配器
+  → 已登录的 ChatGPT 浏览器会话
+  → ChatGPT GitHub Connector
+  → GitHub 仓库 / PR / 文件
 ```
 
-The GitHub connector runs inside ChatGPT's web product. The local API only
-drives the browser session and transports prompts/responses.
+GitHub Connector 运行在 ChatGPT 网页产品内部，本地 API 仅驱动浏览器会话并传输 prompt 和响应。
 
-## What Must Be Configured Manually
+## 手动配置步骤
 
-1. Start the ChatGPT Web Gateway service.
-2. Log in to ChatGPT in the browser profile used by WebAI2API.
-3. Open ChatGPT web UI and authorize the GitHub connector.
-4. Make sure the connector has access to the target GitHub org/repo.
-5. Reuse a `conversation_url` where the connector is available, or explicitly
-   ask ChatGPT to use the connector in every prompt.
+1. 启动 ChatGPT Web Gateway 服务
+2. 在 WebAI2API 使用的浏览器 profile 中登录 ChatGPT
+3. 打开 ChatGPT 网页，授权 GitHub Connector
+4. 确保 Connector 有目标 GitHub 组织/仓库的访问权限
+5. 复用一个已开启 Connector 的 `conversation_url`，或在每次 prompt 中明确要求使用
 
-You do not need to upload browser cookies, session tokens, or local MCP config
-to GitHub.
+无需上传浏览器 Cookie、session token 或本地 MCP 配置到 GitHub。
 
-## MCP Client Configuration Shape
+## MCP 客户端配置
 
-Keep actual keys outside git. A generic local MCP wrapper can point to:
+将实际密钥放在 git 之外：
 
 ```json
 {
   "base_url": "http://127.0.0.1:3000/v1",
-  "api_key": "sk-your-webai2api-key",
+  "api_key": "YOUR_API_KEY",
   "default_model": "gpt-thinking"
 }
 ```
 
-If your MCP wrapper supports conversation metadata, pass:
+如支持会话元数据，传入：
 
 ```json
 {
@@ -51,12 +46,11 @@ If your MCP wrapper supports conversation metadata, pass:
 }
 ```
 
-## Prompt Rule
+## 提示词规则
 
-The prompt must instruct ChatGPT to use the GitHub connector. A URL by itself is
-not enough.
+prompt 中**必须**明确要求 ChatGPT 使用 GitHub Connector 读取内容，仅发送 URL 不够。
 
-Good:
+好的做法：
 
 ```text
 Use the GitHub connector enabled in this ChatGPT session to open this PR and
@@ -64,39 +58,40 @@ read changed files/diff before reviewing:
 https://github.com/owner/repo/pull/123
 ```
 
-Bad:
+不好的做法：
 
 ```text
 Review https://github.com/owner/repo/pull/123
 ```
 
-The bad version may cause ChatGPT to reason from the URL text instead of
-reading GitHub content.
+后者可能导致 ChatGPT 仅根据 URL 文本推测，而不实际读取 GitHub 内容。
 
-## Review Request Example
+## 审核请求示例
 
-```json
-{
-  "model": "gpt-thinking",
-  "conversation_url": "https://chatgpt.com/c/your-conversation-id",
-  "messages": [
-    {
-      "role": "user",
-      "content": "Use the GitHub connector enabled in this ChatGPT session to open https://github.com/owner/repo/pull/123 and read changed files/diff before reviewing. Focus on bugs, regressions, security risks, and missing tests. Cite file paths and line numbers when possible."
-    }
-  ],
-  "stream": true
-}
+```bash
+curl http://127.0.0.1:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "gpt-thinking",
+    "conversation_url": "https://chatgpt.com/c/your-conversation-id",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Use the GitHub connector in this session to open https://github.com/owner/repo/pull/123 and read changed files/diff. Focus on bugs, regressions, security risks. Cite file paths and line numbers."
+      }
+    ],
+    "stream": true
+  }'
 ```
 
-## Failure Signals
+## 失败信号
 
-Treat the connector call as failed if ChatGPT:
+如出现以下情况，说明 Connector 未正确工作：
 
-- only repeats the URL,
-- says it cannot browse or cannot access GitHub,
-- reviews from the PR title/description only,
-- gives no file paths or code-grounded findings for a non-trivial PR.
+- ChatGPT 仅重复 URL
+- 声称无法浏览或无法访问 GitHub
+- 仅根据 PR 标题/描述审核
+- 对非简单 PR 未给出文件路径或代码引用
 
-Fix by authorizing the GitHub connector in ChatGPT, checking repo permissions,
-or reusing a known-good `conversation_url`.
+解决方式：检查 GitHub Connector 授权、仓库权限，或换一个已知可用的 `conversation_url`。

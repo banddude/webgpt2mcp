@@ -9,7 +9,7 @@ runtime-libs/
 # Local runtime state. This contains API keys, browser profiles, cookies,
 # ChatGPT login sessions, prompts, responses, logs, screenshots, and SQLite DBs.
 data/
-.omc/state/
+.omc/
 
 # Local-only config and environment files
 config.yaml

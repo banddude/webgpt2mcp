@@ -1,319 +1,321 @@
-# WebAI2API
+# webgpt2mcp
 
-[简体中文](README.md) | English
+Turn ChatGPT web capabilities into MCP tools, enabling CLI coding agents like Claude Code and Cursor to call ChatGPT directly for code review, document generation, academic writing, and more — zero extra API costs by reusing your existing ChatGPT web subscription.
 
-> [!NOTE]
-> This English version is translated by **Gemini 3 Flash**.
+## How It Works
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/296a518e-c42b-4e39-8ff6-9b4381ed4f6e" width="49%" />
-  <img src="https://github.com/user-attachments/assets/bfa30ece-6947-4f18-b2c9-ccc8087b7e89" width="49%" />
-</p>
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/5b15ebd2-7593-4f0e-8561-83d6ba5d88ab" width="49%" />
-  <img src="https://github.com/user-attachments/assets/53deea29-4071-4a07-8a61-211761c5f2f7" width="49%" />
-</p>
+```text
+CLI Agent (Claude Code / Cursor)
+  → MCP tool call (chatgpt / chatgpt_sessions / chatgpt_browse)
+  → webgpt2mcp MCP Server
+  → WebAI2API (OpenAI-compatible endpoint)
+  → Logged-in ChatGPT browser session
+  → ChatGPT (with GitHub Connector / Skill system_prompt)
+  → Returns result to CLI Agent for execution
+```
 
-## 📑 Table of Contents
+The local model handles code execution and file operations; ChatGPT handles reasoning and review.
 
-- [Quick Deployment](#-quick-deployment)
-- [Quick Start](#-quick-start)
-- [Usage](#-usage)
-- [API Reference](#-api-reference)
-- [Hardware Configuration Reference](#-hardware-configuration-reference)
+## Key Features
 
----
+- **MCP Server** — Exposes `chatgpt`, `chatgpt_sessions`, and `chatgpt_browse` as MCP tools
+- **Skill Injection** — CLI Agent injects arbitrary skills into ChatGPT sessions via `system_prompt`, instantly turning them into agent-like entities
+- **Session Management** — Auto-save, smart routing (topic matching / conversation_url exact continuation), cloud sync
+- **GitHub Code Review** — Review PRs and read code through ChatGPT's GitHub Connector — no local API key needed
+- **Multi-Platform Gateway** — Built on WebAI2API, providing OpenAI-compatible endpoints for ChatGPT, Gemini, LMArena, and more
 
-## 📝 Project Introduction
+## Quick Start
 
-**WebAI2API** is a tool that converts web-based AI services into general APIs based on **Camoufox (Playwright)**. It interacts with websites like LMArena and Gemini by simulating human operations, providing interfaces compatible with the **OpenAI format**, while supporting **multi-window concurrency** and **multi-account management** (browser instance data isolation).
+### Prerequisites
 
-### ✨ Key Features
+- Node.js v20.0.0+
+- pnpm
 
-- 🤖 **Human-like Interaction**: Simulates human typing and mouse trajectories, evading automation detection through feature camouflage.
-- 🔄 **API Compatibility**: Provides standard OpenAI format interfaces, supporting streaming responses and heartbeat persistence.
-- 🚀 **Concurrency & Isolation**: Supports multi-window concurrent execution with independent proxy configurations, achieving browser-level data isolation for multiple accounts.
-- 🛡️ **Stable Protection**: Built-in task queue, load balancing, failover, error retry, and other essential functions.
-- 🎨 **Web Management**: Provides a visual management interface supporting real-time log viewing, VNC connection, adapter management, etc.
+### 1. Install & Initialize
 
-### 📋 Supported Platforms
-
-| Website | Text Gen | Image Gen | Video Gen |
-| :--- | :---: | :---: | :---: | 
-| [**LMArena**](https://lmarena.ai/) | ✅ | ✅ | 🚫 |
-| [**Gemini Enterprise Business**](https://business.gemini.google/) | ✅ | ✅ | ✅ |
-| [**Nano Banana Free**](https://nanobananafree.ai/) | 🚫 | ✅ | 🚫 |
-| [**zAI**](https://zai.is/) | ✅ | ✅ | 🚫 |
-| [**Google Gemini**](https://gemini.google.com/) | ✅ | ✅💧 | ✅💧 | 
-| [**ZenMux**](https://zenmux.ai/) | ✅ | ❌ | 🚫 | 
-| [**ChatGPT**](https://chatgpt.com/) | ✅ | ✅ | 🚫 | 
-| [**DeepSeek**](https://chat.deepseek.com/) | ✅ | 🚫 | 🚫 | 
-| [**Sora**](https://sora.chatgpt.com/) | 🚫 | 🚫 | ✅💧 | 
-| [**Google Flow**](https://labs.google/fx/zh/tools/flow) | 🚫 | ✅ | ❌ | 
-| [**Doubao**](https://www.doubao.com/) | ✅ | ✅ | ❌ | 
-| To be continued... | - | - | - | 
-
-> [!NOTE]
-> **Get full model list**: Use the `GET /v1/models` endpoint to view all available models and their details under the current configuration.
-> 
-> ✅ Supported; ❌ Not currently supported, but may be in the future; 🚫 Website does not support, future support depends on the website's status; 💧 Results contain watermarks that cannot be removed.
-
----
-
-## 🚀 Quick Deployment
-
-This project supports both **source code execution** and **Docker containerized deployment**.
-
-### 📋 Environment Requirements
-
-- **Node.js**: v20.0.0+ (ABI 115+)
-- **OS**: Windows / Linux / macOS
-- **Core Dependency**: Camoufox (automatically downloaded during installation)
-
-### 🛠️ Method 1: Manual Deployment
-
-1. **Installation & Configuration**
-   ```bash
-   # 1. Install NPM dependencies
-   pnpm install
-
-   # 2. Install precompiled dependencies like the browser
-   # ⚠️ This script requires connecting to GitHub to download resources. Use a proxy if network access is limited.
-   npm run init 
-   # Using a proxy
-   # Use -proxy to interactively input proxy configuration
-   npm run init -- -proxy=http://username:passwd@host:port
-
-   # 3. Linux Dependencies
-   # For other distributions, please check the documentation center or search online.
-   apt install -y xvfb x11vnc libgtk-3-0 libx11-xcb1 libasound2
-
-   ```
-
-2. **Start Service**
-   ```bash
-   # Standard start
-   npm start
-
-   # Linux - Start with virtual display
-   npm start -- -xvfb -vnc
-
-   # Login mode (Temporarily forces disabling headless mode and automation)
-   npm start -- -login (-xvfb -vnc)
-   ```
-
-### 🐳 Method 2: Docker Deployment
-
-> [!WARNING]
-> **Security Reminder**: 
-> - The Docker image enables the virtual display (Xvfb) and VNC service by default.
-> - Connection is possible via the virtual display section of the WebUI.
-> - **WebUI transmission is unencrypted. Please use SSH tunneling or HTTPS in public network environments.**
-
-**Start with Docker CLI**
 ```bash
-docker build -t chatgpt-web-gateway:latest .
-docker run -d --name chatgpt-web-gateway \
+pnpm install
+npm run init          # Download browser and prebuilt dependencies (requires GitHub access)
+```
+
+Use a proxy if network is restricted:
+
+```bash
+npm run init -- -proxy=http://username:passwd@host:port
+```
+
+### 2. Configuration
+
+On first run, `config.example.yaml` is automatically copied to `data/config.yaml`. For a minimal ChatGPT-only setup:
+
+```bash
+cp config.chatgpt.example.yaml data/config.yaml
+```
+
+Edit the key fields:
+
+```yaml
+server:
+  port: 3000
+  auth: sk-change-me-to-your-secure-key   # API auth key (generate with npm run genkey)
+
+backend:
+  pool:
+    instances:
+      - name: "browser_chatgpt"
+        workers:
+          - name: "chatgpt_text_worker"
+            type: chatgpt_text
+
+browser:
+  headless: false          # Set to false for initial login; true once stable
+  proxy:
+    enable: false           # Enable if ChatGPT requires a proxy
+    type: http
+    host: 127.0.0.1
+    port: 7890
+```
+
+> See [config.example.yaml](config.example.yaml) for full configuration annotations.
+
+#### Linux Server Local Start Script
+
+If your server needs extra Camoufox native library paths, create a local start script (do not commit to git):
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+export LD_LIBRARY_PATH="$ROOT/camoufox:$ROOT/runtime-libs/root/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+exec npm start
+```
+
+### 3. Start the Service
+
+```bash
+# Standard start
+npm start
+
+# Linux headless environment
+npm start -- -xvfb -vnc
+
+# First-time login mode (disables headless, manually log into ChatGPT)
+npm start -- -login
+```
+
+On first use, complete ChatGPT login via the Web UI (`http://localhost:3000`) — connect to the virtual display, log into ChatGPT in the browser, and send a test message to confirm it works.
+
+For public servers, use an SSH tunnel:
+
+```bash
+ssh -L 3000:127.0.0.1:3000 user@server
+# Then access http://localhost:3000 locally
+```
+
+> Session-token injection scripts handle sensitive cookies and are not included in the public repo. Keep them outside git or use placeholder-only examples.
+
+### 4. Docker Deployment
+
+```bash
+docker build -t webgpt2mcp .
+docker run -d --name webgpt2mcp \
   -p 3000:3000 \
   -v "$(pwd)/data:/app/data" \
   --shm-size=2gb \
-  chatgpt-web-gateway:latest
+  webgpt2mcp
 ```
 
-**Start with Docker Compose**
+Or with Docker Compose:
+
 ```bash
 docker-compose up -d
 ```
 
----
+> The Docker image enables Xvfb virtual display and VNC by default. Connect via the WebUI virtual display panel. Use SSH tunneling or HTTPS for public networks.
 
-## ⚡ Quick Start
+## MCP Server
 
-### 1. Adjust Configuration File
+### Client Configuration
 
-On first run, the program will copy the configuration file from `config.example.yaml` to `data/config.yaml`.
+Add to your Claude Code MCP config:
 
-**Changes to the configuration file require a program restart to take effect!**
-
-```yaml
-server:
-  # Listening port
-  port: 3000
-  # Authentication API Token (can be generated using npm run genkey)
-  # This configuration applies to both API endpoints and the WebUI
-  auth: sk-change-me-to-your-secure-key
+```json
+{
+  "mcpServers": {
+    "webgpt2mcp": {
+      "command": "node",
+      "args": ["/path/to/webgpt2mcp/mcp-server/index.mjs"],
+      "env": {
+        "CHATGPT_API_URL": "http://127.0.0.1:3000",
+        "CHATGPT_API_KEY": "sk-your-key"
+      }
+    }
+  }
+}
 ```
 
-> [!TIP]
-> **Full Configuration Details**: Please refer to the detailed comments in [config.example.yaml](config.example.yaml), or visit the [WebAI2API Documentation Center](https://foxhui.github.io/WebAI2API/en/) for a complete configuration guide.
+### Tools
 
-### 2. Access Web Management Interface
+| Tool | Description |
+| :--- | :--- |
+| `chatgpt` | Send a message to ChatGPT and get a reply; supports session routing and system_prompt injection |
+| `chatgpt_sessions` | Manage sessions: list, view history, delete (local + cloud), cloud sync |
+| `chatgpt_browse` | Have ChatGPT visit a URL and answer questions about the page content |
 
-After the service starts, open your browser and visit:
+### Session Routing Rules
+
+1. Pass `conversation_url` → Exactly continue the specified session
+2. No `conversation_url` but pass `topic` → Auto-match the most recent session with the same topic; create new if no match
+3. Pass neither → Create a new session
+
+### Model Selection
+
+| Model | Use Case |
+| :--- | :--- |
+| `gpt-instant` | Fast response (default) |
+| `gpt-thinking` | Complex reasoning, deep analysis |
+| `gpt-pro` | High-quality output |
+
+## Skill Injection
+
+A local CLI Agent (Claude Code, etc.) can inject a custom `system_prompt` through the MCP tool's parameter, giving the ChatGPT session a specific role and capability — effectively turning a plain ChatGPT conversation into a skilled agent on demand.
+
+Workflow:
+
+1. CLI Agent defines a skill (e.g., a code reviewer or academic writer system_prompt)
+2. Calls the `chatgpt` tool with `system_prompt` + task content
+3. ChatGPT reasons according to the injected role and returns results
+4. CLI Agent handles actual code execution and file operations locally
+
+ChatGPT acts as a zero-cost "thinking layer"; the local model handles execution — each does what it does best.
+
+## GitHub Connector Workflow
+
+Through the ChatGPT web GitHub Connector, ChatGPT can directly read GitHub repos, PRs, and code files — enabling zero-API-key code review.
+
+### Prerequisites
+
+1. Start this gateway service and complete ChatGPT login
+2. Authorize the GitHub Connector in the ChatGPT web UI, ensuring access to target repos
+3. Reuse a conversation URL where the Connector is active, or explicitly request its use in each prompt
+
+### Prompt Rule
+
+The prompt **must explicitly ask** ChatGPT to use the GitHub Connector to read content — sending a URL alone is not enough:
+
+```text
+# Good
+Use the GitHub connector in this session to open this PR and read changed
+files/diff before reviewing:
+https://github.com/owner/repo/pull/123
+
+# Bad (ChatGPT may reason from the URL text alone without actually reading code)
+Review https://github.com/owner/repo/pull/123
 ```
-http://localhost:3000
-```
 
-> [!TIP]
-> **Remote Access**: Replace `localhost` with your server's IP address.
-> **API Token**: The authentication key configured in `auth` of the configuration file.
-> **Security Suggestion**: For public network environments, it is recommended to configure HTTPS using Nginx/Caddy or access via SSH tunnel.
+### Review Request Example
 
-### 3. Initial Account Login
-
-> [!IMPORTANT]
-> **The following initialization steps must be completed on first use**:
-
-1. **Connect to Virtual Display**:
-   - Linux/Docker: Connect in the "Virtual Display" section of the WebUI.
-   - Windows: Operate directly in the browser window that pops up.
-
-2. **Complete Account Login**:
-   - Manually log in to the required AI website account (account requirements can be found in the WebUI's adapter management).
-   - Send any message in the input box to trigger and complete human-machine verification (if required).
-   - Agree to terms of service or新手 guides (if required).
-   - Ensure there are no more initial use related obstructions.
-
-3. **SSH Tunnel Connection Example** (Recommended for public servers):
-   ```bash
-   # Run in your local terminal to map the server's WebUI to local
-   ssh -L 3000:127.0.0.1:3000 root@Server_IP
-   
-   # Then access locally
-   # WebUI: http://localhost:3000
-   ```
-
----
-
-## 📖 Usage
-
-### Running Mode Description
-
-> [!NOTE]
-> **Regarding Headful/Headless Mode**:
-> - **Headful Mode** (Default): Displays the browser window, convenient for debugging and manual intervention.
-> - **Headless Mode**: Runs in the background, saves resources but interfaces cannot be viewed, and may be detected by websites.
-> 
-> **Recommendation**: To reduce risk, **it is strongly recommended to run in non-headless mode for the long term** (or use virtual display Xvfb).
-
----
-
-## 🔌 API Reference
-
-> [!TIP]
-> **Detailed Documentation**: Please visit the [WebAI2API Documentation Center](https://foxhui.github.io/WebAI2API/en/) for a more comprehensive configuration guide and interface description.
-
-### 1. OpenAI Compatible API
-
-> [!WARNING]
-> **Concurrency Limits and Streaming Keep-alive Recommendations**
-> 
-> This project is implemented by simulating real browser operations, and processing time may vary. When the backlog of tasks exceeds the configured amount, non-streaming requests will be rejected directly.
-> 
-> **💡 Highly Recommended to enable Streaming Mode**: The server will send keep-alive heartbeat packets, allowing for infinite queuing to avoid timeouts.
-
-#### Text Chat
-
-**Endpoint**: `POST /v1/chat/completions`
-
-**Request Example**:
 ```bash
-curl http://localhost:3000/v1/chat/completions \
+curl http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
-    "model": "gemini-3-pro",
+    "model": "gpt-thinking",
+    "conversation_url": "https://chatgpt.com/c/your-conversation-id",
     "messages": [
-      {"role": "user", "content": "Hello, please introduce yourself"}
+      {
+        "role": "user",
+        "content": "Use the GitHub connector in this session to open https://github.com/owner/repo/pull/123 and read changed files/diff. Focus on bugs, regressions, security risks. Cite file paths and line numbers."
+      }
     ],
     "stream": true
   }'
 ```
 
-#### Multimodal Requests (Text-to-Image / Image-to-Image)
+### Failure Signals
 
-**Supported Image Formats**:
-- **Formats**: PNG, JPEG, GIF, WebP
-- **Quantity**: Max 10 images (specific limits vary by website)
-- **Data Format**: Must use Base64 Data URL format
-- **Auto Conversion**: The server automatically converts all images to JPG to ensure compatibility.
+The Connector is not working correctly if ChatGPT: only repeats the URL, claims it cannot browse or access GitHub, reviews from the title/description only, or gives no file paths or code references for a non-trivial PR. Fix by checking Connector authorization or switching to a known-working `conversation_url`.
 
-#### Parameter Description
+## Conversation Reuse
 
-| Parameter | Type | Required | Description |
-| :--- | :--- | :---: | :--- |
-| `model` | string | ✅ | Model name, available list can be retrieved via `/v1/models` |
-| `stream` | boolean | Rec. | Whether to enable streaming response, includes heartbeat keep-alive mechanism |
+The gateway supports reusing an existing ChatGPT session via `conversation_url` to maintain context continuity:
 
-> [!NOTE]
-> **Regarding Streaming Keep-alive (Heartbeat)**
->
-> To prevent long connection timeouts, the system provides two keep-alive modes (configurable):
-> 1. **Comment Mode (Default/Recommended)**: Sends `:keepalive` comments, compliant with SSE standards, best compatibility.
-> 2. **Content Mode**: Sends data packets with empty content, only for special clients that must receive JSON data to reset timeouts.
-
-### 2. Get Model List
-
-**Endpoint**: `GET /v1/models`
-
-**Request Example**:
 ```bash
-curl http://localhost:3000/v1/models \
-  -H "Authorization: Bearer YOUR_API_KEY"
+curl http://127.0.0.1:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "gpt-instant",
+    "conversation_url": "https://chatgpt.com/c/your-conversation-id",
+    "messages": [{"role": "user", "content": "Continue the previous discussion"}],
+    "stream": true
+  }'
 ```
 
-### 3. Get Cookies
+API responses include `conversation_url` — save it for follow-up requests to continue the same session.
 
-**Description**: Utilize the project's automatic renewal feature to get the latest Cookies for use with other tools.
+## Thinking Model
 
-**Endpoint**: `GET /v1/cookies`
+Use `"model": "gpt-thinking"` to invoke ChatGPT's Thinking model for complex reasoning tasks.
 
-**Parameters**:
-- `name` (Optional): Browser instance name, defaults to `default`.
-- `domain` (Optional): Filter Cookies for a specific domain.
+If you encounter response parsing issues, enable debug dump for diagnostics (local use only — output contains prompts and screenshots, never publish):
 
-**Request Example**:
-```bash
-# Get cookies for a specific instance and domain
-curl "http://localhost:3000/v1/cookies?name=browser_default&domain=lmarena.ai" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+```yaml
+backend:
+  adapter:
+    chatgpt_text:
+      debugDump: true    # Outputs to data/debug-chatgpt/
 ```
 
+## API Reference
+
+The gateway provides standard OpenAI-compatible endpoints usable by any OpenAI API client.
+
+### Chat Completions
+
+```bash
+curl http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "gpt-instant",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+```
+
+> It is recommended to enable `stream: true` — the server sends keepalive heartbeat packets to prevent long-wait timeouts.
+
+### Other Endpoints
+
+| Endpoint | Description |
+| :--- | :--- |
+| `GET /v1/models` | List currently available models |
+| `GET /v1/cookies` | Get browser cookies (filterable by instance name and domain) |
+| `GET /admin/chatgpt/conversations` | List ChatGPT cloud conversations |
+| `GET /admin/chatgpt/conversation/:id` | Get full history of a specific conversation |
+
+## Hardware Requirements
+
+| Resource | Minimum | Recommended |
+| :--- | :--- | :--- |
+| CPU | 1 core | 2+ cores |
+| RAM | 1 GB | 2+ GB |
+| Disk | 2 GB free | 5+ GB |
+
+## Documentation
+
+- [Configuration Guide](docs/CONFIGURATION.md)
+- [MCP & GitHub Connector Workflow](docs/MCP_GITHUB_CONNECTOR_WORKFLOW.md)
+- [Open Source Checklist](docs/OPEN_SOURCE_CHECKLIST.md)
+- [GPT Code Skill](skills/gpt-code.md)
+
+## License
+
+[MIT License](LICENSE)
+
+> **Disclaimer**: This project is for educational purposes only. The authors bear no responsibility for any consequences arising from its use (including but not limited to account suspension). Please comply with the Terms of Service of relevant websites.
+
 ---
 
-## 📊 Hardware Configuration Reference
-
-| Resource | Minimum | Recommended (Single Instance) | Recommended (Multi-Instance) |
-| :--- | :--- | :--- | :--- |
-| **CPU** | 1 Core | 2 Cores+ | 2 Cores+ |
-| **RAM** | 1 GB | 2 GB+ | 4 GB+ |
-| **Disk** | 2 GB available | 5 GB+ | 7 GB+ |
-
-**Measured Environment Performance** (All with single browser instance):
-- **Oracle Free Tier** (1C1G, Debian 12): Resource-intensive, quite laggy, only for trial or light use.
-- **Aliyun Lightweight Cloud** (2C2G, Debian 11): Runs smoothly but instances may still lag; used for project development and testing.
-
----
-
-## 📄 License and Disclaimer
-
-This project is open-sourced under the [MIT License](LICENSE).
-
-> [!CAUTION]
-> **Disclaimer**
-> 
-> This project is for educational and exchange purposes only. The author and the project are not responsible for any consequences (including but not limited to account suspension) caused by using this project. Please comply with the Terms of Service (ToS) of the relevant websites and services, and ensure proper backup of relevant data.
-
----
-
-## 📋 Changelog
-
-View the full version history and update details at [CHANGELOG.md](CHANGELOG.md).
-
-### 🕰️ Historical Version Note
-
-This project has migrated from Puppeteer to Camoufox to handle increasingly complex anti-bot detection mechanisms. Older code based on Puppeteer has been archived to the `puppeteer-edition` branch for reference only and is **no longer updated or maintained**.
-
----
-
-**Thanks to sites like LMArena and Gemini for providing AI services!** 🎉
+Built on the WebAI2API open source project. See [NOTICE.md](NOTICE.md) for details.
