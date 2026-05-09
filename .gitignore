@@ -1,0 +1,38 @@
+node_modules/
+webui/node_modules/
+webui/dist/
+
+# Runtime browser, downloaded binaries, and generated native libraries
+camoufox/
+runtime-libs/
+
+# Local runtime state. This contains API keys, browser profiles, cookies,
+# ChatGPT login sessions, prompts, responses, logs, screenshots, and SQLite DBs.
+data/
+.omc/state/
+
+# Local-only config and environment files
+config.yaml
+.env
+.env.*
+.mcp.json
+
+# Logs and temporary files
+*.log
+*.pid
+*.tmp
+tmp/
+temp/
+test/
+
+# Databases and user data snapshots
+*.db
+*.sqlite
+*.sqlite3
+*.zip
+*.tar
+*.tar.gz
+
+# Local helper scripts with machine-specific absolute paths.
+start.sh
+admin-fixed.sh

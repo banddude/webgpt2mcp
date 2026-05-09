@@ -1,0 +1,56 @@
+logLevel: info
+
+server:
+  port: 3000
+  # Use a private value with at least 10 characters.
+  auth: sk-your-webai2api-key
+  keepalive:
+    mode: "comment"
+  imageMarkdown: false
+
+backend:
+  pool:
+    strategy: least_busy
+    failover:
+      enabled: true
+      maxRetries: 2
+    waitTimeout: 120000
+
+    instances:
+      - name: "browser_chatgpt"
+        workers:
+          - name: "chatgpt_text_worker"
+            type: chatgpt_text
+
+  adapter:
+    chatgpt_text:
+      # Set true only when debugging locally. It may write prompts, DOM text,
+      # network payload summaries, and screenshots to data/debug-chatgpt/.
+      debugDump: false
+      # Optional default conversation:
+      # conversationUrl: "https://chatgpt.com/c/your-conversation-id"
+      # Optional: open temporary chat by default.
+      # temporaryChat: false
+
+queue:
+  queueBuffer: 2
+  imageLimit: 5
+
+browser:
+  path: ""
+  # Use false for first login/debugging. Use true only after login is stable.
+  headless: false
+  humanizeCursor: false
+  fission: false
+  cssInject:
+    animation: true
+    filter: true
+    font: false
+
+  proxy:
+    enable: false
+    type: http
+    host: 127.0.0.1
+    port: 7890
+    # user: username
+    # passwd: password

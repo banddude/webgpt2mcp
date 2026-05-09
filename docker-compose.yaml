@@ -1,0 +1,12 @@
+services:
+  chatgpt-web-gateway:
+    image: chatgpt-web-gateway:latest
+    build: .
+    container_name: chatgpt-web-gateway
+    restart: unless-stopped
+    ports:
+      - "3000:3000"  # API + WebUI
+    volumes:
+      - ./data:/app/data  # 数据和配置持久化，config.yaml 会自动生成到此目录
+    shm_size: '2gb'
+    init: true

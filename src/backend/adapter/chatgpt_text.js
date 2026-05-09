@@ -1,0 +1,1090 @@
+/**
+ * @fileoverview ChatGPT 文本生成适配器
+ */
+
+import fs from 'fs/promises';
+import path from 'path';
+import {
+    sleep,
+    humanType,
+    safeClick,
+    uploadFilesViaChooser
+} from '../engine/utils.js';
+import {
+    normalizePageError,
+    waitForInput,
+    gotoWithCheck
+} from '../utils/index.js';
+import { logger } from '../../utils/logger.js';
+
+// --- 配置常量 ---
+const TARGET_URL = 'https://chatgpt.com/'; // 基础URL
+const INPUT_SELECTOR = '.ProseMirror';
+const DEBUG_DIR = path.join(process.cwd(), 'data', 'debug-chatgpt');
+
+function normalizeConversationUrl(url) {
+    if (!url || typeof url !== 'string') return null;
+    try {
+        const parsed = new URL(url);
+        if (parsed.hostname !== 'chatgpt.com') return null;
+        if (!parsed.pathname.startsWith('/c/')) return null;
+        return parsed.toString();
+    } catch {
+        return null;
+    }
+}
+
+function extractVisibleText(parts) {
+    if (!Array.isArray(parts)) return '';
+    return parts
+        .map(part => typeof part === 'string' ? part : '')
+        .join('');
+}
+
+function isVisibleAssistantMessage(message) {
+    if (message?.author?.role !== 'assistant') return false;
+    if (!Array.isArray(message?.content?.parts)) return false;
+
+    // Thinking models may emit analysis/commentary before the final answer.
+    // Keep those out of the API response and track only user-visible text.
+    const hiddenChannels = new Set(['analysis', 'commentary', 'thinking']);
+    if (hiddenChannels.has(message.channel)) return false;
+
+    const contentType = message.content?.content_type;
+    return !contentType || contentType === 'text' || contentType === 'multimodal_text';
+}
+
+function cleanDomText(text) {
+    return (text || '')
+        .replace(/\n?ChatGPT can make mistakes\.[\s\S]*$/i, '')
+        .replace(/^Thought for .+\n+/i, '')
+        .trim();
+}
+
+function isPlaceholderDomText(text) {
+    const normalized = cleanDomText(text).replace(/\s+/g, ' ').trim();
+    if (!normalized) return true;
+    return /^(Thinking|Thinking\.\.\.|思考中|正在思考|思考)$/i.test(normalized);
+}
+
+async function extractAssistantTextFromContainer(container) {
+    const body = container.locator('.markdown, [data-testid="markdown"], [data-message-content-part="assistant"]');
+    const bodyCount = await body.count().catch(() => 0);
+    for (let i = bodyCount - 1; i >= 0; i--) {
+        const text = cleanDomText(await body.nth(i).innerText({ timeout: 2000 }).catch(() => ''));
+        if (text && !isPlaceholderDomText(text)) return text;
+    }
+
+    const fallbackText = cleanDomText(await container.innerText({ timeout: 2000 }).catch(() => ''));
+    if (fallbackText && !isPlaceholderDomText(fallbackText)) return fallbackText;
+    return '';
+}
+
+async function extractLatestAssistantTextFromDom(page, baselineCount = 0) {
+    const assistantMessages = page.locator('[data-message-author-role="assistant"]');
+    const count = await assistantMessages.count().catch(() => 0);
+
+    for (let i = count - 1; i >= baselineCount; i--) {
+        const text = await extractAssistantTextFromContainer(assistantMessages.nth(i));
+        if (text) return text;
+    }
+
+    // Turns 兜底仅在 baselineCount === 0 时使用，避免会话继续时返回旧消息
+    if (baselineCount === 0) {
+        const turns = page.locator('[data-testid^="conversation-turn-"]');
+        const turnCount = await turns.count().catch(() => 0);
+        for (let i = turnCount - 1; i >= 0; i--) {
+            const assistantInTurn = turns.nth(i).locator('[data-message-author-role="assistant"]');
+            if ((await assistantInTurn.count().catch(() => 0)) === 0) continue;
+            const text = await extractAssistantTextFromContainer(assistantInTurn.first());
+            if (text) return text;
+        }
+    }
+
+    return '';
+}
+
+async function waitForAssistantTextFromDom(page, baselineCount, timeoutMs, meta = {}) {
+    const start = Date.now();
+    let latestText = '';
+    let stableSince = 0;
+    let loggedOnce = false;
+    let effectiveBaseline = baselineCount;
+    let prevCount = -1;
+    let pageRerendered = false;
+
+    while (Date.now() - start < timeoutMs) {
+        const locator = page.locator('[data-message-author-role="assistant"]');
+        const count = await locator.count().catch(() => 0);
+
+        // 检测页面重渲染：assistant 数量从 >0 降到 0（stream_handoff 后页面重建）
+        if (prevCount > 0 && count === 0) {
+            logger.info('适配器', `DOM 检测到页面重渲染 (assistant ${prevCount}->0)，重置 baseline 为 0`, meta);
+            effectiveBaseline = 0;
+            pageRerendered = true;
+            latestText = '';
+            stableSince = 0;
+        }
+        prevCount = count;
+
+        // 诊断日志：每 15 秒输出一次 DOM 状态
+        const elapsed = Date.now() - start;
+        if (elapsed > 0 && elapsed % 15000 < 700) {
+            const turnLocator = page.locator('[data-testid^="conversation-turn-"]');
+            const turnCount = await turnLocator.count().catch(() => 0);
+            const markdownLocator = page.locator('.markdown');
+            const mdCount = await markdownLocator.count().catch(() => 0);
+            const articleLocator = page.locator('main article');
+            const articleCount = await articleLocator.count().catch(() => 0);
+            logger.info('适配器', `DOM 轮询诊断 [${Math.round(elapsed / 1000)}s]: assistant=${count} baseline=${effectiveBaseline} turns=${turnCount} markdown=${mdCount} articles=${articleCount} rerendered=${pageRerendered}`, meta);
+
+            // 首次发现新 assistant 元素时，尝试读取原始文本
+            if (!loggedOnce && count > effectiveBaseline) {
+                loggedOnce = true;
+                const rawText = await locator.nth(count - 1).innerText({ timeout: 3000 }).catch(() => '<inner text failed>');
+                logger.info('适配器', `DOM 最新 assistant 原始文本 (前200字): ${String(rawText).slice(0, 200)}`, meta);
+                const bodyLocator = locator.nth(count - 1).locator('.markdown');
+                const bodyCount = await bodyLocator.count().catch(() => 0);
+                if (bodyCount > 0) {
+                    const bodyText = await bodyLocator.first().innerText({ timeout: 3000 }).catch(() => '<body inner text failed>');
+                    logger.info('适配器', `DOM .markdown 原始文本 (前200字): ${String(bodyText).slice(0, 200)}`, meta);
+                } else {
+                    logger.info('适配器', `DOM .markdown 子元素数量: ${bodyCount}`, meta);
+                }
+            }
+        }
+
+        if (count > effectiveBaseline) {
+            const text = await extractLatestAssistantTextFromDom(page, effectiveBaseline);
+            if (text && text !== latestText) {
+                latestText = text;
+                stableSince = Date.now();
+                loggedOnce = false;  // 重置，以便下次诊断时记录新内容
+            }
+
+            if (latestText && Date.now() - stableSince >= 1800) {
+                return latestText;
+            }
+        }
+
+        await sleep(450, 650);
+    }
+
+    return latestText;
+}
+
+async function getConversationUrl(page) {
+    if (page.url().includes('/c/')) return page.url();
+    await page.waitForURL(url => url.href.includes('/c/'), { timeout: 5000 }).catch(() => { });
+    return page.url().includes('/c/') ? page.url() : null;
+}
+
+function createDebugState(meta, modelId, prompt, targetUrl) {
+    return {
+        id: meta?.id || `debug-${Date.now()}`,
+        startedAt: new Date().toISOString(),
+        modelId,
+        targetUrl,
+        prompt,
+        events: [],
+        network: [],
+        sse: [],
+        domSnapshots: [],
+        result: null,
+        error: null
+    };
+}
+
+function shouldDumpDebug(config) {
+    const adapterConfig = config?.backend?.adapter?.chatgpt_text || {};
+    return adapterConfig.debugDump === true || process.env.CHATGPT_DEBUG_DUMP === '1';
+}
+
+function pushLimited(list, item, limit = 200) {
+    list.push(item);
+    if (list.length > limit) list.shift();
+}
+
+function summarizeSseData(data) {
+    const message = data?.v?.message;
+    const patches = Array.isArray(data?.v)
+        ? data.v.slice(0, 8).map(p => ({
+            o: p.o,
+            p: p.p,
+            valueType: typeof p.v,
+            valuePreview: typeof p.v === 'string' ? p.v.slice(0, 300) : undefined,
+            partsPreview: Array.isArray(p.v) ? extractVisibleText(p.v).slice(0, 300) : undefined
+        }))
+        : undefined;
+
+    return {
+        type: data?.type,
+        o: data?.o,
+        p: data?.p,
+        valueType: typeof data?.v,
+        valuePreview: typeof data?.v === 'string' ? data.v.slice(0, 300) : undefined,
+        message: message ? {
+            id: message.id,
+            role: message.author?.role,
+            channel: message.channel,
+            contentType: message.content?.content_type,
+            partsPreview: extractVisibleText(message.content?.parts).slice(0, 500),
+            status: message.status
+        } : undefined,
+        patches
+    };
+}
+
+async function captureDomSnapshot(page, label, baselineCount = 0) {
+    return await page.evaluate(({ label, baselineCount }) => {
+        const clean = text => (text || '').replace(/\s+/g, ' ').trim();
+        const attrs = el => {
+            const result = {};
+            for (const name of ['data-testid', 'data-message-author-role', 'data-message-id', 'aria-label', 'role', 'class']) {
+                const value = el.getAttribute(name);
+                if (value) result[name] = value.slice(0, 300);
+            }
+            return result;
+        };
+        const collect = (selector, limit = 20) => Array.from(document.querySelectorAll(selector))
+            .slice(-limit)
+            .map((el, index) => ({
+                index,
+                tag: el.tagName,
+                attrs: attrs(el),
+                text: clean(el.innerText).slice(0, 1500),
+                html: el.outerHTML.slice(0, 3000)
+            }));
+
+        return {
+            label,
+            at: new Date().toISOString(),
+            url: location.href,
+            title: document.title,
+            baselineCount,
+            counts: {
+                assistantRole: document.querySelectorAll('[data-message-author-role="assistant"]').length,
+                userRole: document.querySelectorAll('[data-message-author-role="user"]').length,
+                turns: document.querySelectorAll('[data-testid^="conversation-turn-"]').length,
+                markdown: document.querySelectorAll('.markdown, [data-testid="markdown"]').length,
+                articles: document.querySelectorAll('article').length
+            },
+            assistantRole: collect('[data-message-author-role="assistant"]'),
+            turns: collect('[data-testid^="conversation-turn-"]'),
+            markdown: collect('.markdown, [data-testid="markdown"]'),
+            articles: collect('article'),
+            bodyText: clean(document.body?.innerText || '').slice(0, 8000)
+        };
+    }, { label, baselineCount }).catch(e => ({
+        label,
+        at: new Date().toISOString(),
+        error: e.message
+    }));
+}
+
+async function writeDebugDump(debug, page, meta, label, baselineCount = 0) {
+    if (!debug) return null;
+    try {
+        await fs.mkdir(DEBUG_DIR, { recursive: true });
+        debug.finishedAt = new Date().toISOString();
+        debug.currentUrl = page.url();
+        debug.domSnapshots.push(await captureDomSnapshot(page, label, baselineCount));
+
+        const screenshotPath = path.join(DEBUG_DIR, `${debug.id}-${label}.png`);
+        await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => { });
+        debug.screenshotPath = screenshotPath;
+
+        const dumpPath = path.join(DEBUG_DIR, `${debug.id}.json`);
+        await fs.writeFile(dumpPath, JSON.stringify(debug, null, 2));
+        logger.info('适配器', `ChatGPT 调试 dump 已写入: ${dumpPath}`, meta);
+        return dumpPath;
+    } catch (e) {
+        logger.warn('适配器', `写入 ChatGPT 调试 dump 失败: ${e.message}`, meta);
+        return null;
+    }
+}
+
+/**
+ * 通过 UI 选择模型
+ * @param {import('playwright-core').Page} page - 页面对象
+ * @param {string} codeName - 模型 codeName
+ * @param {object} meta - 日志元数据
+ * @returns {Promise<boolean>} 是否成功选择了模型
+ */
+async function selectModel(page, codeName, meta = {}) {
+    try {
+        // 1. 点击 Model selector 按钮
+        const modelSelectorBtn = page.getByRole('button', { name: /^Model selector/ });
+        const btnExists = await modelSelectorBtn.count();
+        if (btnExists === 0) {
+            logger.debug('适配器', '未找到模型选择器按钮，跳过选择模型', meta);
+            return false;
+        }
+
+        await modelSelectorBtn.waitFor({ timeout: 5000 });
+        await safeClick(page, modelSelectorBtn, { bias: 'button' });
+        await sleep(300, 500);
+
+        // 2. 检查是否有 Legacy models 选项
+        const legacyMenuItem = page.getByRole('menuitem', { name: /^Legacy models/ });
+        const legacyExists = await legacyMenuItem.count();
+        if (legacyExists > 0) {
+            logger.debug('适配器', '发现 Legacy models 选项，正在点击...', meta);
+            await safeClick(page, legacyMenuItem, { bias: 'button' });
+            await sleep(300, 500);
+        }
+
+        // 3. 查找匹配 codeName 开头的 menuitem 或 menuitemradio
+        let targetMenuItem = page.getByRole('menuitemradio', { name: new RegExp(`^${codeName}`, 'i') });
+        let targetExists = await targetMenuItem.count();
+        if (targetExists === 0) {
+            targetMenuItem = page.getByRole('menuitem', { name: new RegExp(`^${codeName}`, 'i') });
+            targetExists = await targetMenuItem.count();
+        }
+
+        if (targetExists > 0) {
+            logger.info('适配器', `正在选择模型: ${codeName}`, meta);
+            await safeClick(page, targetMenuItem.first(), { bias: 'button' });
+            return true;
+        } else {
+            logger.debug('适配器', `未找到模型 ${codeName}，使用默认模型`, meta);
+            // 点击空白区域关闭菜单
+            await page.keyboard.press('Escape');
+            return false;
+        }
+    } catch (e) {
+        logger.warn('适配器', `选择模型失败: ${e.message}`, meta);
+        // 尝试关闭菜单
+        await page.keyboard.press('Escape').catch(() => { });
+        return false;
+    }
+}
+
+/**
+ * 执行文本生成任务
+ * @param {object} context - 浏览器上下文 { page, config }
+ * @param {string} prompt - 提示词
+ * @param {string[]} imgPaths - 图片路径数组
+ * @param {string} [modelId] - 模型 ID
+ * @param {object} [meta={}] - 日志元数据
+ * @returns {Promise<{text?: string, error?: string}>}
+ */
+async function generate(context, prompt, imgPaths, modelId, meta = {}) {
+    const { page, config } = context;
+    const waitTimeout = config?.backend?.pool?.waitTimeout ?? 120000;
+    const sendBtnLocator = page.getByRole('button', { name: 'Send prompt' });
+    let debug = null;
+    let debugResponseHandler = null;
+    let rawNetworkHandler = null;
+    let wsHandler = null;
+    let assistantCountBefore = 0;
+    let conversationUrl = null;
+
+    try {
+        const useTemp = config?.backend?.adapter?.chatgpt_text?.temporaryChat || false;
+        conversationUrl = normalizeConversationUrl(meta?.conversationUrl) ||
+            normalizeConversationUrl(config?.backend?.adapter?.chatgpt_text?.conversationUrl);
+        const targetUrl = conversationUrl ||
+            (useTemp ? 'https://chatgpt.com/?temporary-chat=true' : 'https://chatgpt.com/'); // 感谢 @zhongjianhua163 提供临时对话方案
+        if (shouldDumpDebug(config)) {
+            debug = createDebugState(meta, modelId, prompt, targetUrl);
+            debugResponseHandler = (response) => {
+                const url = response.url();
+                if (!/chatgpt\.com|backend-api|conversation|stream|message|thread/i.test(url)) return;
+                const req = response.request();
+                pushLimited(debug.network, {
+                    at: new Date().toISOString(),
+                    url,
+                    method: req.method(),
+                    resourceType: req.resourceType(),
+                    status: response.status(),
+                    contentType: response.headers()['content-type'] || ''
+                });
+            };
+            page.on('response', debugResponseHandler);
+        }
+
+        logger.info('适配器', conversationUrl ? '继续已有会话...' : '开启新会话...', meta);
+
+        // 快速复用：如果页面已在目标 URL 且输入框可见，跳过导航（省 ~18s）
+        const currentUrl = page.url();
+        const inputVisible = await page.locator(INPUT_SELECTOR).isVisible().catch(() => false);
+        const canSkipNav = inputVisible && (
+            // 新对话：页面在首页
+            (!conversationUrl && (currentUrl === 'https://chatgpt.com/' || currentUrl === 'https://chatgpt.com')) ||
+            // 继续会话：页面已在目标会话
+            (conversationUrl && currentUrl === conversationUrl)
+        );
+
+        if (canSkipNav) {
+            logger.info('适配器', conversationUrl
+                ? `页面已在目标会话，跳过导航 (${conversationUrl})`
+                : '页面已就绪，跳过导航 (快速复用)', meta);
+        } else {
+            await gotoWithCheck(page, targetUrl);
+        }
+
+        // 1. 等待输入框加载
+        await waitForInput(page, INPUT_SELECTOR, { click: false });
+
+        // 2. 选择模型
+        if (modelId) {
+            const modelConfig = manifest.models.find(m => m.id === modelId);
+            if (modelConfig && modelConfig.codeName) {
+                await selectModel(page, modelConfig.codeName, meta);
+            } else {
+                logger.info('适配器', `未指定模型或未知模型 (${modelId})，跳过模型选择`, meta);
+            }
+        }
+
+        // 用于捕获 stream_handoff 后的 conversation ID
+        let capturedConversationId = null;
+
+        // === 全量网络监控：扒所有数据，捕获每个响应的 body ===
+        rawNetworkHandler = async (response) => {
+            const url = response.url();
+            if (!url.includes('chatgpt.com')) return;
+            const req = response.request();
+            const method = req.method();
+            const status = response.status();
+            const contentType = response.headers()['content-type'] || '';
+
+            // 非后端 API 的静态资源跳过
+            if (/\.(js|css|png|jpg|ico|woff2?|svg|gif|webp)(\?|$)/i.test(url)) return;
+
+            // 对所有 backend-api 响应，记录 URL 和 body 预览
+            if (url.includes('backend-api')) {
+                logger.info('全量监控', `${method} ${status} ${url.slice(0, 150)} | ${contentType}`, meta);
+
+                // 从任意 backend-api URL 中尽早提取 conversation ID
+                if (!capturedConversationId) {
+                    const convMatch = url.match(/\/conversation\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/);
+                    if (convMatch) {
+                        capturedConversationId = convMatch[1];
+                        logger.info('全量监控', `★ conversation ID (URL): ${capturedConversationId}`, meta);
+                    }
+                }
+
+                // 尝试读取 body
+                try {
+                    const body = await response.text();
+
+                    // 捕获 stream_status 内容
+                    if (url.includes('/stream_status')) {
+                        const match = url.match(/\/conversation\/([0-9a-f-]+)\//);
+                        if (match && !capturedConversationId) {
+                            capturedConversationId = match[1];
+                            logger.info('全量监控', `★ conversation ID: ${capturedConversationId}`, meta);
+                        }
+                        logger.info('全量监控', `★ stream_status BODY: ${body.slice(0, 1000)}`, meta);
+                    }
+
+                    // 捕获 conversations 列表
+                    if (url.includes('/conversations?') && method === 'GET') {
+                        try {
+                            const data = JSON.parse(body);
+                            if (Array.isArray(data?.items) && data.items.length > 0) {
+                                const c = data.items[0];
+                                capturedConversationId = c.id;
+                                logger.info('全量监控', `★ 从列表更新 conversation ID: ${c.id} title=${c.title}`, meta);
+                            }
+                        } catch {}
+                    }
+
+                    // SSE 数据详细记录
+                    if (contentType.includes('text/event-stream')) {
+                        const lines = body.split('\n').filter(l => l.startsWith('data: '));
+                        logger.info('全量监控', `★ SSE 共 ${lines.length} 行`, meta);
+                        for (let i = 0; i < Math.min(lines.length, 50); i++) {
+                            const d = lines[i].slice(6).trim();
+                            if (d === '[DONE]') { logger.info('全量监控', `  SSE[${i}]: [DONE]`, meta); continue; }
+                            try {
+                                const p = JSON.parse(d);
+                                const msg = p.v?.message;
+                                const s = { type: p.type, channel: msg?.channel, role: msg?.author?.role, ct: msg?.content?.content_type, op: p.o, path: p.p };
+                                Object.keys(s).forEach(k => s[k] === undefined && delete s[k]);
+                                // 有 parts 内容时也记录
+                                if (Array.isArray(msg?.content?.parts)) {
+                                    s.parts = JSON.stringify(msg.content.parts).slice(0, 200);
+                                }
+                                if (Array.isArray(p.v)) {
+                                    s.patches = p.v.slice(0, 5).map(x => ({ o: x.o, p: x.p, v: String(x.v || '').slice(0, 100) }));
+                                }
+                                logger.info('全量监控', `  SSE[${i}]: ${JSON.stringify(s)}`, meta);
+                            } catch {
+                                logger.info('全量监控', `  SSE[${i}](raw): ${d.slice(0, 300)}`, meta);
+                            }
+                        }
+                    } else {
+                        // 非 SSE 响应：记录 body 前 500 字节
+                        logger.info('全量监控', `  BODY: ${body.slice(0, 500)}`, meta);
+                    }
+                } catch (e) {
+                    logger.info('全量监控', `  读取 body 失败: ${e.message}`, meta);
+                }
+            }
+        };
+        page.on('response', rawNetworkHandler);
+
+        // 3. 上传图片 (双击 Add files and more 按钮)
+        if (imgPaths && imgPaths.length > 0) {
+            logger.info('适配器', `开始上传 ${imgPaths.length} 张图片...`, meta);
+            const expectedUploads = imgPaths.length;
+            let uploadedCount = 0;
+            let processedCount = 0;
+
+            logger.debug('适配器', '双击添加文件按钮...', meta);
+            const addFilesBtn = page.getByRole('button', { name: 'Add files and more' });
+
+            await uploadFilesViaChooser(page, addFilesBtn, imgPaths, {
+                clickAction: 'dblclick',  // 使用双击
+                uploadValidator: (response) => {
+                    const url = response.url();
+                    if (response.status() === 200) {
+                        // 上传请求
+                        if (url.includes('backend-api/files') && !url.includes('process_upload_stream')) {
+                            uploadedCount++;
+                            logger.debug('适配器', `图片上传进度: ${uploadedCount}/${expectedUploads}`, meta);
+                            return false;
+                        }
+                        // 处理完成请求
+                        if (url.includes('backend-api/files/process_upload_stream')) {
+                            processedCount++;
+                            logger.info('适配器', `图片处理进度: ${processedCount}/${expectedUploads}`, meta);
+
+                            if (processedCount >= expectedUploads) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            }, meta);
+        }
+
+        // 3. 输入提示词
+        logger.info('适配器', '输入提示词...', meta);
+        await safeClick(page, INPUT_SELECTOR, { bias: 'input' });
+        await humanType(page, INPUT_SELECTOR, prompt);
+
+        // 4. 先启动 SSE 监听，再发送提示词（避免竞态）
+        logger.info('适配器', '监听 SSE 流获取文本...', meta);
+
+        let textContent = '';
+        let isComplete = false;
+        let targetMessageId = null;  // 只追踪最终可见的 assistant 文本消息
+        assistantCountBefore = await page.locator('[data-message-author-role="assistant"]')
+            .count()
+            .catch(() => 0);
+        if (debug) {
+            debug.assistantCountBefore = assistantCountBefore;
+            debug.domSnapshots.push(await captureDomSnapshot(page, 'before-send', assistantCountBefore));
+        }
+
+        // Thinking 模型 stream_handoff 支持
+        let streamHandoffDetected = false;
+        let streamHandoffResolve;
+        const streamHandoffPromise = new Promise(resolve => { streamHandoffResolve = resolve; });
+
+        // WebSocket 帧监控（thinking 模型通过 WebSocket 传输内容）
+        let wsCapturedText = '';
+        let wsFinalTextFound = false;  // 标记是否已找到完整 parts 文本
+        wsHandler = (ws) => {
+            const wsUrl = ws.url();
+            if (!wsUrl.includes('chatgpt.com')) return;
+            logger.info('WebSocket', `连接: ${wsUrl.slice(0, 150)}`, meta);
+            ws.on('framereceived', frame => {
+                const text = typeof frame.payload === 'string' ? frame.payload : '';
+                if (!text) return;
+                logger.info('WebSocket', `帧 (${text.length} 字节): ${text.slice(0, 2000)}`, meta);
+
+                // 从 WebSocket 帧解析 assistant 文本，支持多帧累积
+                try {
+                    const items = JSON.parse(text);
+                    const entries = Array.isArray(items) ? items : [items];
+                    for (const entry of entries) {
+                        const catchups = entry?.reply?.catchups || [];
+                        for (const catchup of catchups) {
+                            const payload = catchup?.payload?.payload;
+                            if (!payload) continue;
+                            // 处理 catchup 中的 encoded_item（SSE 格式）
+                            if (payload.encoded_item && !wsFinalTextFound) {
+                                const lines = payload.encoded_item.split('\n');
+                                for (const line of lines) {
+                                    if (!line.startsWith('data: ')) continue;
+                                    const d = line.slice(6).trim();
+                                    if (d === '[DONE]' || !d) continue;
+                                    try {
+                                        const sseData = JSON.parse(d);
+                                        // 查找 assistant 完整可见文本（parts 数组）
+                                        if (sseData.v?.message?.author?.role === 'assistant') {
+                                            const parts = sseData.v.message.content?.parts;
+                                            if (Array.isArray(parts)) {
+                                                const t = parts.filter(p => typeof p === 'string').join('');
+                                                if (t && !isPlaceholderDomText(t)) {
+                                                    wsCapturedText = t;
+                                                    wsFinalTextFound = true;
+                                                }
+                                            }
+                                        }
+                                    } catch {}
+                                }
+                            }
+                            // 处理 stream-item 中的 nested encoded_item（delta 增量）
+                            const nestedItems = payload.items || [];
+                            for (const ni of nestedItems) {
+                                if (!ni.encoded_item) continue;
+                                if (wsFinalTextFound) break;  // 已有完整文本，跳过
+                                const nLines = ni.encoded_item.split('\n');
+                                for (const nl of nLines) {
+                                    if (!nl.startsWith('data: ')) continue;
+                                    const nd = nl.slice(6).trim();
+                                    if (nd === '[DONE]' || !nd) continue;
+                                    try {
+                                        const nsse = JSON.parse(nd);
+                                        const patches = Array.isArray(nsse.v) ? nsse.v : [];
+                                        for (const patch of patches) {
+                                            if (patch.o === 'append' && typeof patch.v === 'string') {
+                                                wsCapturedText += patch.v;
+                                            } else if (patch.o === 'add' || patch.o === 'replace') {
+                                                if (Array.isArray(patch.v)) {
+                                                    const t = patch.v.filter(p => typeof p === 'string').join('');
+                                                    if (t && !isPlaceholderDomText(t)) {
+                                                        wsCapturedText = t;
+                                                        wsFinalTextFound = true;
+                                                    }
+                                                } else if (typeof patch.v === 'string' && patch.v.trim()) {
+                                                    wsCapturedText = patch.v;
+                                                }
+                                            }
+                                        }
+                                    } catch {}
+                                }
+                            }
+                        }
+                    }
+                } catch {}
+            });
+        };
+        page.on('websocket', wsHandler);
+
+        const responsePromise = page.waitForResponse(async (response) => {
+            const url = response.url();
+            if (!url.includes('backend-api/f/conversation') &&
+                !url.includes('backend-api/conversation')) return false;
+            if (response.request().method() !== 'POST') return false;
+            if (response.status() !== 200) return false;
+
+            try {
+                const body = await response.text();
+                const lines = body.split('\n');
+
+                for (const line of lines) {
+                    // 跳过空行和事件行
+                    if (!line.startsWith('data: ')) continue;
+
+                    const dataStr = line.slice(6).trim();
+                    if (dataStr === '[DONE]') {
+                        if (streamHandoffDetected || (targetMessageId && textContent.trim())) {
+                            isComplete = true;
+                            if (streamHandoffDetected && streamHandoffResolve) {
+                                streamHandoffResolve('handoff');
+                                streamHandoffResolve = null;
+                            }
+                        }
+                        continue;
+                    }
+
+                    try {
+                        const data = JSON.parse(dataStr);
+
+                        if (data.type === 'stream_handoff') {
+                            streamHandoffDetected = true;
+                            logger.info('适配器', '检测到 stream_handoff (thinking 模型)', meta);
+                        }
+
+                        if (debug) {
+                            pushLimited(debug.sse, {
+                                at: new Date().toISOString(),
+                                url,
+                                summary: summarizeSseData(data)
+                            }, 500);
+                        }
+
+                        // 检测目标消息。gpt-thinking 的最终文本结构不总是
+                        // channel: "final" + content_type: "text"，所以这里按
+                        // “assistant 的可见文本”识别，并排除 thinking/commentary。
+                        if (isVisibleAssistantMessage(data.v?.message)) {
+                            targetMessageId = data.v.message.id;
+                            textContent = extractVisibleText(data.v.message.content.parts);
+                        }
+
+                        // 以下所有内容累积都必须在 targetMessageId 设置之后才执行
+                        // 避免误收 commentary / thinking 频道的内容
+                        if (!targetMessageId) continue;
+
+                        // 累积 delta 内容 (append 操作，顶层 path)
+                        if (data.o === 'append' && data.p === '/message/content/parts/0' && data.v) {
+                            textContent += data.v;
+                        }
+
+                        // patch 操作中的 append (数组格式)
+                        if (Array.isArray(data.v)) {
+                            for (const patch of data.v) {
+                                if (patch.p === '/message/content/parts/0' && typeof patch.v === 'string') {
+                                    if (patch.o === 'append') {
+                                        textContent += patch.v;
+                                    } else if (patch.o === 'add' || patch.o === 'replace') {
+                                        textContent = patch.v;
+                                    }
+                                }
+                                if (patch.p === '/message/content/parts' && Array.isArray(patch.v)) {
+                                    if (patch.o === 'add' || patch.o === 'replace') {
+                                        textContent = extractVisibleText(patch.v);
+                                    }
+                                }
+                                // 仅在 targetMessageId 存在时检查完成
+                                if (patch.p === '/message/status' && patch.v === 'finished_successfully') {
+                                    isComplete = true;
+                                }
+                            }
+                        }
+
+                        // message_stream_complete 表示完成（仅在有内容时）
+                        if (data.type === 'message_stream_complete' && targetMessageId && textContent.trim()) {
+                            isComplete = true;
+                        }
+                    } catch {
+                        // 忽略解析错误
+                    }
+                }
+
+                return isComplete;
+            } catch {
+                return false;
+            }
+        }, { timeout: waitTimeout });
+
+        // 5. 发送提示词
+        logger.debug('适配器', '发送提示词...', meta);
+        await page.keyboard.press('Enter');
+        if (debug) {
+            pushLimited(debug.events, {
+                at: new Date().toISOString(),
+                event: 'prompt-sent',
+                url: page.url()
+            });
+        }
+
+        logger.info('适配器', '等待生成结果...', meta);
+
+        // 6. 并行等待 SSE、页面 DOM 和 stream_handoff 流程
+        let sseError = null;
+        const sseTextPromise = responsePromise
+            .then(() => textContent.trim() ? textContent.trim() : new Promise(() => { }))
+            .catch((e) => {
+                sseError = e;
+                return new Promise(() => { });
+            });
+
+        const domTextPromise = waitForAssistantTextFromDom(page, assistantCountBefore, waitTimeout, meta);
+
+        // stream_handoff 专用处理：并行等待 WebSocket / convId，convId 一到立即走 API
+        const handoffTextPromise = streamHandoffPromise.then(async () => {
+            const t0 = Date.now();
+            logger.info('适配器', 'stream_handoff 流程启动，并行等待 WebSocket 和会话 ID...', meta);
+
+            // 并行竞争：谁先到用谁
+            // 通道1: WebSocket 文本（200ms 轮询，最多 3s）
+            const wsPromise = new Promise(async (resolve) => {
+                const deadline = Date.now() + 3000;
+                while (Date.now() < deadline) {
+                    if (wsCapturedText) return resolve({ type: 'ws', text: wsCapturedText });
+                    await sleep(200, 200);
+                }
+                resolve({ type: 'ws', text: wsCapturedText || '' });
+            });
+
+            // 通道2: 会话 ID（200ms 轮询，最多 10s）
+            const convIdPromise = new Promise((resolve) => {
+                const start = Date.now();
+                const check = () => {
+                    if (capturedConversationId) return resolve(capturedConversationId);
+                    if (Date.now() - start > 10000) return resolve(null);
+                    setTimeout(check, 200);
+                };
+                check();
+            });
+
+            // 同时启动两个通道，谁先有结果就行动
+            const wsRace = wsPromise.then(async (r) => {
+                if (r.text) {
+                    logger.info('适配器', `stream_handoff: WebSocket 解析到文本 (${r.text.length} 字符, ${Date.now() - t0}ms)`, meta);
+                    return r.text;
+                }
+                return null;  // WS 超时无内容，等 convId 通道
+            });
+
+            const apiRace = convIdPromise.then(async (convId) => {
+                if (!convId) return null;
+
+                logger.info('适配器', `stream_handoff: convId 到达，轮询 API (${convId}, ${Date.now() - t0}ms)`, meta);
+                try {
+                    const accessToken = await page.evaluate(async () => {
+                        try {
+                            const res = await fetch('/api/auth/session');
+                            if (!res.ok) return null;
+                            const data = await res.json();
+                            return data.accessToken || null;
+                        } catch { return null; }
+                    });
+
+                    const apiUrl = `https://chatgpt.com/backend-api/conversation/${convId}`;
+                    const hdrs = { 'Accept': 'application/json' };
+                    if (accessToken) hdrs['Authorization'] = `Bearer ${accessToken}`;
+
+                    // 轮询 API：每 2s 查一次，最多 25s（ChatGPT 思考模型可能需要 10-20s）
+                    const apiDeadline = Date.now() + 25000;
+                    let attempt = 0;
+                    while (Date.now() < apiDeadline) {
+                        attempt++;
+                        const apiResponse = await page.evaluate(async ({ url, hdrs }) => {
+                            const res = await fetch(url, { headers: hdrs });
+                            if (!res.ok) return { error: `HTTP ${res.status}` };
+                            return await res.json();
+                        }, { url: apiUrl, hdrs });
+
+                        if (apiResponse && !apiResponse.error && apiResponse.mapping) {
+                            let latestText = '';
+                            let latestTs = 0;
+                            for (const [, node] of Object.entries(apiResponse.mapping)) {
+                                const msg = node?.message;
+                                if (msg?.author?.role === 'assistant' &&
+                                    msg?.content?.content_type === 'text' &&
+                                    (msg?.create_time || 0) > latestTs) {
+                                    const parts = msg.content.parts;
+                                    const text = Array.isArray(parts) ? parts.join('') : '';
+                                    if (text && !isPlaceholderDomText(text)) {
+                                        latestText = text;
+                                        latestTs = msg.create_time || 0;
+                                    }
+                                }
+                            }
+                            if (latestText) {
+                                logger.info('适配器', `stream_handoff: API 第${attempt}次获取成功 (${latestText.length} 字符, ${Date.now() - t0}ms)`, meta);
+                                return latestText;
+                            }
+                        }
+                        logger.info('适配器', `stream_handoff: API 第${attempt}次无文本，2s 后重试 (${Date.now() - t0}ms)`, meta);
+                        await sleep(2000, 2000);
+                    }
+                    logger.info('适配器', `stream_handoff: API 轮询超时，尝试导航 (${Date.now() - t0}ms)`, meta);
+                } catch (apiErr) {
+                    logger.warn('适配器', `stream_handoff: API 失败: ${apiErr.message}`, meta);
+                }
+
+                // 兜底：导航到会话页面读取 DOM
+                logger.info('适配器', `stream_handoff: 导航到 /c/${convId} (${Date.now() - t0}ms)`, meta);
+                try {
+                    await gotoWithCheck(page, `https://chatgpt.com/c/${convId}`);
+                } catch (navErr) {
+                    logger.warn('适配器', `stream_handoff: 导航失败: ${navErr.message}`, meta);
+                    return '';
+                }
+                const text = await waitForAssistantTextFromDom(page, 0, 30000, meta);
+                if (text) {
+                    logger.info('适配器', `stream_handoff: DOM 获取到文本 (${text.length} 字符, ${Date.now() - t0}ms)`, meta);
+                } else {
+                    logger.warn('适配器', `stream_handoff: DOM 未找到文本 (${Date.now() - t0}ms)`, meta);
+                }
+                return text || '';
+            });
+
+            // WS 通道先到先返回，否则等 API 通道
+            const wsResult = await wsRace;
+            if (wsResult) return wsResult;
+
+            const apiResult = await apiRace;
+            return apiResult || '';
+        }).catch(e => {
+            logger.warn('适配器', `stream_handoff 流程异常: ${e.message}`, meta);
+            return '';
+        });
+
+        textContent = await Promise.race([sseTextPromise, domTextPromise, handoffTextPromise]);
+
+        if (!textContent || textContent.trim() === '') {
+            logger.warn('适配器', 'SSE 未解析到文本，尝试从页面 DOM 读取最后一条回复', meta);
+            await page.waitForTimeout(1200);
+            textContent = await extractLatestAssistantTextFromDom(page, assistantCountBefore);
+        }
+
+        // 终极兜底：通过 ChatGPT 后端 API 直接获取对话内容（使用 Bearer token）
+        if ((!textContent || textContent.trim() === '') && capturedConversationId) {
+            logger.info('适配器', `尝试通过 API 获取对话内容: ${capturedConversationId}`, meta);
+            try {
+                // 获取 access token（ChatGPT 使用 Auth0，需 Bearer token）
+                const accessToken = await page.evaluate(async () => {
+                    try {
+                        const res = await fetch('/api/auth/session');
+                        if (!res.ok) return null;
+                        const data = await res.json();
+                        return data.accessToken || null;
+                    } catch { return null; }
+                });
+                logger.info('适配器', `access token: ${accessToken ? '已获取' : '未获取'}`, meta);
+
+                const apiUrl = `https://chatgpt.com/backend-api/conversation/${capturedConversationId}`;
+                const headers = { 'Accept': 'application/json' };
+                if (accessToken) {
+                    headers['Authorization'] = `Bearer ${accessToken}`;
+                } else {
+                    const cookies = await page.context().cookies(['https://chatgpt.com']);
+                    headers['Cookie'] = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+                }
+
+                const apiResponse = await page.evaluate(async ({ url, hdrs }) => {
+                    const res = await fetch(url, { headers: hdrs });
+                    if (!res.ok) return { error: `HTTP ${res.status}` };
+                    return await res.json();
+                }, { url: apiUrl, hdrs: headers });
+
+                if (apiResponse && !apiResponse.error) {
+                    const messages = apiResponse?.mapping || {};
+                    let latestAssistantText = '';
+                    let latestTimestamp = 0;
+                    for (const [, node] of Object.entries(messages)) {
+                        const msg = node?.message;
+                        if (msg?.author?.role === 'assistant' &&
+                            msg?.content?.content_type === 'text' &&
+                            (msg?.create_time || 0) > latestTimestamp) {
+                            const parts = msg.content.parts;
+                            const text = Array.isArray(parts) ? parts.join('') : '';
+                            if (text && !isPlaceholderDomText(text)) {
+                                latestAssistantText = text;
+                                latestTimestamp = msg.create_time || 0;
+                            }
+                        }
+                    }
+                    if (latestAssistantText) {
+                        textContent = latestAssistantText;
+                        logger.info('适配器', `API 获取成功: ${textContent.length} 字符`, meta);
+                    } else {
+                        logger.info('适配器', 'API 返回对话但未找到 assistant 文本', meta);
+                    }
+                } else {
+                    logger.info('适配器', `API 请求失败: ${apiResponse?.error || 'unknown'}`, meta);
+                }
+            } catch (apiErr) {
+                logger.warn('适配器', `API 获取对话失败: ${apiErr.message}`, meta);
+            }
+        }
+
+        if (!textContent || textContent.trim() === '') {
+            if (sseError) {
+                const pageError = normalizePageError(sseError, meta);
+                if (pageError) return pageError;
+            }
+            logger.warn('适配器', '回复内容为空', meta);
+            return { error: '回复内容为空' };
+        }
+
+        logger.info('适配器', `已获取文本内容 (${textContent.length} 字符)`, meta);
+
+        // 捕获当前会话 URL
+        const convUrl = await getConversationUrl(page);
+        if (convUrl) {
+            logger.info('适配器', `会话 URL: ${convUrl}`, meta);
+        }
+
+        logger.info('适配器', '文本生成完成，任务完成', meta);
+        if (debug) {
+            debug.result = {
+                textLength: textContent.trim().length,
+                textPreview: textContent.trim().slice(0, 1000),
+                conversationUrl: convUrl
+            };
+            await writeDebugDump(debug, page, meta, 'success', assistantCountBefore);
+        }
+        return { text: textContent.trim(), conversationUrl: convUrl };
+
+    } catch (err) {
+        // 顶层错误处理
+        const pageError = normalizePageError(err, meta);
+        if (debug) {
+            debug.error = {
+                message: err.message,
+                normalized: pageError || null
+            };
+            await writeDebugDump(debug, page, meta, 'error', assistantCountBefore);
+        }
+        if (pageError) return pageError;
+
+        logger.error('适配器', '生成任务失败', { ...meta, error: err.message });
+        return { error: `生成任务失败: ${err.message}` };
+    } finally {
+        if (debugResponseHandler) {
+            page.off('response', debugResponseHandler);
+        }
+        if (rawNetworkHandler) {
+            page.off('response', rawNetworkHandler);
+        }
+        if (wsHandler) {
+            page.off('websocket', wsHandler);
+        }
+        // 后台导航回首页，为下一个新请求预热（不阻塞当前响应）
+        // 仅在新对话后预热，会话复用时保留当前页面以便继续
+        const currentUrl = page.url();
+        if (!conversationUrl && (currentUrl.includes('/c/') || currentUrl.includes('/codex/'))) {
+            page.goto('https://chatgpt.com/', { waitUntil: 'commit', timeout: 30000 })
+                .then(() => logger.info('适配器', '后台预热：已导航回首页', meta))
+                .catch(() => {});  // 忽略错误，不影响响应
+        }
+    }
+}
+
+/**
+ * 适配器 manifest
+ */
+export const manifest = {
+    id: 'chatgpt_text',
+    displayName: 'ChatGPT (文本生成)',
+    description: '使用 ChatGPT 官网生成文本，支持多模型切换和图片上传。需要已登录的 ChatGPT 账户，若需要选择模型，请使用会员账号 (包含 K12 教室认证账号)。',
+
+    // 配置项模式
+    configSchema: [
+        {
+            key: 'temporaryChat',
+            label: '临时对话',
+            type: 'boolean',
+            default: false,
+            note: '开启后将使用临时对话模式 (?temporary-chat=true)'
+        },
+        {
+            key: 'conversationUrl',
+            label: '固定会话 URL',
+            type: 'string',
+            default: '',
+            note: '填写 https://chatgpt.com/c/... 后将默认在该网页会话中继续对话'
+        }
+    ],
+
+    // 入口 URL
+    getTargetUrl(config, workerConfig) {
+        const useTemp = config?.backend?.adapter?.chatgpt_text?.temporaryChat || false;
+        return useTemp ? 'https://chatgpt.com/?temporary-chat=true' : 'https://chatgpt.com/';
+    },
+
+    // 模型列表
+    models: [
+        { id: 'gpt-instant', codeName: 'Instant', imagePolicy: 'optional', type: 'text' },
+        { id: 'gpt-thinking', codeName: 'Thinking', imagePolicy: 'optional', type: 'text' },
+        { id: 'gpt-pro', codeName: 'Pro', imagePolicy: 'optional', type: 'text' }
+    ],
+
+    // 无需导航处理器
+    navigationHandlers: [],
+
+    // 核心文本生成方法
+    generate
+};
