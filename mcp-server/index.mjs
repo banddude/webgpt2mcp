@@ -83,6 +83,28 @@ async function recordSession({ conversation_url, model, prompt, response_content
 // API 调用
 // ==========================================
 
+async function trySteerActiveConversation({ conversation_url, prompt, timeout = 30000 }) {
+    if (!conversation_url || !prompt) return null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+        const response = await fetch(`${API_URL}/admin/chatgpt/steer`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${API_KEY}`,
+            },
+            body: JSON.stringify({ conversation_url, prompt }),
+            signal: controller.signal,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (response.status === 409 && data?.error === 'worker_busy_on_different_conversation') return null;
+        return data;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function callChatGPT({ model = 'gpt-instant', messages, conversation_url, timeout = 300000 }) {
     const body = { model, messages };
     if (conversation_url) body.conversation_url = conversation_url;
@@ -133,7 +155,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             name: 'chatgpt',
             description: `向 ChatGPT 发送消息并获取回复，自动保存会话记录。
 会话路由规则（按优先级）：
-1. 传 conversation_url → 精确继续指定会话
+1. 传 conversation_url → 精确继续指定会话；若该会话正在生成，则自动中途 steer，必要时先 Stop answering 再提交新指令
 2. 不传 conversation_url 但传 topic → 自动匹配同 topic 的最近会话，无匹配则新建
 3. 都不传 → 创建新会话
 
@@ -152,7 +174,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                         description: '模型选择: gpt-instant 最快，gpt-thinking 用于复杂推理',
                         default: 'gpt-instant',
                     },
-                    conversation_url: { type: 'string', description: '已有会话 URL，传入则继续该会话。不传则创建新会话。' },
+                    conversation_url: { type: 'string', description: '已有会话 URL，传入则继续该会话。若会话正在生成，会自动 steer/中断后提交新指令。不传则创建新会话。' },
                     system_prompt: { type: 'string', description: '系统提示词，设定角色和上下文（可选）' },
                     topic: { type: 'string', description: '会话主题标签，用于后续查找（可选）' },
                 },
@@ -164,7 +186,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: `管理 ChatGPT 会话：列表、查看完整对话历史、删除（本地+云端）。
 操作说明：
 - list: 列出最近会话，显示主题、消息数、首条预览
-- history: 查看指定会话的完整本地对话记录（user/assistant 逐条展示）
+- history: 从 ChatGPT 云端读取指定会话的完整对话记录（user/assistant 逐条展示）
 - delete: 删除指定会话。delete_cloud=true 时同步删除 ChatGPT 云端会话
 - clear: 清空所有本地会话记录
 - sync: 同步云端状态。清理本地中已从云端删除的会话；pull_cloud=true 时同时拉取云端新会话
@@ -227,6 +249,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (args.system_prompt) messages.push({ role: 'system', content: args.system_prompt });
             messages.push({ role: 'user', content: args.prompt });
 
+            // Control-path preflight: if the exact target conversation is already
+            // streaming, steer it directly through the browser instead of entering the
+            // generation queue behind the response we are trying to interrupt.
+            if (convUrl) {
+                const steer = await trySteerActiveConversation({
+                    conversation_url: convUrl,
+                    prompt: args.prompt,
+                });
+                if (steer?.success && steer?.active) {
+                    await recordSession({
+                        conversation_url: convUrl,
+                        model: args.model,
+                        prompt: args.prompt,
+                        response_content: '',
+                        topic,
+                    });
+                    return {
+                        content: [{ type: 'text', text: `Steered active ChatGPT response (${steer.mode}).\n\n[conversation: ${convUrl}]` }],
+                        _meta: { conversation_url: convUrl, steered: true, steer_mode: steer.mode },
+                    };
+                }
+            }
+
             const data = await callChatGPT({
                 model: args.model || 'gpt-instant',
                 messages,
@@ -251,23 +296,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (name === 'chatgpt_sessions') {
             const action = args.action || 'list';
 
-            // 查看完整对话历史
+            // 查看 ChatGPT 云端完整对话历史
             if (action === 'history') {
                 if (!args.conversation_url) {
                     return { content: [{ type: 'text', text: '请提供 conversation_url 指定要查看的会话。' }], isError: true };
                 }
-                const store = await loadSessions();
-                const session = store.sessions.find(s => s.conversation_url === args.conversation_url);
-                if (!session) {
-                    return { content: [{ type: 'text', text: `未找到会话: ${args.conversation_url}` }], isError: true };
+
+                const convId = args.conversation_url.match(/\/c\/([0-9a-f-]+)/i)?.[1];
+                if (!convId) {
+                    return { content: [{ type: 'text', text: `无效的 ChatGPT 会话 URL: ${args.conversation_url}` }], isError: true };
                 }
-                const header = `[${session.model}] ${session.topic || '无主题'} | ${session.message_count}轮对话 | ${session.last_used?.replace('T', ' ').slice(0, 16)}`;
-                const msgs = (session.messages || []).map(m => {
-                    const tag = m.role === 'user' ? '👤 User' : '🤖 Assistant';
-                    const time = m.time?.replace('T', ' ').slice(11, 16) || '';
-                    return `[${time}] ${tag}:\n${m.content}`;
+
+                const cloudResp = await fetch(`${API_URL}/admin/chatgpt/conversation/${convId}`, {
+                    headers: { 'Authorization': `Bearer ${API_KEY}` },
                 });
-                return { content: [{ type: 'text', text: `${header}\n${'─'.repeat(40)}\n${msgs.join('\n\n')}` }] };
+                let cloudData;
+                try {
+                    cloudData = await cloudResp.json();
+                } catch {
+                    cloudData = null;
+                }
+                if (!cloudResp.ok || !cloudData || !Array.isArray(cloudData.messages)) {
+                    const detail = cloudData?.error?.message || cloudData?.error || cloudData?.message || `HTTP ${cloudResp.status}`;
+                    return { content: [{ type: 'text', text: `读取 ChatGPT 云端会话失败: ${detail}` }], isError: true };
+                }
+
+                const messages = cloudData.messages;
+                const header = `[cloud] ${cloudData.title || '无主题'} | ${messages.length} messages`;
+                const body = messages.map((m, index) => {
+                    const role = m.role === 'user' ? 'User' : 'Assistant';
+                    const timestamp = m.create_time
+                        ? new Date(m.create_time * 1000).toISOString()
+                        : '';
+                    const model = m.model ? ` | model: ${m.model}` : '';
+                    return `${index + 1}. ${role}${timestamp ? ` | ${timestamp}` : ''}${model}\n${m.text || ''}`;
+                });
+                return { content: [{ type: 'text', text: `${header}\n${'─'.repeat(40)}\n${body.join('\n\n')}` }] };
             }
 
             // 删除指定会话

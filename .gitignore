@@ -36,3 +36,15 @@ test/
 # Local helper scripts with machine-specific absolute paths.
 start.sh
 admin-fixed.sh
+
+# webgpt2mcp MCP/OAuth runtime state (NEVER COMMIT)
+mcp-server/sessions.json
+oauth-store.json
+oauth-admin-token
+data/oauth-store.json
+data/oauth-admin-token
+*.bak-*
+*.bak
+
+# Local publish/deployment scratch
+.deploy-local/

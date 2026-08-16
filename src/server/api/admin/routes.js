@@ -598,6 +598,93 @@ export function createAdminRouter(context) {
                 return;
             }
 
+            // POST /admin/chatgpt/steer - bypass the generation queue to steer an active stream
+            if (method === 'POST' && pathname === '/chatgpt/steer') {
+                const body = await readBody(req);
+                const conversationUrl = body.conversation_url || body.conversationUrl;
+                const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+                const convMatch = typeof conversationUrl === 'string'
+                    ? conversationUrl.match(/^https:\/\/chatgpt\.com\/c\/([0-9a-f-]+)\/?$/i)
+                    : null;
+                if (!convMatch || !prompt) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation_url and prompt are required' });
+                    return;
+                }
+
+                let poolContext = queueManager?.getPoolContext?.();
+                if (!poolContext) poolContext = await queueManager?.initializePool?.();
+                const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                if (!page) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                    return;
+                }
+
+                // If this browser is not already on the target conversation, only navigate
+                // when the worker is idle. Navigating a busy worker away from its own task
+                // would corrupt that in-flight generation.
+                if (page.url().replace(/\/$/, '') !== conversationUrl.replace(/\/$/, '')) {
+                    const q = queueManager.getStatus();
+                    if (q.processing > 0) {
+                        sendJson(res, 409, { success: false, active: false, error: 'worker_busy_on_different_conversation' });
+                        return;
+                    }
+                    await page.goto(conversationUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                    await page.locator('.ProseMirror').waitFor({ state: 'visible', timeout: 30000 });
+                }
+
+                const convId = convMatch[1];
+                const streamState = await page.evaluate(async (id) => {
+                    try {
+                        const r = await fetch(`/backend-api/conversation/${id}/stream_status`, { credentials: 'include' });
+                        return r.ok ? await r.json() : { http: r.status };
+                    } catch (e) { return { error: e.message }; }
+                }, convId);
+
+                const stopButton = page.locator('[data-testid="stop-button"]');
+                const stopVisible = await stopButton.isVisible().catch(() => false);
+                if (streamState?.status !== 'IS_STREAMING' && !stopVisible) {
+                    sendJson(res, 200, { success: false, active: false, stream_status: streamState?.status || null });
+                    return;
+                }
+
+                const composer = page.locator('.ProseMirror');
+                await composer.fill(prompt);
+                await page.waitForTimeout(150);
+                const sendButton = page.locator('[data-testid="send-button"]');
+                let sendVisible = await sendButton.isVisible().catch(() => false);
+                let sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
+                let mode = 'native';
+
+                if (!sendEnabled) {
+                    mode = 'interrupt';
+                    if (await stopButton.isVisible().catch(() => false)) {
+                        await stopButton.click();
+                        await page.waitForSelector('[data-testid="stop-button"]', { state: 'hidden', timeout: 15000 }).catch(() => { });
+                    }
+                    await page.waitForTimeout(250);
+                    const current = await composer.innerText().catch(() => '');
+                    if (!current.includes(prompt)) await composer.fill(prompt);
+                    sendVisible = await sendButton.isVisible().catch(() => false);
+                    sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
+                }
+
+                if (sendEnabled) {
+                    await sendButton.click();
+                } else {
+                    await composer.press('Enter');
+                }
+
+                logger.info('Admin', `Steered active ChatGPT conversation (${mode}): ${convId}`);
+                sendJson(res, 200, {
+                    success: true,
+                    active: true,
+                    mode,
+                    conversation_url: conversationUrl,
+                    stream_status_before: streamState?.status || null
+                });
+                return;
+            }
+
             // ==================== 请求历史 ====================
 
             // GET /admin/chatgpt/conversations - 列出最近的 ChatGPT 会话
@@ -679,14 +766,17 @@ export function createAdminRouter(context) {
                             if (!msg || !msg.content) continue;
                             const role = msg.author?.role;
                             if (role !== 'user' && role !== 'assistant') continue;
-                            let text = '';
-                            if (msg.content.content_type === 'text') {
-                                text = msg.content.parts?.join('') || '';
-                            } else if (msg.content.content_type === 'model_editable_context') {
-                                continue;
-                            } else {
-                                text = JSON.stringify(msg.content);
-                            }
+                            // Return conversational text only. ChatGPT's cloud graph also
+                            // contains internal reasoning/tool-call/code nodes that are not part of
+                            // the visible chat transcript and must not be surfaced as conversation
+                            // history.
+                            if (role === 'assistant' && ['analysis', 'thinking'].includes(msg.channel)) continue;
+                            const contentType = msg.content.content_type;
+                            if (contentType !== 'text' && contentType !== 'multimodal_text') continue;
+                            const parts = Array.isArray(msg.content.parts) ? msg.content.parts : [];
+                            const text = parts
+                                .map(part => typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : ''))
+                                .join('');
                             if (!text.trim()) continue;
                             messages.push({
                                 id: msg.id,

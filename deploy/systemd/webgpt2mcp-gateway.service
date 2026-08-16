@@ -1,0 +1,17 @@
+[Unit]
+Description=webgpt2mcp Streamable HTTP MCP Gateway
+After=webgpt2mcp.service
+Requires=webgpt2mcp.service
+PartOf=webgpt2mcp.service
+
+[Service]
+Type=simple
+User=__RUN_USER__
+Group=__RUN_GROUP__
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__INSTALL_DIR__/gateway/node_modules/.bin/supergateway --stdio __INSTALL_DIR__/run-mcp.sh --outputTransport streamableHttp --port 17842 --streamableHttpPath /mcp --healthEndpoint /healthz --logLevel info
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

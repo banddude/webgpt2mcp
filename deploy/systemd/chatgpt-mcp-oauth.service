@@ -1,0 +1,24 @@
+[Unit]
+Description=OAuth wrapper for ChatGPT Web MCP
+After=webgpt2mcp-gateway.service
+Requires=webgpt2mcp-gateway.service
+PartOf=webgpt2mcp.service
+
+[Service]
+Type=simple
+User=__RUN_USER__
+Group=__RUN_GROUP__
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=__ENV_FILE__
+Environment=UPSTREAM=http://127.0.0.1:17842/mcp
+Environment=PORT=17843
+ExecStart=/usr/bin/node __INSTALL_DIR__/oauth-proxy.mjs
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=__INSTALL_DIR__/data
+
+[Install]
+WantedBy=multi-user.target
