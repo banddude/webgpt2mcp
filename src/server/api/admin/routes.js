@@ -692,6 +692,8 @@ export function createAdminRouter(context) {
                 const url = new URL(req.url, `http://${req.headers.host}`);
                 const offset = parseInt(url.searchParams.get('offset') || '0', 10);
                 const limit = parseInt(url.searchParams.get('limit') || '28', 10);
+                const includeStatus = url.searchParams.get('include_status') === '1';
+                const includeLastMessage = url.searchParams.get('include_last_message') === '1';
 
                 let poolContext = queueManager?.getPoolContext?.();
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
@@ -701,28 +703,69 @@ export function createAdminRouter(context) {
                     return;
                 }
 
-                const result = await page.evaluate(async ({ offset: o, limit: l }) => {
+                const result = await page.evaluate(async ({ offset: o, limit: l, includeStatus, includeLastMessage }) => {
                     try {
                         const sessionRes = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
                         if (!sessionRes.ok) return { error: `session failed: ${sessionRes.status}` };
                         const session = await sessionRes.json();
                         const accessToken = session?.accessToken;
                         if (!accessToken) return { error: `no access token, session keys: ${Object.keys(session || {}).join(',')}` };
+                        const headers = { 'Authorization': `Bearer ${accessToken}` };
 
-                        const res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, {
-                            headers: { 'Authorization': `Bearer ${accessToken}` }
-                        });
+                        const res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { headers });
                         if (!res.ok) return { error: `api failed: ${res.status}` };
                         const data = await res.json();
-                        return { items: (data.items || []).map(c => ({
+                        const items = (data.items || []).map(c => ({
                             id: c.id,
                             title: c.title,
                             create_time: c.create_time,
                             update_time: c.update_time,
                             model: c.model || null
-                        })) };
+                        }));
+
+                        const visibleMessage = (msg) => {
+                            if (!msg?.content) return null;
+                            const role = msg.author?.role;
+                            if (role !== 'user' && role !== 'assistant') return null;
+                            if (role === 'assistant' && ['analysis', 'thinking'].includes(msg.channel)) return null;
+                            const type = msg.content.content_type;
+                            if (type !== 'text' && type !== 'multimodal_text') return null;
+                            const parts = Array.isArray(msg.content.parts) ? msg.content.parts : [];
+                            const text = parts.map(part => typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : '')).join('').trim();
+                            if (!text) return null;
+                            return { role, text, create_time: msg.create_time || null };
+                        };
+
+                        await Promise.all(items.map(async item => {
+                            if (includeStatus) {
+                                try {
+                                    const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${item.id}/stream_status`, { headers });
+                                    if (sr.ok) item.stream_status = (await sr.json())?.status || null;
+                                    else item.stream_status = `HTTP_${sr.status}`;
+                                } catch { item.stream_status = null; }
+                            }
+                            if (includeLastMessage) {
+                                try {
+                                    const cr = await fetch(`https://chatgpt.com/backend-api/conversation/${item.id}`, { headers });
+                                    if (!cr.ok) return;
+                                    const conv = await cr.json();
+                                    const visible = Object.values(conv.mapping || {}).map(n => visibleMessage(n?.message)).filter(Boolean);
+                                    visible.sort((a, b) => (a.create_time || 0) - (b.create_time || 0));
+                                    const last = visible.at(-1);
+                                    item.message_count = visible.length;
+                                    item.turn_count = visible.filter(m => m.role === 'user').length;
+                                    if (last) {
+                                        item.last_message_role = last.role;
+                                        item.last_message_time = last.create_time ? new Date(last.create_time * 1000).toISOString() : null;
+                                        item.last_message_preview = last.text.slice(0, 240);
+                                    }
+                                } catch { }
+                            }
+                        }));
+
+                        return { items };
                     } catch (e) { return { error: e.message }; }
-                }, { offset, limit });
+                }, { offset, limit, includeStatus, includeLastMessage });
 
                 if (result.error) {
                     sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: result.error });

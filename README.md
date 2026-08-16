@@ -22,7 +22,7 @@ CLI Agent (Claude Code / Cursor)
 
 - **MCP Server** — 暴露 `chatgpt`、`chatgpt_sessions`、`chatgpt_browse` 三个 MCP 工具
 - **Skill 注入** — CLI Agent 通过 system_prompt 将任意技能注入 ChatGPT 会话，即时将其转变为类智能体
-- **会话管理** — 自动保存、智能路由（topic 匹配 / conversation_url 精确继续）、云端同步
+- **会话管理** — 云端实时列表（`STREAMING`/`COMPLETE`）、最后消息时间/预览、`active` 查询、智能路由、完整云端历史和同步
 - **GitHub 代码审核** — 通过 ChatGPT 的 GitHub Connector 审核 PR、阅读代码，无需本地 API Key
 - **多平台网关** — 底层基于 WebAI2API，支持 ChatGPT、Gemini、LMArena 等多个 AI 网站的 OpenAI 兼容接口
 

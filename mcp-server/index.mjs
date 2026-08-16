@@ -185,13 +185,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             name: 'chatgpt_sessions',
             description: `管理 ChatGPT 会话：列表、查看完整对话历史、删除（本地+云端）。
 操作说明：
-- list: 列出最近会话，显示主题、消息数、首条预览
+- list: 直接从 ChatGPT 云端列出最近会话，显示实时状态、最后活动时间和最后一条可见消息
+- active: 只列出当前仍在生成（IS_STREAMING）的 ChatGPT 会话
 - history: 从 ChatGPT 云端读取指定会话的完整对话记录（user/assistant 逐条展示）
 - delete: 删除指定会话。delete_cloud=true 时同步删除 ChatGPT 云端会话
 - clear: 清空所有本地会话记录
 - sync: 同步云端状态。清理本地中已从云端删除的会话；pull_cloud=true 时同时拉取云端新会话
 决策示例：
 - "看看最近的 ChatGPT 会话" → action=list
+- "现在有哪些 ChatGPT 会话还在跑" → action=active
 - "查看上次 KGQA 讨论的完整记录" → action=history, conversation_url=...
 - "删除这个会话，云端也一起删" → action=delete, conversation_url=..., delete_cloud=true`,
             inputSchema: {
@@ -199,7 +201,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 properties: {
                     filter_topic: { type: 'string', description: '按主题过滤（模糊匹配）' },
                     limit: { type: 'number', description: '返回数量，默认 10', default: 10 },
-                    action: { type: 'string', enum: ['list', 'history', 'delete', 'clear', 'sync'], description: '操作: list(默认)=列出, history=查看完整对话, delete=删除会话, clear=清空所有, sync=同步云端状态', default: 'list' },
+                    action: { type: 'string', enum: ['list', 'active', 'history', 'delete', 'clear', 'sync'], description: '操作: list(默认)=云端实时列表, active=当前正在生成的会话, history=查看完整对话, delete=删除会话, clear=清空所有, sync=同步云端状态', default: 'list' },
                     conversation_url: { type: 'string', description: 'history/delete 操作时指定会话 URL' },
                     delete_cloud: { type: 'boolean', description: 'delete 时是否同步删除 ChatGPT 云端会话（默认 false，仅删本地）', default: false },
                 },
@@ -422,11 +424,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     for (const cloud of cloudItems) {
                         const existing = localIdMap.get(cloud.id);
                         if (existing) {
-                            // 更新标题等元信息
+                            // 更新云端元信息。last_used 必须跟随 ChatGPT 的 update_time，
+                            // 不能永远停留在第一次 sync 的时间。
+                            let changed = false;
                             if (cloud.title && existing.topic !== cloud.title) {
                                 existing.topic = cloud.title;
-                                updated++;
+                                changed = true;
                             }
+                            if (cloud.update_time && existing.last_used !== cloud.update_time) {
+                                existing.last_used = cloud.update_time;
+                                changed = true;
+                            }
+                            if (cloud.model && existing.model !== cloud.model) {
+                                existing.model = cloud.model;
+                                changed = true;
+                            }
+                            if (changed) updated++;
                         } else {
                             // 拉取新会话
                             store.sessions.push({
@@ -436,7 +449,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                                 message_count: 0,
                                 first_prompt: '',
                                 messages: [],
-                                last_used: cloud.update_time?.replace('T', ' ').slice(0, 19) || new Date().toISOString(),
+                                last_used: cloud.update_time || new Date().toISOString(),
                             });
                             added++;
                         }
@@ -445,7 +458,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     await saveSessions(store);
                     const parts = [`同步完成: 本地 ${before} → ${store.sessions.length} 个会话`];
                     if (added > 0) parts.push(`从云端拉取了 ${added} 个新会话`);
-                    if (updated > 0) parts.push(`更新了 ${updated} 个会话标题`);
+                    if (updated > 0) parts.push(`更新了 ${updated} 个会话元信息`);
                     if (added === 0 && updated === 0) parts.push('本地已与云端一致');
                     return { content: [{ type: 'text', text: parts.join('；') + '。' }] };
                 } catch (e) {
@@ -453,31 +466,78 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 }
             }
 
-            // 列表（默认）
-            const store = await loadSessions();
-            let sessions = store.sessions || [];
-            if (args.filter_topic) {
-                const kw = args.filter_topic.toLowerCase();
-                sessions = sessions.filter(s =>
-                    (s.topic || '').toLowerCase().includes(kw) ||
-                    (s.messages?.[0]?.content || '').toLowerCase().includes(kw)
-                );
-            }
-            const limit = args.limit || 10;
-            sessions = sessions.slice(0, limit);
+            // 云端实时列表（默认）/ 当前运行中会话。
+            // 不再依赖 sessions.json 的 last_used，因为那只是本地缓存时间。
+            if (action === 'list' || action === 'active') {
+                try {
+                    const requestedLimit = Math.max(1, Math.min(Number(args.limit || 10), 50));
+                    const cloudLimit = action === 'active' || args.filter_topic ? 50 : requestedLimit;
+                    const includeLast = action === 'list' ? 1 : 0;
+                    const cloudResp = await fetch(
+                        `${API_URL}/admin/chatgpt/conversations?limit=${cloudLimit}&include_status=1&include_last_message=${includeLast}`,
+                        { headers: { 'Authorization': `Bearer ${API_KEY}` } },
+                    );
+                    if (!cloudResp.ok) throw new Error(`cloud list HTTP ${cloudResp.status}`);
+                    const cloudData = await cloudResp.json();
+                    let sessions = cloudData.items || [];
 
-            if (sessions.length === 0) {
-                return { content: [{ type: 'text', text: '暂无会话记录。' }] };
+                    if (args.filter_topic) {
+                        const kw = args.filter_topic.toLowerCase();
+                        sessions = sessions.filter(s => (s.title || '').toLowerCase().includes(kw));
+                    }
+                    if (action === 'active') {
+                        sessions = sessions.filter(s => s.stream_status === 'IS_STREAMING');
+                        // Only enrich the actually-running conversations with their latest
+                        // visible message. This avoids fetching full histories for 50 chats.
+                        await Promise.all(sessions.map(async s => {
+                            try {
+                                const detailResp = await fetch(`${API_URL}/admin/chatgpt/conversation/${s.id}`, {
+                                    headers: { 'Authorization': `Bearer ${API_KEY}` },
+                                });
+                                if (!detailResp.ok) return;
+                                const detail = await detailResp.json();
+                                const messages = detail.messages || [];
+                                const last = messages.at(-1);
+                                s.message_count = messages.length;
+                                s.turn_count = messages.filter(m => m.role === 'user').length;
+                                if (last) {
+                                    s.last_message_role = last.role;
+                                    s.last_message_time = last.create_time ? new Date(last.create_time * 1000).toISOString() : null;
+                                    s.last_message_preview = String(last.text || '').slice(0, 240);
+                                }
+                            } catch { }
+                        }));
+                    }
+                    sessions = sessions.slice(0, requestedLimit);
+
+                    if (sessions.length === 0) {
+                        const text = action === 'active'
+                            ? 'No ChatGPT conversations are currently streaming.'
+                            : 'No ChatGPT conversations found.';
+                        return { content: [{ type: 'text', text }] };
+                    }
+
+                    const lines = sessions.map((s, i) => {
+                        const status = s.stream_status || 'UNKNOWN';
+                        const title = s.title || 'Untitled';
+                        const created = s.create_time || 'unknown';
+                        const activityCandidates = [s.update_time, s.last_message_time].filter(Boolean);
+                        const updated = activityCandidates.sort((a, b) => Date.parse(b) - Date.parse(a))[0] || 'unknown';
+                        const url = `https://chatgpt.com/c/${s.id}`;
+                        const model = s.model || 'unknown';
+                        const count = Number.isFinite(s.message_count) ? ` | ${s.message_count} visible messages / ${s.turn_count || 0} user turns` : '';
+                        const last = s.last_message_preview
+                            ? `\n   Last message: ${s.last_message_role || 'unknown'} @ ${s.last_message_time || updated} — ${s.last_message_preview.replace(/\s+/g, ' ')}`
+                            : '';
+                        return `${i + 1}. [${status}] ${title}\n   Last activity: ${updated}\n   Created: ${created}\n   Model: ${model}${count}${last}\n   URL: ${url}`;
+                    });
+                    const heading = action === 'active' ? 'Currently streaming ChatGPT conversations:' : 'Recent ChatGPT conversations (live cloud state):';
+                    return { content: [{ type: 'text', text: `${heading}\n\n${lines.join('\n\n')}` }] };
+                } catch (e) {
+                    return { content: [{ type: 'text', text: `Unable to read live ChatGPT conversation state: ${e.message}` }], isError: true };
+                }
             }
 
-            const lines = sessions.map((s, i) => {
-                const time = s.last_used?.replace('T', ' ').slice(0, 16) || '';
-                const firstMsg = s.messages?.[0]?.content?.slice(0, 80) || '';
-                return `${i + 1}. [${s.model}] ${s.topic || '无主题'} (${s.message_count}轮, ${time})
-   URL: ${s.conversation_url}
-   首条: ${firstMsg}`;
-            });
-            return { content: [{ type: 'text', text: `ChatGPT 会话列表:\n\n${lines.join('\n\n')}` }] };
         }
 
         if (name === 'chatgpt_browse') {

@@ -22,7 +22,7 @@ The local model handles code execution and file operations; ChatGPT handles reas
 
 - **MCP Server** — Exposes `chatgpt`, `chatgpt_sessions`, and `chatgpt_browse` as MCP tools
 - **Skill Injection** — CLI Agent injects arbitrary skills into ChatGPT sessions via `system_prompt`, instantly turning them into agent-like entities
-- **Session Management** — Auto-save, smart routing (topic matching / conversation_url exact continuation), cloud sync
+- **Session Management** — Live cloud list with `STREAMING`/`COMPLETE` status, last-message timestamps/previews, `active` query, smart routing, cloud history, and sync
 - **GitHub Code Review** — Review PRs and read code through ChatGPT's GitHub Connector — no local API key needed
 - **Multi-Platform Gateway** — Built on WebAI2API, providing OpenAI-compatible endpoints for ChatGPT, Gemini, LMArena, and more
 
