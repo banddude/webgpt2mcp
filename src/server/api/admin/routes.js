@@ -991,6 +991,108 @@ export function createAdminRouter(context) {
                 return { idle: status.processing === 0, status };
             };
 
+            // POST /admin/chatgpt/stop - stop one exact active conversation without sending a replacement message
+            if (method === 'POST' && pathname === '/chatgpt/stop') {
+                const body = await readBody(req);
+                const conversationUrl = body.conversation_url || body.conversationUrl;
+                const convMatch = typeof conversationUrl === 'string'
+                    ? conversationUrl.match(/^https:\/\/chatgpt\.com\/c\/([0-9a-f-]+)\/?$/i)
+                    : null;
+                if (!convMatch) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation_url must be an exact ChatGPT conversation URL' });
+                    return;
+                }
+
+                const releaseControlLock = queueManager?.acquireControlLock?.('chatgpt-stop');
+                if (typeof releaseControlLock !== 'function') {
+                    sendJson(res, 409, { success: false, error: 'browser_control_locked', conversation_url: conversationUrl });
+                    return;
+                }
+
+                try {
+                    let poolContext = queueManager?.getPoolContext?.();
+                    if (!poolContext) poolContext = await queueManager?.initializePool?.();
+                    const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                    if (!page) {
+                        sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                        return;
+                    }
+
+                    const targetUrl = normalizeChatUrl(conversationUrl);
+                    if (normalizeChatUrl(page.url()) !== targetUrl) {
+                        const idle = await waitForExistingGenerationToFinish(queueManager, 120000);
+                        if (!idle.idle) {
+                            sendJson(res, 409, {
+                                success: false,
+                                error: 'existing_generation_did_not_finish',
+                                processing: idle.status.processing,
+                                waiting: idle.status.queueLength,
+                                conversation_url: conversationUrl,
+                            });
+                            return;
+                        }
+                    }
+
+                    const nav = await navigateExactChat(page, conversationUrl);
+                    if (!nav.ok) {
+                        sendJson(res, 503, {
+                            success: false,
+                            error: nav.ready === false ? 'composer_unavailable' : 'conversation_navigation_mismatch',
+                            actual_url: nav.actualUrl || page.url(),
+                            conversation_url: conversationUrl,
+                        });
+                        return;
+                    }
+
+                    const convId = convMatch[1];
+                    const attached = await attachOraclePageToActiveStream(page, conversationUrl, convId);
+                    if (attached.error) {
+                        sendJson(res, 409, { success: false, error: attached.error, stream_status_before: attached.state?.status || null });
+                        return;
+                    }
+                    if (!attached.state?.status && !attached.stopVisible) {
+                        sendJson(res, 503, { success: false, error: 'stream_status_unavailable', stream_http: attached.state?.http || null });
+                        return;
+                    }
+                    if (attached.state?.status !== 'IS_STREAMING' && !attached.stopVisible) {
+                        sendJson(res, 200, {
+                            success: true,
+                            already_idle: true,
+                            conversation_url: conversationUrl,
+                            stream_status_after: attached.state?.status || null,
+                        });
+                        return;
+                    }
+                    if (!attached.stopVisible) {
+                        sendJson(res, 409, { success: false, error: 'active_stream_not_attached', stream_status_before: attached.state?.status || null });
+                        return;
+                    }
+
+                    await clickVerifiedChatGptControl(page, page.locator('[data-testid="stop-button"]'));
+                    const stopped = await waitForStoppedStream(page, convId);
+                    if (!stopped.stopped) {
+                        sendJson(res, 409, {
+                            success: false,
+                            error: 'stop_not_confirmed',
+                            stream_status_after: stopped.state?.status || null,
+                            stop_ui: stopped.ui || null,
+                        });
+                        return;
+                    }
+
+                    logger.info('Admin', `Stopped exact ChatGPT conversation: ${convId}`);
+                    sendJson(res, 200, {
+                        success: true,
+                        already_idle: false,
+                        conversation_url: conversationUrl,
+                        stream_status_after: stopped.state?.status || null,
+                    });
+                    return;
+                } finally {
+                    releaseControlLock();
+                }
+            }
+
             // POST /admin/chatgpt/steer - bypass the generation queue to interrupt and steer an active stream
             if (method === 'POST' && pathname === '/chatgpt/steer') {
                 const body = await readBody(req);
@@ -1264,7 +1366,7 @@ export function createAdminRouter(context) {
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
                 const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
                 if (!page) {
-                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT 浏览器页面不可用' });
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
                     return;
                 }
 
@@ -1277,8 +1379,13 @@ export function createAdminRouter(context) {
                         if (!accessToken) return { error: `no access token, session keys: ${Object.keys(session || {}).join(',')}` };
                         const headers = { 'Authorization': `Bearer ${accessToken}` };
 
-                        const res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { headers });
-                        if (!res.ok) return { error: `api failed: ${res.status}` };
+                        let res = null;
+                        for (let attempt = 0; attempt < 4; attempt += 1) {
+                            res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { headers });
+                            if (res.ok || res.status !== 429) break;
+                            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+                        }
+                        if (!res?.ok) return { error: `api failed: ${res?.status || 'unknown'}` };
                         const data = await res.json();
                         const items = (data.items || []).map(c => ({
                             id: c.id,
@@ -1349,7 +1456,7 @@ export function createAdminRouter(context) {
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
                 const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
                 if (!page) {
-                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT 浏览器页面不可用' });
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
                     return;
                 }
 
@@ -1395,7 +1502,23 @@ export function createAdminRouter(context) {
                             });
                         }
                         messages.sort((a, b) => (a.create_time || 0) - (b.create_time || 0));
-                        return { id: data.id, title: data.title, messages };
+
+                        let stream_status = null;
+                        try {
+                            const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${id}/stream_status`, {
+                                headers: { 'Authorization': `Bearer ${accessToken}` }
+                            });
+                            stream_status = sr.ok ? ((await sr.json())?.status || null) : `HTTP_${sr.status}`;
+                        } catch { }
+
+                        return {
+                            id: data.id,
+                            title: data.title,
+                            create_time: data.create_time || null,
+                            update_time: data.update_time || null,
+                            stream_status,
+                            messages,
+                        };
                     } catch (e) { return { error: e.message }; }
                 }, convId);
 
@@ -1419,7 +1542,7 @@ export function createAdminRouter(context) {
                 if (urls.length === 0) {
                     sendApiError(res, {
                         code: ERROR_CODES.INVALID_REQUEST_BODY,
-                        message: '缺少 conversation_url 或 conversation_urls'
+                        message: 'conversation_url or conversation_urls is required'
                     });
                     return;
                 }

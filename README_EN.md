@@ -1,6 +1,6 @@
 # webgpt2mcp
 
-> **Banddude private deployment:** this branch includes production fixes for cloud history, continuation, mid-stream steering, OAuth, and systemd deployment. See [`BANDDUDE_DEPLOYMENT.md`](BANDDUDE_DEPLOYMENT.md) for the portable install path.
+> **Banddude private deployment:** this branch includes production fixes for exact conversation control, cloud history, OAuth, and systemd deployment. See [`BANDDUDE_DEPLOYMENT.md`](BANDDUDE_DEPLOYMENT.md) for the portable install path.
 
 Turn ChatGPT web capabilities into MCP tools, enabling CLI coding agents like Claude Code and Cursor to call ChatGPT directly for code review, document generation, academic writing, and more — zero extra API costs by reusing your existing ChatGPT web subscription.
 
@@ -8,11 +8,11 @@ Turn ChatGPT web capabilities into MCP tools, enabling CLI coding agents like Cl
 
 ```text
 CLI Agent (Claude Code / Cursor)
-  → MCP tool call (chatgpt / chatgpt_steer / chatgpt_sessions / chatgpt_browse)
+  → MCP tool call (list / read / search / create / send / stop / delete)
   → webgpt2mcp MCP Server
   → WebAI2API (OpenAI-compatible endpoint)
   → Logged-in ChatGPT browser session
-  → ChatGPT (with GitHub Connector / Skill system_prompt)
+  → ChatGPT logged-in web session
   → Returns result to CLI Agent for execution
 ```
 
@@ -20,9 +20,10 @@ The local model handles code execution and file operations; ChatGPT handles reas
 
 ## Key Features
 
-- **MCP Server** — Exposes `chatgpt`, `chatgpt_steer`, `chatgpt_sessions`, and `chatgpt_browse` as MCP tools
-- **Skill Injection** — CLI Agent injects arbitrary skills into ChatGPT sessions via `system_prompt`, instantly turning them into agent-like entities
-- **Session Management** — Live cloud list with `STREAMING`/`COMPLETE` status, last-message timestamps/previews, `active` query, smart routing, cloud history, and sync
+- **Explicit MCP Control** — Separate tools for list, read, search, create, send, stop, and delete
+- **Fail-Closed Targeting** — Read/send/stop/delete accept only exact conversation IDs or exact ChatGPT conversation URLs; no title/topic guessing
+- **Safe Active Send** — Sending to a streaming conversation automatically performs Stop → wait → exact send under the hood
+- **Conversation Discovery** — List/search return exact IDs and URLs; search never auto-selects a match
 - **GitHub Code Review** — Review PRs and read code through ChatGPT's GitHub Connector — no local API key needed
 - **Multi-Platform Gateway** — Built on WebAI2API, providing OpenAI-compatible endpoints for ChatGPT, Gemini, LMArena, and more
 
@@ -160,16 +161,21 @@ Add to your Claude Code MCP config:
 
 | Tool | Description |
 | :--- | :--- |
-| `chatgpt` | Send a message to ChatGPT and get a reply; supports session routing and system_prompt injection |
-| `chatgpt_steer` | Atomically steer one streaming conversation: Stop, wait for idle composer, exact-send the new instruction, and verify replacement generation |
-| `chatgpt_sessions` | Manage sessions: list, view history, delete (local + cloud), cloud sync |
-| `chatgpt_browse` | Have ChatGPT visit a URL and answer questions about the page content |
+| `conversations_list` | List recent conversations with exact IDs/URLs and status |
+| `conversation_read` | Read one exact conversation, including current status and full visible transcript |
+| `conversations_search` | Search recent conversation titles and return exact IDs/URLs; discovery only |
+| `send` | Send to one exact existing conversation; if active, Stop → wait → send automatically |
+| `create` | Explicitly create a brand-new conversation; this is the only tool allowed to create one |
+| `stop` | Stop one exact active conversation without sending a replacement message |
+| `delete` | Delete one exact conversation; requires explicit `confirm=true` |
 
-### Session Routing Rules
+### Targeting Rules
 
-1. Pass `conversation_url` → Exactly continue the specified session
-2. No `conversation_url` but pass `topic` → Auto-match the most recent session with the same topic; create new if no match
-3. Pass neither → Create a new session
+1. `conversations_list` and `conversations_search` are discovery tools and may use human-readable text.
+2. `conversation_read`, `send`, `stop`, and `delete` require an exact conversation UUID or exact `https://chatgpt.com/c/...` URL.
+3. Titles, topics, and fuzzy names are rejected for any operation that reads or changes a specific conversation.
+4. `send` never creates a chat. If the target is generating, it stops the current response, waits for idle, and then uses the normal exact-send path.
+5. `create` is the only MCP tool that can create a new conversation.
 
 ### Model Selection
 
@@ -179,18 +185,9 @@ Add to your Claude Code MCP config:
 | `gpt-thinking` | Complex reasoning, deep analysis |
 | `gpt-pro` | High-quality output |
 
-## Skill Injection
+## Explicit Conversation Control
 
-A local CLI Agent (Claude Code, etc.) can inject a custom `system_prompt` through the MCP tool's parameter, giving the ChatGPT session a specific role and capability — effectively turning a plain ChatGPT conversation into a skilled agent on demand.
-
-Workflow:
-
-1. CLI Agent defines a skill (e.g., a code reviewer or academic writer system_prompt)
-2. Calls the `chatgpt` tool with `system_prompt` + task content
-3. ChatGPT reasons according to the injected role and returns results
-4. CLI Agent handles actual code execution and file operations locally
-
-ChatGPT acts as a zero-cost "thinking layer"; the local model handles execution — each does what it does best.
+The MCP intentionally avoids topic routing, fuzzy session selection, hidden new-chat fallbacks, and generic web browsing. Discovery tools return exact IDs/URLs; callers then use those exact identifiers for read/send/stop/delete operations. This keeps agent behavior predictable and makes ambiguous requests fail instead of silently targeting the wrong chat.
 
 ## GitHub Connector Workflow
 

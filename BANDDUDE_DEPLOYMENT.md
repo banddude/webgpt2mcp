@@ -4,10 +4,10 @@ This repository is a portable, private packaging of `maoulee/webgpt2mcp` with th
 
 ## What this version adds
 
-- ChatGPT cloud conversation history through `chatgpt_sessions history`.
+- Exact ChatGPT conversation list/read/search with cloud metadata and status.
 - Correct continuation response selection so a continued chat cannot return the prior assistant answer.
 - Conversation-ID capture hardening so unrelated sidebar/project network traffic cannot switch the active conversation.
-- Atomic live steering through `chatgpt_steer`: target the exact conversation, acquire the browser control lock, wait for any one already-running Oracle browser request to finish, click **Stop answering**, confirm the idle composer, then reuse the normal exact-send path and verify the replacement response started. Queued work cannot steal the browser mid-steer.
+- Exact `send` behavior: idle chats send normally; streaming chats atomically Stop → wait → exact send under the hood.
 - OAuth wrapper suitable for ChatGPT custom MCP/plugin connections.
 - Streamable HTTP MCP gateway.
 - systemd templates with correct dependency/restart chaining.
@@ -56,10 +56,15 @@ Then:
 
 ## MCP tools
 
-- `chatgpt`: start, continue, and model-select conversations; exact URL continuations also use the guarded control path when the target is live.
-- `chatgpt_steer`: one-command Stop -> wait -> exact send for a currently streaming conversation.
-- `chatgpt_sessions`: list, sync, history, clear local cache, delete optionally from cloud.
-- `chatgpt_browse`: ask the logged-in ChatGPT web session to read a URL.
+- `conversations_list`: list recent chats with exact IDs/URLs and status.
+- `conversation_read`: read one exact chat and include its current status.
+- `conversations_search`: search recent titles and return exact IDs/URLs; discovery only.
+- `send`: send to one exact existing chat. If it is streaming, Stop → wait → send automatically.
+- `create`: explicitly create a new chat. No other tool may create one.
+- `stop`: stop one exact active chat without sending a replacement.
+- `delete`: delete one exact chat and require `confirm=true`.
+
+Targeting rule: discovery may use text, but read/send/stop/delete require an exact conversation UUID or exact ChatGPT conversation URL. There is no topic routing, fuzzy target selection, separate steer tool, browse tool, or `dispatch_only` mode in the public MCP.
 
 ## Upstream
 
@@ -67,42 +72,33 @@ Original project: `maoulee/webgpt2mcp`.
 
 The original MIT license and copyright notice are preserved in `LICENSE`.
 
-## AIVA / mcporter exact-chat dispatch
+## AIVA / mcporter CLI
 
-The `chatgpt` MCP tool supports `dispatch_only=true` when `conversation_url` is supplied. This submits the prompt into that exact existing ChatGPT conversation, verifies ChatGPT accepted the turn, and returns immediately instead of waiting for the assistant's final response. An explicit conversation URL is a hard target: the dispatch path will error rather than silently create a different chat.
-
-For an AIVA-style CLI, generate the mcporter binary and put the included wrapper in front of it:
+Generate the mcporter binary and install the thin wrapper:
 
 ```bash
 mcporter generate-cli --server chatgpt-web --compile ~/bin/chatgpt-web-mcporter
 install -m 0755 scripts/chatgpt-web-aiva ~/bin/chatgpt-web
 ```
 
-Then existing exact-chat commands are fast-dispatch by default:
+Examples:
 
 ```bash
-chatgpt-web chatgpt --prompt 'Continue the task.' \
-  --conversation-url 'https://chatgpt.com/c/<conversation-id>'
+# Discover chats
+chatgpt-web conversations-list --limit 10
+chatgpt-web conversations-search --query 'CI Dispatcher'
+
+# Read an exact chat
+chatgpt-web conversation-read \
+  --conversation 'https://chatgpt.com/c/<conversation-id>'
+
+# Send to an exact existing chat. Active responses are stopped automatically.
+chatgpt-web send \
+  --conversation 'https://chatgpt.com/c/<conversation-id>' \
+  --message 'Continue the task.'
+
+# Explicitly create a new chat
+chatgpt-web create --message 'Start a new task.' --model gpt-instant
 ```
 
-To deliberately wait for the final assistant response instead:
-
-```bash
-chatgpt-web chatgpt --prompt 'Answer this now.' \
-  --conversation-url 'https://chatgpt.com/c/<conversation-id>' \
-  --dispatch-only false
-```
-
-### Live steering from AIVA
-
-Use one command. AIVA does not issue separate Stop and Send operations:
-
-```bash
-chatgpt-web chatgpt-steer \
-  --conversation-url 'https://chatgpt.com/c/<conversation-id>' \
-  --prompt 'Change course and do this instead.'
-```
-
-Under the hood the command takes exclusive control of the single ChatGPT browser, waits for any request that was already using it, clicks **Stop answering**, confirms the normal message composer has returned, types the prompt through the same exact-send machinery used for idle chats, clicks Send, and verifies a replacement response started. New normal requests remain queued until the steer releases the browser lock.
-
-A failed checkpoint returns an error and does **not** silently fall back to appending a message or creating a new conversation. The AIVA wrapper gives steer and exact-chat dispatch a 150-second client timeout because browser attach/navigation can legitimately exceed mcporter's shorter default.
+The wrapper does not add routing behavior. It simply executes the generated CLI. The MCP itself enforces exact identifiers for specific-chat operations and fails closed on ambiguous targets.
