@@ -7,6 +7,21 @@ if [[ ! -x "$BIN" ]]; then
   exit 127
 fi
 
+# Steering is one atomic command from AIVA's perspective, but internally it may
+# wait for one pre-existing browser request, Stop the live response, wait for the
+# idle composer, then send and confirm the replacement response.
+if [[ "${1:-}" == "chatgpt-steer" ]]; then
+  has_timeout=false
+  for arg in "$@"; do
+    case "$arg" in
+      --timeout|-t|--timeout=*) has_timeout=true ;;
+    esac
+  done
+  if ! $has_timeout; then
+    exec "$BIN" --timeout 150000 "$@"
+  fi
+fi
+
 # AIVA uses exact conversation URLs for long-running sub-agent dispatch.
 # Treat prompt acceptance as success instead of waiting for the final response.
 # Explicit --dispatch-only false opts back into synchronous continuation.
@@ -22,7 +37,7 @@ if [[ "${1:-}" == "chatgpt" ]]; then
     esac
   done
   if $has_conversation && ! $has_dispatch && ! $has_raw; then
-    exec "$BIN" "$@" --dispatch-only true
+    exec "$BIN" --timeout 150000 "$@" --dispatch-only true
   fi
 fi
 

@@ -19,7 +19,7 @@ import { logger } from '../../utils/logger.js';
 
 // --- 配置常量 ---
 const TARGET_URL = 'https://chatgpt.com/'; // 基础URL
-const INPUT_SELECTOR = '.ProseMirror';
+const INPUT_SELECTOR = '#prompt-textarea';
 const DEBUG_DIR = path.join(process.cwd(), 'data', 'debug-chatgpt');
 
 function normalizeConversationUrl(url) {

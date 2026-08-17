@@ -8,7 +8,7 @@ Turn ChatGPT web capabilities into MCP tools, enabling CLI coding agents like Cl
 
 ```text
 CLI Agent (Claude Code / Cursor)
-  → MCP tool call (chatgpt / chatgpt_sessions / chatgpt_browse)
+  → MCP tool call (chatgpt / chatgpt_steer / chatgpt_sessions / chatgpt_browse)
   → webgpt2mcp MCP Server
   → WebAI2API (OpenAI-compatible endpoint)
   → Logged-in ChatGPT browser session
@@ -20,7 +20,7 @@ The local model handles code execution and file operations; ChatGPT handles reas
 
 ## Key Features
 
-- **MCP Server** — Exposes `chatgpt`, `chatgpt_sessions`, and `chatgpt_browse` as MCP tools
+- **MCP Server** — Exposes `chatgpt`, `chatgpt_steer`, `chatgpt_sessions`, and `chatgpt_browse` as MCP tools
 - **Skill Injection** — CLI Agent injects arbitrary skills into ChatGPT sessions via `system_prompt`, instantly turning them into agent-like entities
 - **Session Management** — Live cloud list with `STREAMING`/`COMPLETE` status, last-message timestamps/previews, `active` query, smart routing, cloud history, and sync
 - **GitHub Code Review** — Review PRs and read code through ChatGPT's GitHub Connector — no local API key needed
@@ -161,6 +161,7 @@ Add to your Claude Code MCP config:
 | Tool | Description |
 | :--- | :--- |
 | `chatgpt` | Send a message to ChatGPT and get a reply; supports session routing and system_prompt injection |
+| `chatgpt_steer` | Atomically steer one streaming conversation: Stop, wait for idle composer, exact-send the new instruction, and verify replacement generation |
 | `chatgpt_sessions` | Manage sessions: list, view history, delete (local + cloud), cloud sync |
 | `chatgpt_browse` | Have ChatGPT visit a URL and answer questions about the page content |
 

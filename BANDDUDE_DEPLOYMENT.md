@@ -7,7 +7,7 @@ This repository is a portable, private packaging of `maoulee/webgpt2mcp` with th
 - ChatGPT cloud conversation history through `chatgpt_sessions history`.
 - Correct continuation response selection so a continued chat cannot return the prior assistant answer.
 - Conversation-ID capture hardening so unrelated sidebar/project network traffic cannot switch the active conversation.
-- Mid-stream steering. A message sent to a currently streaming conversation bypasses the normal generation queue and uses ChatGPT's live steering behavior. It falls back to Stop + immediate resubmit when native steering is unavailable.
+- Atomic live steering through `chatgpt_steer`: target the exact conversation, acquire the browser control lock, wait for any one already-running Oracle browser request to finish, click **Stop answering**, confirm the idle composer, then reuse the normal exact-send path and verify the replacement response started. Queued work cannot steal the browser mid-steer.
 - OAuth wrapper suitable for ChatGPT custom MCP/plugin connections.
 - Streamable HTTP MCP gateway.
 - systemd templates with correct dependency/restart chaining.
@@ -56,7 +56,8 @@ Then:
 
 ## MCP tools
 
-- `chatgpt`: start, continue, model-select, and steer conversations.
+- `chatgpt`: start, continue, and model-select conversations; exact URL continuations also use the guarded control path when the target is live.
+- `chatgpt_steer`: one-command Stop -> wait -> exact send for a currently streaming conversation.
 - `chatgpt_sessions`: list, sync, history, clear local cache, delete optionally from cloud.
 - `chatgpt_browse`: ask the logged-in ChatGPT web session to read a URL.
 
@@ -91,3 +92,17 @@ chatgpt-web chatgpt --prompt 'Answer this now.' \
   --conversation-url 'https://chatgpt.com/c/<conversation-id>' \
   --dispatch-only false
 ```
+
+### Live steering from AIVA
+
+Use one command. AIVA does not issue separate Stop and Send operations:
+
+```bash
+chatgpt-web chatgpt-steer \
+  --conversation-url 'https://chatgpt.com/c/<conversation-id>' \
+  --prompt 'Change course and do this instead.'
+```
+
+Under the hood the command takes exclusive control of the single ChatGPT browser, waits for any request that was already using it, clicks **Stop answering**, confirms the normal message composer has returned, types the prompt through the same exact-send machinery used for idle chats, clicks Send, and verifies a replacement response started. New normal requests remain queued until the steer releases the browser lock.
+
+A failed checkpoint returns an error and does **not** silently fall back to appending a message or creating a new conversation. The AIVA wrapper gives steer and exact-chat dispatch a 150-second client timeout because browser attach/navigation can legitimately exceed mcporter's shorter default.

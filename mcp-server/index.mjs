@@ -83,7 +83,7 @@ async function recordSession({ conversation_url, model, prompt, response_content
 // API 调用
 // ==========================================
 
-async function trySteerActiveConversation({ conversation_url, prompt, timeout = 30000 }) {
+async function trySteerActiveConversation({ conversation_url, prompt, timeout = 120000 }) {
     if (!conversation_url || !prompt) return null;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
@@ -105,7 +105,7 @@ async function trySteerActiveConversation({ conversation_url, prompt, timeout = 
     }
 }
 
-async function dispatchExactConversation({ conversation_url, prompt, timeout = 45000 }) {
+async function dispatchExactConversation({ conversation_url, prompt, timeout = 120000 }) {
     if (!conversation_url || !prompt) throw new Error('conversation_url and prompt are required');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
@@ -121,7 +121,8 @@ async function dispatchExactConversation({ conversation_url, prompt, timeout = 4
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data?.success || !data?.submitted) {
-            const reason = data?.error || `HTTP ${response.status}`;
+            const rawReason = data?.error || `HTTP ${response.status}`;
+            const reason = typeof rawReason === 'string' ? rawReason : (rawReason?.message || JSON.stringify(rawReason));
             const error = new Error(reason);
             error.status = response.status;
             error.data = data;
@@ -211,6 +212,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             },
         },
         {
+            name: 'chatgpt_steer',
+            description: `Steer one exact ChatGPT conversation that is currently generating. This is one atomic control operation from the caller's perspective. Under the hood it attaches to the exact conversation, clicks Stop answering, confirms the old stream stopped, then uses the normal exact-conversation send path for the steering prompt and verifies the replacement response started. It never silently creates a new chat and never treats a cloud-history append as successful steering.`,
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    conversation_url: { type: 'string', description: 'Exact chatgpt.com/c/... conversation URL to interrupt and steer.' },
+                    prompt: { type: 'string', description: 'Steering instruction to send immediately after the old response is stopped.' },
+                },
+                required: ['conversation_url', 'prompt'],
+            },
+        },
+        {
             name: 'chatgpt_sessions',
             description: `管理 ChatGPT 会话：列表、查看完整对话历史、删除（本地+云端）。
 操作说明：
@@ -261,6 +274,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
     try {
+        if (name === 'chatgpt_steer') {
+            const convUrl = args.conversation_url || null;
+            const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+            if (!convUrl || !prompt) {
+                return {
+                    content: [{ type: 'text', text: 'Error: chatgpt_steer requires conversation_url and prompt.' }],
+                    isError: true,
+                };
+            }
+
+            const steer = await trySteerActiveConversation({
+                conversation_url: convUrl,
+                prompt,
+                timeout: 120000,
+            });
+
+            if (!steer?.success || !steer?.active || !steer?.submitted || !steer?.response_started) {
+                const rawReason = steer?.error || (steer?.active === false ? 'conversation_not_streaming' : 'steer_not_confirmed');
+                const reason = typeof rawReason === 'string' ? rawReason : (rawReason?.message || JSON.stringify(rawReason));
+                return {
+                    content: [{ type: 'text', text: `Error: ChatGPT steer failed safely: ${reason}. No successful steer is being claimed.\n\n[conversation: ${convUrl}]` }],
+                    isError: true,
+                    _meta: { conversation_url: convUrl, steered: false, steer_error: reason },
+                };
+            }
+
+            await recordSession({
+                conversation_url: convUrl,
+                model: 'unknown',
+                prompt,
+                response_content: '',
+                topic: '',
+            });
+
+            return {
+                content: [{ type: 'text', text: `Steered the exact live ChatGPT conversation: Stop confirmed, exact replacement user turn confirmed, and replacement response started.\n\n[conversation: ${convUrl}]` }],
+                _meta: {
+                    conversation_url: convUrl,
+                    steered: true,
+                    steer_mode: steer.mode || 'stop_then_send',
+                    exact_user_turn_confirmed: !!steer.exact_user_turn_confirmed,
+                    response_started: !!steer.response_started,
+                },
+            };
+        }
+
         if (name === 'chatgpt') {
             let convUrl = args.conversation_url || null;
             const topic = args.topic || '';
@@ -338,8 +397,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         topic,
                     });
                     return {
-                        content: [{ type: 'text', text: `Steered active ChatGPT response (${steer.mode}).\n\n[conversation: ${convUrl}]` }],
-                        _meta: { conversation_url: convUrl, steered: true, steer_mode: steer.mode },
+                        content: [{ type: 'text', text: `Steered active ChatGPT response (${steer.mode}); exact user turn and replacement response were confirmed.\n\n[conversation: ${convUrl}]` }],
+                        _meta: { conversation_url: convUrl, steered: true, steer_mode: steer.mode, response_started: !!steer.response_started },
+                    };
+                }
+                // If ChatGPT says the target is active but this browser could not attach/stop it,
+                // do NOT fall through to the normal continuation path. That old fallback could
+                // append a user turn to cloud history without steering the live response.
+                if (steer?.error) {
+                    return {
+                        content: [{ type: 'text', text: `Error: active conversation steer failed safely: ${steer.error}. No fallback message was submitted.\n\n[conversation: ${convUrl}]` }],
+                        isError: true,
+                        _meta: { conversation_url: convUrl, steered: false, steer_error: steer.error },
                     };
                 }
             }
