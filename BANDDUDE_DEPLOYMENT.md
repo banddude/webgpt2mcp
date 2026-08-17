@@ -65,3 +65,29 @@ Then:
 Original project: `maoulee/webgpt2mcp`.
 
 The original MIT license and copyright notice are preserved in `LICENSE`.
+
+## AIVA / mcporter exact-chat dispatch
+
+The `chatgpt` MCP tool supports `dispatch_only=true` when `conversation_url` is supplied. This submits the prompt into that exact existing ChatGPT conversation, verifies ChatGPT accepted the turn, and returns immediately instead of waiting for the assistant's final response. An explicit conversation URL is a hard target: the dispatch path will error rather than silently create a different chat.
+
+For an AIVA-style CLI, generate the mcporter binary and put the included wrapper in front of it:
+
+```bash
+mcporter generate-cli --server chatgpt-web --compile ~/bin/chatgpt-web-mcporter
+install -m 0755 scripts/chatgpt-web-aiva ~/bin/chatgpt-web
+```
+
+Then existing exact-chat commands are fast-dispatch by default:
+
+```bash
+chatgpt-web chatgpt --prompt 'Continue the task.' \
+  --conversation-url 'https://chatgpt.com/c/<conversation-id>'
+```
+
+To deliberately wait for the final assistant response instead:
+
+```bash
+chatgpt-web chatgpt --prompt 'Answer this now.' \
+  --conversation-url 'https://chatgpt.com/c/<conversation-id>' \
+  --dispatch-only false
+```

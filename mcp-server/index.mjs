@@ -105,6 +105,34 @@ async function trySteerActiveConversation({ conversation_url, prompt, timeout = 
     }
 }
 
+async function dispatchExactConversation({ conversation_url, prompt, timeout = 45000 }) {
+    if (!conversation_url || !prompt) throw new Error('conversation_url and prompt are required');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+        const response = await fetch(`${API_URL}/admin/chatgpt/dispatch`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${API_KEY}`,
+            },
+            body: JSON.stringify({ conversation_url, prompt }),
+            signal: controller.signal,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.success || !data?.submitted) {
+            const reason = data?.error || `HTTP ${response.status}`;
+            const error = new Error(reason);
+            error.status = response.status;
+            error.data = data;
+            throw error;
+        }
+        return data;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function callChatGPT({ model = 'gpt-instant', messages, conversation_url, timeout = 300000 }) {
     const body = { model, messages };
     if (conversation_url) body.conversation_url = conversation_url;
@@ -175,6 +203,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                         default: 'gpt-instant',
                     },
                     conversation_url: { type: 'string', description: '已有会话 URL，传入则继续该会话。若会话正在生成，会自动 steer/中断后提交新指令。不传则创建新会话。' },
+                    dispatch_only: { type: 'boolean', description: '仅提交到指定 conversation_url 并确认 ChatGPT 已接受，不等待 assistant 完成。用于长任务/子代理续聊；必须同时传 conversation_url。', default: false },
                     system_prompt: { type: 'string', description: '系统提示词，设定角色和上下文（可选）' },
                     topic: { type: 'string', description: '会话主题标签，用于后续查找（可选）' },
                 },
@@ -250,6 +279,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const messages = [];
             if (args.system_prompt) messages.push({ role: 'system', content: args.system_prompt });
             messages.push({ role: 'user', content: args.prompt });
+
+            // Fast exact dispatch: submit into one specific existing chat and return
+            // after ChatGPT accepts the user turn. Explicit URLs are hard targets: this
+            // path never falls back to creating a new conversation.
+            if (args.dispatch_only) {
+                if (!convUrl) {
+                    return {
+                        content: [{ type: 'text', text: 'Error: dispatch_only requires conversation_url.' }],
+                        isError: true,
+                    };
+                }
+                try {
+                    const dispatched = await dispatchExactConversation({
+                        conversation_url: convUrl,
+                        prompt: args.prompt,
+                    });
+                    await recordSession({
+                        conversation_url: convUrl,
+                        model: args.model,
+                        prompt: args.prompt,
+                        response_content: '',
+                        topic,
+                    });
+                    return {
+                        content: [{ type: 'text', text: `Prompt accepted in the exact ChatGPT conversation (${dispatched.mode}).\n\n[conversation: ${convUrl}]` }],
+                        _meta: {
+                            conversation_url: convUrl,
+                            dispatched: true,
+                            dispatch_mode: dispatched.mode,
+                            active_before: !!dispatched.active_before,
+                        },
+                    };
+                } catch (err) {
+                    const detail = err?.data?.actual_url ? ` (browser was at ${err.data.actual_url})` : '';
+                    return {
+                        content: [{ type: 'text', text: `Error: exact conversation dispatch failed: ${err.message}${detail}` }],
+                        isError: true,
+                        _meta: { conversation_url: convUrl, dispatched: false },
+                    };
+                }
+            }
 
             // Control-path preflight: if the exact target conversation is already
             // streaming, steer it directly through the browser instead of entering the

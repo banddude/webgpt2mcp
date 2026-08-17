@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BIN="${CHATGPT_WEB_MCPORTER_BIN:-$HOME/bin/chatgpt-web-mcporter}"
+
+if [[ ! -x "$BIN" ]]; then
+  echo "Missing generated mcporter binary: $BIN" >&2
+  exit 127
+fi
+
+# AIVA uses exact conversation URLs for long-running sub-agent dispatch.
+# Treat prompt acceptance as success instead of waiting for the final response.
+# Explicit --dispatch-only false opts back into synchronous continuation.
+if [[ "${1:-}" == "chatgpt" ]]; then
+  has_conversation=false
+  has_dispatch=false
+  has_raw=false
+  for arg in "$@"; do
+    case "$arg" in
+      --conversation-url|--conversation-url=*) has_conversation=true ;;
+      --dispatch-only|--dispatch-only=*) has_dispatch=true ;;
+      --raw|--raw=*) has_raw=true ;;
+    esac
+  done
+  if $has_conversation && ! $has_dispatch && ! $has_raw; then
+    exec "$BIN" "$@" --dispatch-only true
+  fi
+fi
+
+exec "$BIN" "$@"

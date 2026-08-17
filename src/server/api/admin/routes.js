@@ -685,6 +685,189 @@ export function createAdminRouter(context) {
                 return;
             }
 
+            // POST /admin/chatgpt/dispatch - submit into one exact existing conversation and return after acceptance
+            if (method === 'POST' && pathname === '/chatgpt/dispatch') {
+                const body = await readBody(req);
+                const conversationUrl = body.conversation_url || body.conversationUrl;
+                const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+                const convMatch = typeof conversationUrl === 'string'
+                    ? conversationUrl.match(/^https:\/\/chatgpt\.com\/c\/([0-9a-f-]+)\/?$/i)
+                    : null;
+                if (!convMatch || !prompt) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation_url and prompt are required' });
+                    return;
+                }
+
+                let poolContext = queueManager?.getPoolContext?.();
+                if (!poolContext) poolContext = await queueManager?.initializePool?.();
+                const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                if (!page) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                    return;
+                }
+
+                const normalizeUrl = (value) => String(value || '').replace(/\/$/, '');
+                const targetUrl = normalizeUrl(conversationUrl);
+                const queueStatus = queueManager.getStatus();
+
+                // Never steal the single browser from another in-flight generation.
+                if (normalizeUrl(page.url()) !== targetUrl) {
+                    if (queueStatus.processing > 0) {
+                        sendJson(res, 409, {
+                            success: false,
+                            submitted: false,
+                            error: 'worker_busy_on_different_conversation',
+                            conversation_url: conversationUrl
+                        });
+                        return;
+                    }
+
+                    let composerReady = false;
+                    let lastError = null;
+                    for (let attempt = 1; attempt <= 2 && !composerReady; attempt += 1) {
+                        try {
+                            if (attempt === 1) {
+                                await page.goto(conversationUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                            } else {
+                                await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+                            }
+                            if (normalizeUrl(page.url()) !== targetUrl) {
+                                throw new Error(`conversation_navigation_mismatch:${page.url()}`);
+                            }
+                            await page.locator('.ProseMirror').waitFor({ state: 'visible', timeout: 15000 });
+                            composerReady = true;
+                        } catch (err) {
+                            lastError = err;
+                            if (attempt === 1) await page.waitForTimeout(750).catch(() => {});
+                        }
+                    }
+                    if (!composerReady) {
+                        logger.warn('Admin', `Exact ChatGPT dispatch composer unavailable: ${convMatch[1]} (${lastError?.message || 'unknown'})`);
+                        sendJson(res, 503, {
+                            success: false,
+                            submitted: false,
+                            error: 'composer_unavailable',
+                            conversation_url: conversationUrl
+                        });
+                        return;
+                    }
+                } else {
+                    const ready = await page.locator('.ProseMirror').isVisible().catch(() => false);
+                    if (!ready) {
+                        await page.locator('.ProseMirror').waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+                    }
+                }
+
+                // Explicit URL is a hard invariant. Never submit if the browser is on a different chat.
+                if (normalizeUrl(page.url()) !== targetUrl) {
+                    sendJson(res, 409, {
+                        success: false,
+                        submitted: false,
+                        error: 'conversation_navigation_mismatch',
+                        actual_url: page.url(),
+                        conversation_url: conversationUrl
+                    });
+                    return;
+                }
+
+                const composer = page.locator('.ProseMirror');
+                if (!await composer.isVisible().catch(() => false)) {
+                    sendJson(res, 503, {
+                        success: false,
+                        submitted: false,
+                        error: 'composer_unavailable',
+                        conversation_url: conversationUrl
+                    });
+                    return;
+                }
+
+                const convId = convMatch[1];
+                const readStreamState = async () => page.evaluate(async (id) => {
+                    try {
+                        const r = await fetch(`/backend-api/conversation/${id}/stream_status`, { credentials: 'include' });
+                        return r.ok ? await r.json() : { http: r.status };
+                    } catch (e) { return { error: e.message }; }
+                }, convId);
+
+                const streamState = await readStreamState();
+                const stopButton = page.locator('[data-testid="stop-button"]');
+                const stopVisible = await stopButton.isVisible().catch(() => false);
+                const wasActive = streamState?.status === 'IS_STREAMING' || stopVisible;
+                const userMessages = page.locator('[data-message-author-role="user"]');
+                const userCountBefore = await userMessages.count().catch(() => 0);
+
+                await composer.fill(prompt);
+                await page.waitForTimeout(150);
+                const sendButton = page.locator('[data-testid="send-button"]');
+                let sendVisible = await sendButton.isVisible().catch(() => false);
+                let sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
+                let mode = wasActive ? 'native' : 'dispatch';
+
+                if (wasActive && !sendEnabled) {
+                    mode = 'interrupt';
+                    if (await stopButton.isVisible().catch(() => false)) {
+                        await stopButton.click();
+                        await page.waitForSelector('[data-testid="stop-button"]', { state: 'hidden', timeout: 15000 }).catch(() => {});
+                    }
+                    await page.waitForTimeout(250);
+                    const current = await composer.innerText().catch(() => '');
+                    if (!current.includes(prompt)) await composer.fill(prompt);
+                    sendVisible = await sendButton.isVisible().catch(() => false);
+                    sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
+                }
+
+                if (sendEnabled) {
+                    await sendButton.click();
+                } else {
+                    await composer.press('Enter');
+                }
+
+                // Confirm acceptance, not completion. Either a new user turn appears or ChatGPT starts streaming.
+                let accepted = false;
+                let streamStatusAfter = null;
+                const deadline = Date.now() + 10000;
+                while (Date.now() < deadline) {
+                    if (normalizeUrl(page.url()) !== targetUrl) break;
+                    const userCount = await userMessages.count().catch(() => userCountBefore);
+                    if (userCount > userCountBefore) {
+                        accepted = true;
+                        break;
+                    }
+                    const state = await readStreamState().catch(() => null);
+                    streamStatusAfter = state?.status || streamStatusAfter;
+                    if (state?.status === 'IS_STREAMING') {
+                        accepted = true;
+                        break;
+                    }
+                    await page.waitForTimeout(200);
+                }
+
+                if (!accepted || normalizeUrl(page.url()) !== targetUrl) {
+                    logger.warn('Admin', `Exact ChatGPT dispatch was not confirmed: ${convId}`);
+                    sendJson(res, 502, {
+                        success: false,
+                        submitted: false,
+                        error: 'submission_not_confirmed',
+                        conversation_url: conversationUrl,
+                        actual_url: page.url(),
+                        stream_status_after: streamStatusAfter
+                    });
+                    return;
+                }
+
+                logger.info('Admin', `Dispatched prompt to exact ChatGPT conversation (${mode}): ${convId}`);
+                sendJson(res, 200, {
+                    success: true,
+                    submitted: true,
+                    active_before: wasActive,
+                    mode,
+                    conversation_url: conversationUrl,
+                    stream_status_before: streamState?.status || null,
+                    stream_status_after: streamStatusAfter
+                });
+                return;
+            }
+
             // ==================== 请求历史 ====================
 
             // GET /admin/chatgpt/conversations - 列出最近的 ChatGPT 会话
