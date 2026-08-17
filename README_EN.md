@@ -1,6 +1,6 @@
 # webgpt2mcp
 
-> **Banddude private deployment:** this branch includes production fixes for exact conversation control, cloud history, OAuth, and systemd deployment. See [`BANDDUDE_DEPLOYMENT.md`](BANDDUDE_DEPLOYMENT.md) for the portable install path.
+> **Production-ready fork:** this branch includes hardened exact conversation control, cloud history support, OAuth, and systemd deployment. See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the portable install path.
 
 Turn ChatGPT web capabilities into MCP tools, enabling CLI coding agents like Claude Code and Cursor to call ChatGPT directly for code review, document generation, academic writing, and more — zero extra API costs by reusing your existing ChatGPT web subscription.
 

@@ -1,6 +1,6 @@
-# Banddude deployment notes
+# Production deployment notes
 
-This repository is a portable, private packaging of `maoulee/webgpt2mcp` with the fixes used in production on Oracle.
+This repository packages `maoulee/webgpt2mcp` with additional production hardening for exact ChatGPT conversation control, OAuth-protected MCP access, and systemd deployment.
 
 ## What this version adds
 
@@ -24,7 +24,7 @@ The OAuth proxy requires an admin approval token stored on the host. ChatGPT/bro
 Requirements: Node.js, npm, pnpm, systemd, and an HTTPS ingress capable of forwarding to localhost.
 
 ```bash
-git clone git@github.com:banddude/webgpt2mcp.git
+git clone https://github.com/banddude/webgpt2mcp.git
 cd webgpt2mcp
 ./scripts/install-mcp-stack.sh
 ```
@@ -78,7 +78,7 @@ Generate the mcporter binary and install the thin wrapper:
 
 ```bash
 mcporter generate-cli --server chatgpt-web --compile ~/bin/chatgpt-web-mcporter
-install -m 0755 scripts/chatgpt-web-aiva ~/bin/chatgpt-web
+install -m 0755 scripts/chatgpt-web-cli ~/bin/chatgpt-web
 ```
 
 Examples:

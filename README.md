@@ -1,6 +1,6 @@
 # webgpt2mcp
 
-> **Banddude private deployment:** this branch includes production fixes for cloud history, continuation, mid-stream steering, OAuth, and systemd deployment. See [`BANDDUDE_DEPLOYMENT.md`](BANDDUDE_DEPLOYMENT.md) for the portable install path.
+> **Production-ready fork:** this branch includes hardened ChatGPT conversation control, cloud history support, OAuth, and systemd deployment. See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the portable install path.
 
 将 ChatGPT 网页能力转化为 MCP 工具，让 Claude Code、Cursor 等 CLI 编码代理直接调用 ChatGPT 进行代码审核、文档生成、学术写作等任务——零额外 API 费用，复用已有的 ChatGPT 网页订阅。
 
