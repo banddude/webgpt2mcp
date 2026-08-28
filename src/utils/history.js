@@ -212,6 +212,19 @@ export function getDetail(id) {
 }
 
 /**
+ * Oracle deployment safety compatibility helpers. Upstream admin routes import
+ * these symbols, but the public history schema has no conversation URL column.
+ * Return no cloud-delete targets; local history deletion still works normally.
+ */
+export function getDeleteTargetsByIds(_ids) {
+    return [];
+}
+
+export function getDeleteTargetsByDateRange(_startDate, _endDate) {
+    return [];
+}
+
+/**
  * 删除记录
  * @param {string[]} ids - 要删除的记录 ID 数组
  * @returns {number} 删除的记录数

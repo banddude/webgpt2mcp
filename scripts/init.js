@@ -499,6 +499,18 @@ async function installCamoufox(platform, arch, proxyUrl) {
     fs.unlinkSync(downloadPath);
 }
 
+function ensureLinuxGlxTest(platform) {
+    if (platform !== 'linux') {
+        return;
+    }
+
+    const glxTestPath = path.join(PROJECT_ROOT, 'camoufox', 'glxtest');
+    if (!fs.existsSync(glxTestPath)) {
+        fs.writeFileSync(glxTestPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    }
+    fs.chmodSync(glxTestPath, 0o755);
+}
+
 
 /**
  * 主流程
@@ -571,6 +583,7 @@ async function installCamoufox(platform, arch, proxyUrl) {
                     break;
                 case 'camoufox':
                     await installCamoufox(platform, arch, proxyUrl);
+                    ensureLinuxGlxTest(platform);
                     break;
                 case 'geolite':
                     await downloadGeoLiteDb(proxyUrl, true); // 强制下载
@@ -589,6 +602,7 @@ async function installCamoufox(platform, arch, proxyUrl) {
             // 正常模式：执行所有步骤
             await installBetterSqlite3(platform, arch, abi, proxyUrl);
             await installCamoufox(platform, arch, proxyUrl);
+            ensureLinuxGlxTest(platform);
             await downloadGeoLiteDb(proxyUrl);
         }
 

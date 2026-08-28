@@ -54,6 +54,8 @@ import fs from 'fs/promises';
 import { useContextDownload } from '../../../backend/utils/download.js';
 import { deleteChatGptConversation } from '../../../backend/adapter/chatgpt_text.js';
 import { getBackend } from '../../../backend/index.js';
+import { gotoWithCheck, waitForInput } from '../../../backend/utils/page.js';
+import { safeClick, humanType } from '../../../backend/engine/utils.js';
 
 /**
  * 读取请求体
@@ -598,6 +600,758 @@ export function createAdminRouter(context) {
                 return;
             }
 
+            const normalizeChatUrl = (value) => String(value || '').replace(/\/$/, '');
+
+            // Use the same navigation and composer-wait helpers as the normal ChatGPT
+            // adapter. Steering should not maintain a second browser-navigation stack.
+            const navigateExactChat = async (page, conversationUrl) => {
+                const targetUrl = normalizeChatUrl(conversationUrl);
+                let lastError = null;
+
+                for (let attempt = 1; attempt <= 2; attempt += 1) {
+                    try {
+                        if (normalizeChatUrl(page.url()) !== targetUrl) {
+                            await gotoWithCheck(page, conversationUrl, { timeout: 60000 });
+                        }
+                        await waitForInput(page, '#prompt-textarea', { click: false, timeout: 60000 });
+                        if (normalizeChatUrl(page.url()) === targetUrl) {
+                            return { ok: true, ready: true, actualUrl: page.url() };
+                        }
+                        lastError = new Error(`conversation_navigation_mismatch:${page.url()}`);
+                    } catch (err) {
+                        lastError = err;
+                    }
+
+                    if (attempt < 2) {
+                        await page.waitForTimeout(1250).catch(() => {});
+                    }
+                }
+
+                const ready = await page.locator('#prompt-textarea').isVisible().catch(() => false);
+                return {
+                    ok: false,
+                    ready,
+                    lastError,
+                    error: normalizeChatUrl(page.url()) === targetUrl ? 'composer_unavailable' : 'conversation_navigation_mismatch',
+                    actualUrl: page.url(),
+                };
+            };
+
+            // Read stream state with the same bearer-authenticated path the cloud conversation
+            // listing uses. Cookie-only stream_status calls can return 429 and must never be
+            // interpreted as "idle".
+            const readChatGptStreamState = async (page, convId) => page.evaluate(async (id) => {
+                try {
+                    let accessToken = null;
+                    try {
+                        const sessionRes = await fetch('/api/auth/session', { credentials: 'include' });
+                        if (sessionRes.ok) accessToken = (await sessionRes.json())?.accessToken || null;
+                    } catch { }
+                    const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
+                    let lastHttp = null;
+                    for (let attempt = 0; attempt < 3; attempt += 1) {
+                        const r = await fetch(`/backend-api/conversation/${id}/stream_status`, {
+                            credentials: 'include',
+                            headers,
+                        });
+                        if (r.ok) return await r.json();
+                        lastHttp = r.status;
+                        if (r.status !== 429) break;
+                        await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+                    }
+                    return { http: lastHttp };
+                } catch (e) {
+                    return { error: e.message };
+                }
+            }, convId);
+
+            // A cloud conversation may be streaming while this Oracle browser tab is stale and
+            // shows a normal Send button. In that state clicking Send merely appends a turn to
+            // history; it does NOT steer the live generation. Reattach the page and require the
+            // real Stop control before calling an active-stream operation successful.
+            const attachOraclePageToActiveStream = async (page, conversationUrl, convId) => {
+                let state = await readChatGptStreamState(page, convId);
+                let stopVisible = await page.locator('[data-testid="stop-button"]').isVisible().catch(() => false);
+
+                if (state?.status === 'IS_STREAMING' && !stopVisible) {
+                    let navError = null;
+                    try {
+                        await page.reload({ waitUntil: 'commit', timeout: 8000 });
+                    } catch (err) {
+                        navError = err;
+                    }
+                    if (normalizeChatUrl(page.url()) !== normalizeChatUrl(conversationUrl)) {
+                        const nav = await navigateExactChat(page, conversationUrl);
+                        if (!nav.ok) {
+                            return { state, stopVisible: false, error: `conversation_navigation_mismatch:${page.url()}` };
+                        }
+                        navError = nav.lastError || navError;
+                    } else {
+                        await page.locator('#prompt-textarea').waitFor({ state: 'visible', timeout: 15000 }).catch(err => { navError = err; });
+                    }
+
+                    const deadline = Date.now() + 10000;
+                    while (Date.now() < deadline) {
+                        stopVisible = await page.locator('[data-testid="stop-button"]').isVisible().catch(() => false);
+                        state = await readChatGptStreamState(page, convId);
+                        if (stopVisible || state?.status !== 'IS_STREAMING') break;
+                        await page.waitForTimeout(250);
+                    }
+                    if (navError && !stopVisible && state?.status === 'IS_STREAMING') {
+                        return { state, stopVisible, error: `active_stream_attach_navigation_failed:${navError.message}` };
+                    }
+                }
+
+                return { state, stopVisible };
+            };
+
+            // ChatGPT may show a conversation-history rate-limit modal over an otherwise
+            // valid live conversation. Try to dismiss it; if it cannot be dismissed, callers
+            // may force-click only a control they already verified is visible and enabled.
+            const clearConversationRateLimitModal = async (page) => {
+                const modal = page.locator('[data-testid="modal-conversation-history-rate-limit"]');
+                let visible = await modal.isVisible().catch(() => false);
+                if (!visible) return { visible: false, dismissed: true };
+
+                await page.keyboard.press('Escape').catch(() => {});
+                await page.waitForTimeout(150).catch(() => {});
+                visible = await modal.isVisible().catch(() => false);
+                if (!visible) return { visible: false, dismissed: true };
+
+                const buttons = modal.locator('button');
+                const count = await buttons.count().catch(() => 0);
+                for (let i = 0; i < count; i += 1) {
+                    const button = buttons.nth(i);
+                    const label = [
+                        await button.getAttribute('aria-label').catch(() => ''),
+                        await button.getAttribute('title').catch(() => ''),
+                        await button.innerText().catch(() => ''),
+                    ].filter(Boolean).join(' ').toLowerCase();
+                    if (/close|dismiss|got it|okay|ok|cancel/.test(label)) {
+                        await button.click({ force: true, timeout: 5000 }).catch(() => {});
+                        await page.waitForTimeout(150).catch(() => {});
+                        break;
+                    }
+                }
+
+                visible = await modal.isVisible().catch(() => false);
+                return { visible, dismissed: !visible };
+            };
+
+            const clickVerifiedChatGptControl = async (page, locator) => {
+                const overlay = await clearConversationRateLimitModal(page);
+                if (overlay.visible) {
+                    await locator.click({ force: true, timeout: 5000 });
+                    return { forced: true, overlay: 'conversation_history_rate_limit' };
+                }
+                await locator.click({ timeout: 10000 });
+                return { forced: false, overlay: null };
+            };
+
+            const waitForStoppedStream = async (page, convId, timeoutMs = 20000) => {
+                const deadline = Date.now() + timeoutMs;
+                let state = null;
+                let stableIdleUiChecks = 0;
+                let last = null;
+                while (Date.now() < deadline) {
+                    const stopButton = page.locator('[data-testid="stop-button"]');
+                    const sendButton = page.locator('[data-testid="send-button"]');
+                    const composer = page.locator('#prompt-textarea');
+                    const stopVisible = await stopButton.isVisible().catch(() => false);
+                    const sendVisible = await sendButton.isVisible().catch(() => false);
+                    const sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
+                    const composerVisible = await composer.isVisible().catch(() => false);
+                    state = await readChatGptStreamState(page, convId);
+                    last = { stopVisible, sendVisible, sendEnabled, composerVisible };
+
+                    // This page was positively attached to a live stream before we clicked Stop.
+                    // Immediately after Stop the composer is empty, so Send is normally DISABLED.
+                    // The correct transition is simply: Stop disappeared and the normal composer
+                    // is visible again. The send helper types the steering text next, and only then
+                    // requires Send to become enabled.
+                    if (!stopVisible && composerVisible) {
+                        stableIdleUiChecks += 1;
+                        if (stableIdleUiChecks >= 2) {
+                            return { stopped: true, state, confirmed_by: 'idle_composer_ui', ui: last };
+                        }
+                    } else {
+                        stableIdleUiChecks = 0;
+                    }
+
+                    // Cloud state is useful when it agrees, but it is not required because
+                    // stream_status can lag the UI after a cross-browser Stop.
+                    if (!stopVisible && state?.status && state.status !== 'IS_STREAMING' && composerVisible) {
+                        return { stopped: true, state, confirmed_by: 'cloud_and_ui', ui: last };
+                    }
+                    await page.waitForTimeout(250);
+                }
+                return { stopped: false, state, ui: last };
+            };
+
+            const normalizeVisibleText = value => String(value || '')
+                .replace(/\u00a0/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            const readLatestCloudUserTurn = async (page, convId, retries = 3) => page.evaluate(async ({ id, retries }) => {
+                const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+                try {
+                    const sessionRes = await fetch('/api/auth/session', { credentials: 'include' });
+                    const accessToken = sessionRes.ok ? (await sessionRes.json())?.accessToken : null;
+                    const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
+                    let lastHttp = null;
+                    for (let attempt = 0; attempt < retries; attempt += 1) {
+                        const res = await fetch(`/backend-api/conversation/${id}`, { credentials: 'include', headers });
+                        lastHttp = res.status;
+                        if (res.ok) {
+                            const data = await res.json();
+                            let latest = null;
+                            for (const node of Object.values(data.mapping || {})) {
+                                const msg = node?.message;
+                                if (!msg || msg.author?.role !== 'user' || !msg.content) continue;
+                                const type = msg.content.content_type;
+                                if (type !== 'text' && type !== 'multimodal_text') continue;
+                                const parts = Array.isArray(msg.content.parts) ? msg.content.parts : [];
+                                const text = parts.map(part => typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : '')).join('');
+                                if (!text.trim()) continue;
+                                const item = { id: msg.id || null, text, create_time: msg.create_time || 0 };
+                                if (!latest || item.create_time >= latest.create_time) latest = item;
+                            }
+                            return { latest, http: res.status };
+                        }
+                        if (res.status !== 429) break;
+                        await sleep(600 * (attempt + 1));
+                    }
+                    return { latest: null, http: lastHttp };
+                } catch (e) {
+                    return { latest: null, error: e.message };
+                }
+            }, { id: convId, retries });
+
+            const waitForExactUserTurn = async (page, conversationUrl, prompt, countBefore, convId, cloudUserBefore, timeoutMs = 30000) => {
+                const userMessages = page.locator('[data-message-author-role="user"]');
+                const composer = page.locator('#prompt-textarea');
+                const stopButton = page.locator('[data-testid="stop-button"]');
+                const targetUrl = normalizeChatUrl(conversationUrl);
+                const deadline = Date.now() + timeoutMs;
+                let lastText = '';
+                let count = countBefore;
+                let lastCloud = null;
+                let nextCloudCheck = 0;
+                while (Date.now() < deadline) {
+                    if (normalizeChatUrl(page.url()) !== targetUrl) {
+                        return { accepted: false, count, lastText, error: 'conversation_navigation_mismatch', actual_url: page.url() };
+                    }
+
+                    count = await userMessages.count().catch(() => countBefore);
+                    if (count > countBefore) {
+                        lastText = (await userMessages.last().innerText().catch(() => '')).trim();
+                        if (normalizeVisibleText(lastText) === normalizeVisibleText(prompt)) {
+                            return { accepted: true, count, lastText, confirmed_by: 'dom' };
+                        }
+                    }
+
+                    // Live UI confirmation does not depend on conversation-history APIs. We
+                    // already verified the exact prompt text in the composer before clicking
+                    // Send. If that composer is now empty and a Stop button has appeared, the
+                    // exact target chat accepted the turn and began the new response.
+                    const composerText = (await composer.innerText().catch(() => '')).trim();
+                    const stopVisible = await stopButton.isVisible().catch(() => false);
+                    if (!normalizeVisibleText(composerText) && stopVisible) {
+                        return { accepted: true, count, lastText, confirmed_by: 'ui_new_generation' };
+                    }
+
+                    // Cloud graph is only a fallback when a baseline message ID was captured.
+                    if (cloudUserBefore?.id && Date.now() >= nextCloudCheck) {
+                        lastCloud = await readLatestCloudUserTurn(page, convId, 2);
+                        const latest = lastCloud?.latest;
+                        if (latest?.id && latest.id !== cloudUserBefore.id &&
+                            normalizeVisibleText(latest.text) === normalizeVisibleText(prompt)) {
+                            return { accepted: true, count, lastText: latest.text, confirmed_by: 'cloud_new_id', cloud_id: latest.id };
+                        }
+                        nextCloudCheck = Date.now() + 1000;
+                    }
+                    await page.waitForTimeout(200);
+                }
+                return { accepted: false, count, lastText, cloud_http: lastCloud?.http || null };
+            };
+
+            const waitForNewAssistantResponse = async (page, convId, assistantCountBefore, timeoutMs = 15000) => {
+                const assistantMessages = page.locator('[data-message-author-role="assistant"]');
+                const stopButton = page.locator('[data-testid="stop-button"]');
+                const deadline = Date.now() + timeoutMs;
+                let state = null;
+                let assistantCount = assistantCountBefore;
+                let newStopVisible = false;
+                while (Date.now() < deadline) {
+                    assistantCount = await assistantMessages.count().catch(() => assistantCountBefore);
+                    newStopVisible = await stopButton.isVisible().catch(() => false);
+                    state = await readChatGptStreamState(page, convId);
+                    // Do not trust IS_STREAMING alone here: it may be the stale status from the
+                    // response we just stopped. A new assistant DOM turn or a newly visible Stop
+                    // control proves the replacement generation actually began.
+                    if (assistantCount > assistantCountBefore || newStopVisible) {
+                        return { started: true, state, assistantCount, stopVisible: newStopVisible };
+                    }
+                    await page.waitForTimeout(250);
+                }
+                return { started: false, state, assistantCount, stopVisible: newStopVisible };
+            };
+
+
+            // Single normal exact-send implementation. Steering is special only through the
+            // Stop step; once the old stream is confirmed stopped, it hands off here exactly
+            // like any other idle conversation continuation.
+            const sendExactTurn = async (page, conversationUrl, convId, prompt, { assistantCountBefore = null, requireResponseStart = false } = {}) => {
+                const nav = await navigateExactChat(page, conversationUrl);
+                if (!nav.ok) {
+                    return {
+                        ok: false,
+                        error: nav.ready === false ? 'composer_unavailable' : 'conversation_navigation_mismatch',
+                        actual_url: nav.actualUrl || page.url(),
+                    };
+                }
+
+                const userMessages = page.locator('[data-message-author-role="user"]');
+                const userCountBefore = await userMessages.count().catch(() => 0);
+                const cloudUserBeforeResult = await readLatestCloudUserTurn(page, convId, 3);
+                const cloudUserBefore = cloudUserBeforeResult?.latest || null;
+                // Reacquire the post-Stop composer and use the exact same click/type machinery
+                // as the normal ChatGPT adapter. Stop can rerender this node, so never reuse a
+                // pre-Stop ElementHandle.
+                const composer = page.locator('#prompt-textarea');
+                await waitForInput(page, composer, { click: false, timeout: 60000 });
+                await safeClick(page, composer, { bias: 'input', timeout: 15000 });
+
+                // Ensure a short steering prompt does not append to any text ChatGPT preserved
+                // across the Stop rerender. humanType itself performs this clear for long text;
+                // do it explicitly here so short and long prompts have the same semantics.
+                const modifierKey = process.platform === 'darwin' ? 'Meta' : 'Control';
+                await page.keyboard.down(modifierKey);
+                await page.keyboard.press('A');
+                await page.keyboard.up(modifierKey);
+                await page.keyboard.press('Backspace');
+                await page.waitForTimeout(100);
+                await humanType(page, '#prompt-textarea', prompt);
+
+                const freshComposer = page.locator('#prompt-textarea');
+                const composerText = (await freshComposer.innerText().catch(() => '')).trim();
+                if (normalizeVisibleText(composerText) !== normalizeVisibleText(prompt)) {
+                    return { ok: false, error: 'composer_text_mismatch' };
+                }
+
+                const sendButton = page.locator('[data-testid="send-button"]');
+                const sendVisible = await sendButton.isVisible().catch(() => false);
+                const sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
+                if (!sendEnabled) {
+                    return { ok: false, error: 'send_button_unavailable', send_visible: sendVisible };
+                }
+
+                await clickVerifiedChatGptControl(page, sendButton);
+
+                const accepted = await waitForExactUserTurn(page, conversationUrl, prompt, userCountBefore, convId, cloudUserBefore);
+                if (!accepted.accepted) {
+                    return { ok: false, error: accepted.error || 'exact_user_turn_not_confirmed', last_user_text: accepted.lastText, actual_url: accepted.actual_url || page.url() };
+                }
+
+                let responseStarted = null;
+                if (requireResponseStart) {
+                    const baseline = Number.isInteger(assistantCountBefore)
+                        ? assistantCountBefore
+                        : await page.locator('[data-message-author-role="assistant"]').count().catch(() => 0);
+                    responseStarted = await waitForNewAssistantResponse(page, convId, baseline);
+                    if (!responseStarted.started) {
+                        return {
+                            ok: false,
+                            submitted: true,
+                            exact_user_turn_confirmed: true,
+                            error: 'replacement_response_not_started',
+                            stream_status_after: responseStarted.state?.status || null,
+                        };
+                    }
+                }
+
+                return {
+                    ok: true,
+                    submitted: true,
+                    exact_user_turn_confirmed: true,
+                    acceptance_confirmed_by: accepted.confirmed_by || null,
+                    response_started: requireResponseStart ? !!responseStarted?.started : null,
+                    stream_status_after: responseStarted?.state?.status || null,
+                };
+            };
+
+            const waitForExistingGenerationToFinish = async (queueManager, timeoutMs = 120000) => {
+                const deadline = Date.now() + timeoutMs;
+                let status = queueManager.getStatus();
+                while (status.processing > 0 && Date.now() < deadline) {
+                    await new Promise(resolve => setTimeout(resolve, 250));
+                    status = queueManager.getStatus();
+                }
+                return { idle: status.processing === 0, status };
+            };
+
+            // POST /admin/chatgpt/stop - stop one exact active conversation without sending a replacement message
+            if (method === 'POST' && pathname === '/chatgpt/stop') {
+                const body = await readBody(req);
+                const conversationUrl = body.conversation_url || body.conversationUrl;
+                const convMatch = typeof conversationUrl === 'string'
+                    ? conversationUrl.match(/^https:\/\/chatgpt\.com\/c\/([0-9a-f-]+)\/?$/i)
+                    : null;
+                if (!convMatch) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation_url must be an exact ChatGPT conversation URL' });
+                    return;
+                }
+
+                const releaseControlLock = queueManager?.acquireControlLock?.('chatgpt-stop');
+                if (typeof releaseControlLock !== 'function') {
+                    sendJson(res, 409, { success: false, error: 'browser_control_locked', conversation_url: conversationUrl });
+                    return;
+                }
+
+                try {
+                    let poolContext = queueManager?.getPoolContext?.();
+                    if (!poolContext) poolContext = await queueManager?.initializePool?.();
+                    const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                    if (!page) {
+                        sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                        return;
+                    }
+
+                    const targetUrl = normalizeChatUrl(conversationUrl);
+                    if (normalizeChatUrl(page.url()) !== targetUrl) {
+                        const idle = await waitForExistingGenerationToFinish(queueManager, 120000);
+                        if (!idle.idle) {
+                            sendJson(res, 409, {
+                                success: false,
+                                error: 'existing_generation_did_not_finish',
+                                processing: idle.status.processing,
+                                waiting: idle.status.queueLength,
+                                conversation_url: conversationUrl,
+                            });
+                            return;
+                        }
+                    }
+
+                    const nav = await navigateExactChat(page, conversationUrl);
+                    if (!nav.ok) {
+                        sendJson(res, 503, {
+                            success: false,
+                            error: nav.ready === false ? 'composer_unavailable' : 'conversation_navigation_mismatch',
+                            actual_url: nav.actualUrl || page.url(),
+                            conversation_url: conversationUrl,
+                        });
+                        return;
+                    }
+
+                    const convId = convMatch[1];
+                    const attached = await attachOraclePageToActiveStream(page, conversationUrl, convId);
+                    if (attached.error) {
+                        sendJson(res, 409, { success: false, error: attached.error, stream_status_before: attached.state?.status || null });
+                        return;
+                    }
+                    if (!attached.state?.status && !attached.stopVisible) {
+                        sendJson(res, 503, { success: false, error: 'stream_status_unavailable', stream_http: attached.state?.http || null });
+                        return;
+                    }
+                    if (attached.state?.status !== 'IS_STREAMING' && !attached.stopVisible) {
+                        sendJson(res, 200, {
+                            success: true,
+                            already_idle: true,
+                            conversation_url: conversationUrl,
+                            stream_status_after: attached.state?.status || null,
+                        });
+                        return;
+                    }
+                    if (!attached.stopVisible) {
+                        sendJson(res, 409, { success: false, error: 'active_stream_not_attached', stream_status_before: attached.state?.status || null });
+                        return;
+                    }
+
+                    await clickVerifiedChatGptControl(page, page.locator('[data-testid="stop-button"]'));
+                    const stopped = await waitForStoppedStream(page, convId);
+                    if (!stopped.stopped) {
+                        sendJson(res, 409, {
+                            success: false,
+                            error: 'stop_not_confirmed',
+                            stream_status_after: stopped.state?.status || null,
+                            stop_ui: stopped.ui || null,
+                        });
+                        return;
+                    }
+
+                    logger.info('Admin', `Stopped exact ChatGPT conversation: ${convId}`);
+                    sendJson(res, 200, {
+                        success: true,
+                        already_idle: false,
+                        conversation_url: conversationUrl,
+                        stream_status_after: stopped.state?.status || null,
+                    });
+                    return;
+                } finally {
+                    releaseControlLock();
+                }
+            }
+
+            // POST /admin/chatgpt/steer - bypass the generation queue to interrupt and steer an active stream
+            if (method === 'POST' && pathname === '/chatgpt/steer') {
+                const body = await readBody(req);
+                const conversationUrl = body.conversation_url || body.conversationUrl;
+                const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+                const convMatch = typeof conversationUrl === 'string'
+                    ? conversationUrl.match(/^https:\/\/chatgpt\.com\/c\/([0-9a-f-]+)\/?$/i)
+                    : null;
+                if (!convMatch || !prompt) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation_url and prompt are required' });
+                    return;
+                }
+
+                const releaseControlLock = queueManager?.acquireControlLock?.('chatgpt-steer');
+                if (typeof releaseControlLock !== 'function') {
+                    sendJson(res, 409, { success: false, active: null, error: 'browser_control_locked' });
+                    return;
+                }
+                try {
+
+                let poolContext = queueManager?.getPoolContext?.();
+                if (!poolContext) poolContext = await queueManager?.initializePool?.();
+                const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                if (!page) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                    return;
+                }
+
+                const targetUrl = normalizeChatUrl(conversationUrl);
+                if (normalizeChatUrl(page.url()) !== targetUrl) {
+                    // A request that was already processing before we acquired the control lock
+                    // is allowed to finish. The lock prevents any queued request from starting
+                    // behind it, so once processing reaches zero the browser is exclusively ours.
+                    const idle = await waitForExistingGenerationToFinish(queueManager, 120000);
+                    if (!idle.idle) {
+                        sendJson(res, 409, {
+                            success: false,
+                            active: null,
+                            error: 'existing_generation_did_not_finish',
+                            processing: idle.status.processing,
+                            waiting: idle.status.queueLength,
+                        });
+                        return;
+                    }
+                }
+                const nav = await navigateExactChat(page, conversationUrl);
+                if (!nav.ok) {
+                    sendJson(res, 503, {
+                        success: false,
+                        active: false,
+                        error: nav.ready === false ? 'composer_unavailable' : 'conversation_navigation_mismatch',
+                        actual_url: nav.actualUrl || page.url(),
+                    });
+                    return;
+                }
+
+                const convId = convMatch[1];
+                const attached = await attachOraclePageToActiveStream(page, conversationUrl, convId);
+                if (attached.error) {
+                    sendJson(res, 409, { success: false, active: true, error: attached.error, stream_status: attached.state?.status || null });
+                    return;
+                }
+                if (!attached.state?.status && !attached.stopVisible) {
+                    sendJson(res, 503, { success: false, active: null, error: 'stream_status_unavailable', stream_http: attached.state?.http || null });
+                    return;
+                }
+                if (attached.state?.status !== 'IS_STREAMING' && !attached.stopVisible) {
+                    sendJson(res, 200, { success: false, active: false, stream_status: attached.state?.status || null });
+                    return;
+                }
+                if (!attached.stopVisible) {
+                    sendJson(res, 409, { success: false, active: true, error: 'active_stream_not_attached', stream_status: attached.state?.status || null });
+                    return;
+                }
+
+                const assistantMessages = page.locator('[data-message-author-role="assistant"]');
+                const assistantCountBefore = await assistantMessages.count().catch(() => 0);
+
+                // Cross-browser steering is intentionally Stop -> paste -> Send. A normal Send
+                // while a stale page only knows cloud IS_STREAMING can create a transcript turn
+                // without interrupting the generation the user is actually watching.
+                const stopButton = page.locator('[data-testid="stop-button"]');
+                const stopClick = await clickVerifiedChatGptControl(page, stopButton);
+                const stopped = await waitForStoppedStream(page, convId);
+                if (!stopped.stopped) {
+                    sendJson(res, 409, { success: false, active: true, error: 'stop_not_confirmed', stream_status_after_stop: stopped.state?.status || null, stop_ui: stopped.ui || null });
+                    return;
+                }
+
+                // The active-stream special case ends here. From this point onward use the
+                // same exact-send function as a normal stopped/idle conversation.
+                const sent = await sendExactTurn(page, conversationUrl, convId, prompt, {
+                    assistantCountBefore,
+                    requireResponseStart: true,
+                });
+                if (!sent.ok) {
+                    sendJson(res, sent.submitted ? 502 : 409, {
+                        success: false,
+                        active: false,
+                        ...sent,
+                        conversation_url: conversationUrl,
+                    });
+                    return;
+                }
+
+                logger.info('Admin', `Steered active ChatGPT conversation (stop-then-exact-send): ${convId}`);
+                sendJson(res, 200, {
+                    success: true,
+                    active: true,
+                    submitted: true,
+                    mode: 'stop_then_send',
+                    conversation_url: conversationUrl,
+                    stream_status_before: attached.state?.status || null,
+                    stream_status_after: sent.stream_status_after || null,
+                    exact_user_turn_confirmed: true,
+                    response_started: true,
+                    stop_click_forced: !!stopClick.forced,
+                });
+                return;
+                } finally {
+                    releaseControlLock();
+                }
+            }
+
+            // POST /admin/chatgpt/dispatch - submit into one exact existing conversation and return after acceptance
+            if (method === 'POST' && pathname === '/chatgpt/dispatch') {
+                const body = await readBody(req);
+                const conversationUrl = body.conversation_url || body.conversationUrl;
+                const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+                const convMatch = typeof conversationUrl === 'string'
+                    ? conversationUrl.match(/^https:\/\/chatgpt\.com\/c\/([0-9a-f-]+)\/?$/i)
+                    : null;
+                if (!convMatch || !prompt) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation_url and prompt are required' });
+                    return;
+                }
+
+                const releaseControlLock = queueManager?.acquireControlLock?.('chatgpt-dispatch');
+                if (typeof releaseControlLock !== 'function') {
+                    sendJson(res, 409, { success: false, submitted: false, error: 'browser_control_locked', conversation_url: conversationUrl });
+                    return;
+                }
+                try {
+
+                let poolContext = queueManager?.getPoolContext?.();
+                if (!poolContext) poolContext = await queueManager?.initializePool?.();
+                const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                if (!page) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                    return;
+                }
+
+                const targetUrl = normalizeChatUrl(conversationUrl);
+                if (normalizeChatUrl(page.url()) !== targetUrl) {
+                    const idle = await waitForExistingGenerationToFinish(queueManager, 120000);
+                    if (!idle.idle) {
+                        sendJson(res, 409, {
+                            success: false,
+                            submitted: false,
+                            error: 'existing_generation_did_not_finish',
+                            processing: idle.status.processing,
+                            waiting: idle.status.queueLength,
+                            conversation_url: conversationUrl,
+                        });
+                        return;
+                    }
+                }
+
+                const nav = await navigateExactChat(page, conversationUrl);
+                if (!nav.ok) {
+                    logger.warn('Admin', `Exact ChatGPT dispatch composer unavailable: ${convMatch[1]} (${nav.lastError?.message || nav.error || 'unknown'})`);
+                    sendJson(res, 503, {
+                        success: false,
+                        submitted: false,
+                        error: nav.ready === false ? 'composer_unavailable' : 'conversation_navigation_mismatch',
+                        actual_url: nav.actualUrl || page.url(),
+                        conversation_url: conversationUrl,
+                    });
+                    return;
+                }
+
+                const convId = convMatch[1];
+                const attached = await attachOraclePageToActiveStream(page, conversationUrl, convId);
+                if (attached.error) {
+                    sendJson(res, 409, { success: false, submitted: false, active_before: true, error: attached.error, stream_status_before: attached.state?.status || null });
+                    return;
+                }
+                if (!attached.state?.status && !attached.stopVisible) {
+                    sendJson(res, 503, { success: false, submitted: false, error: 'stream_status_unavailable', stream_http: attached.state?.http || null });
+                    return;
+                }
+
+                let wasActive = attached.state?.status === 'IS_STREAMING' || attached.stopVisible;
+                const assistantMessages = page.locator('[data-message-author-role="assistant"]');
+                const assistantCountBefore = await assistantMessages.count().catch(() => 0);
+                let mode = 'dispatch';
+
+                if (wasActive) {
+                    if (!attached.stopVisible) {
+                        sendJson(res, 409, {
+                            success: false,
+                            submitted: false,
+                            active_before: true,
+                            error: 'active_stream_not_attached',
+                            stream_status_before: attached.state?.status || null,
+                        });
+                        return;
+                    }
+                    mode = 'interrupt';
+                    await clickVerifiedChatGptControl(page, page.locator('[data-testid="stop-button"]'));
+                    const stopped = await waitForStoppedStream(page, convId);
+                    if (!stopped.stopped) {
+                        sendJson(res, 409, {
+                            success: false,
+                            submitted: false,
+                            active_before: true,
+                            error: 'stop_not_confirmed',
+                            stream_status_after_stop: stopped.state?.status || null,
+                            stop_ui: stopped.ui || null,
+                        });
+                        return;
+                    }
+                }
+
+                const sent = await sendExactTurn(page, conversationUrl, convId, prompt, {
+                    assistantCountBefore,
+                    requireResponseStart: wasActive,
+                });
+                if (!sent.ok) {
+                    logger.warn('Admin', `Exact ChatGPT dispatch failed after navigation/stop: ${convId} (${sent.error || 'unknown'})`);
+                    sendJson(res, sent.submitted ? 502 : 409, {
+                        success: false,
+                        submitted: !!sent.submitted,
+                        active_before: wasActive,
+                        ...sent,
+                        conversation_url: conversationUrl,
+                        actual_url: page.url(),
+                    });
+                    return;
+                }
+
+                logger.info('Admin', `Dispatched prompt to exact ChatGPT conversation (${mode}): ${convId}`);
+                sendJson(res, 200, {
+                    success: true,
+                    submitted: true,
+                    active_before: wasActive,
+                    mode,
+                    conversation_url: conversationUrl,
+                    stream_status_before: attached.state?.status || null,
+                    stream_status_after: sent.stream_status_after || null,
+                    exact_user_turn_confirmed: true,
+                    response_started: sent.response_started,
+                });
+                return;
+                } finally {
+                    releaseControlLock();
+                }
+            }
+
             // ==================== 请求历史 ====================
 
             // GET /admin/chatgpt/conversations - 列出最近的 ChatGPT 会话
@@ -605,37 +1359,85 @@ export function createAdminRouter(context) {
                 const url = new URL(req.url, `http://${req.headers.host}`);
                 const offset = parseInt(url.searchParams.get('offset') || '0', 10);
                 const limit = parseInt(url.searchParams.get('limit') || '28', 10);
+                const includeStatus = url.searchParams.get('include_status') === '1';
+                const includeLastMessage = url.searchParams.get('include_last_message') === '1';
 
                 let poolContext = queueManager?.getPoolContext?.();
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
                 const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
                 if (!page) {
-                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT 浏览器页面不可用' });
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
                     return;
                 }
 
-                const result = await page.evaluate(async ({ offset: o, limit: l }) => {
+                const result = await page.evaluate(async ({ offset: o, limit: l, includeStatus, includeLastMessage }) => {
                     try {
                         const sessionRes = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
                         if (!sessionRes.ok) return { error: `session failed: ${sessionRes.status}` };
                         const session = await sessionRes.json();
                         const accessToken = session?.accessToken;
                         if (!accessToken) return { error: `no access token, session keys: ${Object.keys(session || {}).join(',')}` };
+                        const headers = { 'Authorization': `Bearer ${accessToken}` };
 
-                        const res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, {
-                            headers: { 'Authorization': `Bearer ${accessToken}` }
-                        });
-                        if (!res.ok) return { error: `api failed: ${res.status}` };
+                        let res = null;
+                        for (let attempt = 0; attempt < 4; attempt += 1) {
+                            res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { headers });
+                            if (res.ok || res.status !== 429) break;
+                            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+                        }
+                        if (!res?.ok) return { error: `api failed: ${res?.status || 'unknown'}` };
                         const data = await res.json();
-                        return { items: (data.items || []).map(c => ({
+                        const items = (data.items || []).map(c => ({
                             id: c.id,
                             title: c.title,
                             create_time: c.create_time,
                             update_time: c.update_time,
                             model: c.model || null
-                        })) };
+                        }));
+
+                        const visibleMessage = (msg) => {
+                            if (!msg?.content) return null;
+                            const role = msg.author?.role;
+                            if (role !== 'user' && role !== 'assistant') return null;
+                            if (role === 'assistant' && ['analysis', 'thinking'].includes(msg.channel)) return null;
+                            const type = msg.content.content_type;
+                            if (type !== 'text' && type !== 'multimodal_text') return null;
+                            const parts = Array.isArray(msg.content.parts) ? msg.content.parts : [];
+                            const text = parts.map(part => typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : '')).join('').trim();
+                            if (!text) return null;
+                            return { role, text, create_time: msg.create_time || null };
+                        };
+
+                        await Promise.all(items.map(async item => {
+                            if (includeStatus) {
+                                try {
+                                    const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${item.id}/stream_status`, { headers });
+                                    if (sr.ok) item.stream_status = (await sr.json())?.status || null;
+                                    else item.stream_status = `HTTP_${sr.status}`;
+                                } catch { item.stream_status = null; }
+                            }
+                            if (includeLastMessage) {
+                                try {
+                                    const cr = await fetch(`https://chatgpt.com/backend-api/conversation/${item.id}`, { headers });
+                                    if (!cr.ok) return;
+                                    const conv = await cr.json();
+                                    const visible = Object.values(conv.mapping || {}).map(n => visibleMessage(n?.message)).filter(Boolean);
+                                    visible.sort((a, b) => (a.create_time || 0) - (b.create_time || 0));
+                                    const last = visible.at(-1);
+                                    item.message_count = visible.length;
+                                    item.turn_count = visible.filter(m => m.role === 'user').length;
+                                    if (last) {
+                                        item.last_message_role = last.role;
+                                        item.last_message_time = last.create_time ? new Date(last.create_time * 1000).toISOString() : null;
+                                        item.last_message_preview = last.text.slice(0, 240);
+                                    }
+                                } catch { }
+                            }
+                        }));
+
+                        return { items };
                     } catch (e) { return { error: e.message }; }
-                }, { offset, limit });
+                }, { offset, limit, includeStatus, includeLastMessage });
 
                 if (result.error) {
                     sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: result.error });
@@ -654,7 +1456,7 @@ export function createAdminRouter(context) {
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
                 const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
                 if (!page) {
-                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT 浏览器页面不可用' });
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
                     return;
                 }
 
@@ -679,14 +1481,17 @@ export function createAdminRouter(context) {
                             if (!msg || !msg.content) continue;
                             const role = msg.author?.role;
                             if (role !== 'user' && role !== 'assistant') continue;
-                            let text = '';
-                            if (msg.content.content_type === 'text') {
-                                text = msg.content.parts?.join('') || '';
-                            } else if (msg.content.content_type === 'model_editable_context') {
-                                continue;
-                            } else {
-                                text = JSON.stringify(msg.content);
-                            }
+                            // Return conversational text only. ChatGPT's cloud graph also
+                            // contains internal reasoning/tool-call/code nodes that are not part of
+                            // the visible chat transcript and must not be surfaced as conversation
+                            // history.
+                            if (role === 'assistant' && ['analysis', 'thinking'].includes(msg.channel)) continue;
+                            const contentType = msg.content.content_type;
+                            if (contentType !== 'text' && contentType !== 'multimodal_text') continue;
+                            const parts = Array.isArray(msg.content.parts) ? msg.content.parts : [];
+                            const text = parts
+                                .map(part => typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : ''))
+                                .join('');
                             if (!text.trim()) continue;
                             messages.push({
                                 id: msg.id,
@@ -697,7 +1502,23 @@ export function createAdminRouter(context) {
                             });
                         }
                         messages.sort((a, b) => (a.create_time || 0) - (b.create_time || 0));
-                        return { id: data.id, title: data.title, messages };
+
+                        let stream_status = null;
+                        try {
+                            const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${id}/stream_status`, {
+                                headers: { 'Authorization': `Bearer ${accessToken}` }
+                            });
+                            stream_status = sr.ok ? ((await sr.json())?.status || null) : `HTTP_${sr.status}`;
+                        } catch { }
+
+                        return {
+                            id: data.id,
+                            title: data.title,
+                            create_time: data.create_time || null,
+                            update_time: data.update_time || null,
+                            stream_status,
+                            messages,
+                        };
                     } catch (e) { return { error: e.message }; }
                 }, convId);
 
@@ -721,7 +1542,7 @@ export function createAdminRouter(context) {
                 if (urls.length === 0) {
                     sendApiError(res, {
                         code: ERROR_CODES.INVALID_REQUEST_BODY,
-                        message: '缺少 conversation_url 或 conversation_urls'
+                        message: 'conversation_url or conversation_urls is required'
                     });
                     return;
                 }

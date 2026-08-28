@@ -1,0 +1,447 @@
+#!/usr/bin/env node
+/**
+ * webgpt2mcp — ChatGPT Web to MCP Server
+ * 将 WebAI2API 的 ChatGPT 网页端能力暴露为 MCP 工具
+ * 支持会话管理：自动保存、列表查询、智能继续、Skill 注入
+ */
+
+import fs from 'fs/promises';
+import path from 'path';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+
+const API_URL = process.env.CHATGPT_API_URL || 'http://127.0.0.1:3000';
+const API_KEY = process.env.CHATGPT_API_KEY;
+if (!API_KEY) {
+    console.error('[chatgpt-web] CHATGPT_API_KEY environment variable is required');
+    process.exit(1);
+}
+const SESSIONS_FILE = path.join(path.dirname(import.meta.url.replace('file://', '')), 'sessions.json');
+
+// ==========================================
+// 会话存储
+// ==========================================
+
+async function loadSessions() {
+    try {
+        const data = await fs.readFile(SESSIONS_FILE, 'utf-8');
+        return JSON.parse(data);
+    } catch {
+        return { sessions: [] };
+    }
+}
+
+async function saveSessions(store) {
+    // 只保留最近 50 个会话
+    store.sessions.sort((a, b) => new Date(b.last_used) - new Date(a.last_used));
+    if (store.sessions.length > 50) store.sessions = store.sessions.slice(0, 50);
+    await fs.writeFile(SESSIONS_FILE, JSON.stringify(store, null, 2));
+}
+
+async function recordSession({ conversation_url, model, prompt, response_content, topic }) {
+    if (!conversation_url) return;
+    const store = await loadSessions();
+    const existing = store.sessions.find(s => s.conversation_url === conversation_url);
+    // 限制单条消息存储长度，避免 sessions.json 膨胀
+    const maxLen = 4000;
+    const msg = {
+        role: 'user',
+        content: prompt.length > maxLen ? prompt.slice(0, maxLen) + '...(truncated)' : prompt,
+        time: new Date().toISOString(),
+    };
+    const assistantMsg = {
+        role: 'assistant',
+        content: (response_content || '').length > maxLen ? response_content.slice(0, maxLen) + '...(truncated)' : (response_content || ''),
+        time: new Date().toISOString(),
+    };
+    if (existing) {
+        existing.last_used = new Date().toISOString();
+        existing.message_count = (existing.message_count || 0) + 1;
+        if (topic) existing.topic = topic;
+        if (!existing.messages) existing.messages = []; // 兼容旧格式
+        existing.messages.push(msg);
+        if (response_content) existing.messages.push(assistantMsg);
+        // 清理旧格式字段
+        delete existing.first_prompt;
+        delete existing.last_response;
+    } else {
+        store.sessions.push({
+            conversation_url,
+            model: model || 'unknown',
+            topic: topic || '',
+            messages: [msg, ...(response_content ? [assistantMsg] : [])],
+            message_count: 1,
+            created_at: new Date().toISOString(),
+            last_used: new Date().toISOString(),
+        });
+    }
+    await saveSessions(store);
+}
+
+// ==========================================
+// API 调用
+// ==========================================
+
+async function callChatGPT({ model = 'gpt-instant', messages, conversation_url, timeout = 300000 }) {
+    const body = { model, messages };
+    if (conversation_url) body.conversation_url = conversation_url;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+
+    try {
+        const response = await fetch(`${API_URL}/v1/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${API_KEY}`,
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+        });
+        return await response.json();
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function formatResult(data) {
+    if (data.error) {
+        return { content: [{ type: 'text', text: `Error: ${data.error.message || JSON.stringify(data.error)}` }], isError: true };
+    }
+    const content = data.choices?.[0]?.message?.content || 'No response';
+    const convUrl = data.conversation_url || '';
+    const model = data.model || '';
+    let text = content;
+    if (convUrl) text += `\n\n[conversation: ${convUrl} | model: ${model}]`;
+    return { content: [{ type: 'text', text }], _meta: { conversation_url: convUrl, model } };
+}
+
+// ==========================================
+// MCP Server
+// ==========================================
+
+const server = new Server(
+    { name: 'webgpt2mcp', version: '1.0.0' },
+    { capabilities: { tools: {} } },
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+        {
+            name: 'chatgpt',
+            description: `向 ChatGPT 发送消息并获取回复，自动保存会话记录。
+会话路由规则（按优先级）：
+1. 传 conversation_url → 精确继续指定会话
+2. 不传 conversation_url 但传 topic → 自动匹配同 topic 的最近会话，无匹配则新建
+3. 都不传 → 创建新会话
+
+决策示例：
+- "开个新会话问 ChatGPT …" → 不传 conversation_url，可传 topic
+- "继续上次关于 X 的讨论" → 传 topic="X"，不传 conversation_url
+- 用户提供了会话链接 → 传 conversation_url
+- "列出我最近的会话" → 调用 chatgpt_sessions`,
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    prompt: { type: 'string', description: '发送给 ChatGPT 的消息' },
+                    model: {
+                        type: 'string',
+                        enum: ['gpt-instant', 'gpt-thinking', 'gpt-pro'],
+                        description: '模型选择: gpt-instant 最快，gpt-thinking 用于复杂推理',
+                        default: 'gpt-instant',
+                    },
+                    conversation_url: { type: 'string', description: '已有会话 URL，传入则继续该会话。不传则创建新会话。' },
+                    system_prompt: { type: 'string', description: '系统提示词，设定角色和上下文（可选）' },
+                    topic: { type: 'string', description: '会话主题标签，用于后续查找（可选）' },
+                },
+                required: ['prompt'],
+            },
+        },
+        {
+            name: 'chatgpt_sessions',
+            description: `管理 ChatGPT 会话：列表、查看完整对话历史、删除（本地+云端）。
+操作说明：
+- list: 列出最近会话，显示主题、消息数、首条预览
+- history: 查看指定会话的完整本地对话记录（user/assistant 逐条展示）
+- delete: 删除指定会话。delete_cloud=true 时同步删除 ChatGPT 云端会话
+- clear: 清空所有本地会话记录
+- sync: 同步云端状态。清理本地中已从云端删除的会话；pull_cloud=true 时同时拉取云端新会话
+决策示例：
+- "看看最近的 ChatGPT 会话" → action=list
+- "查看上次 KGQA 讨论的完整记录" → action=history, conversation_url=...
+- "删除这个会话，云端也一起删" → action=delete, conversation_url=..., delete_cloud=true`,
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    filter_topic: { type: 'string', description: '按主题过滤（模糊匹配）' },
+                    limit: { type: 'number', description: '返回数量，默认 10', default: 10 },
+                    action: { type: 'string', enum: ['list', 'history', 'delete', 'clear', 'sync'], description: '操作: list(默认)=列出, history=查看完整对话, delete=删除会话, clear=清空所有, sync=同步云端状态', default: 'list' },
+                    conversation_url: { type: 'string', description: 'history/delete 操作时指定会话 URL' },
+                    delete_cloud: { type: 'boolean', description: 'delete 时是否同步删除 ChatGPT 云端会话（默认 false，仅删本地）', default: false },
+                },
+            },
+        },
+        {
+            name: 'chatgpt_browse',
+            description: '让 ChatGPT 访问一个 URL 并回答关于该页面内容的问题。适用于阅读网页、GitHub 项目、文档等。',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    url: { type: 'string', description: '要访问的 URL' },
+                    question: { type: 'string', description: '关于页面内容的问题' },
+                    model: {
+                        type: 'string',
+                        enum: ['gpt-instant', 'gpt-thinking'],
+                        default: 'gpt-instant',
+                        description: '使用的模型',
+                    },
+                },
+                required: ['url', 'question'],
+            },
+        },
+    ],
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+
+    try {
+        if (name === 'chatgpt') {
+            let convUrl = args.conversation_url || null;
+            const topic = args.topic || '';
+
+            // 自动匹配：有 topic 但没传 conversation_url 时，查找已有会话复用
+            if (!convUrl && topic) {
+                const store = await loadSessions();
+                const matched = store.sessions.find(s =>
+                    s.topic && s.topic.toLowerCase() === topic.toLowerCase()
+                );
+                if (matched) {
+                    convUrl = matched.conversation_url;
+                }
+            }
+
+            const messages = [];
+            if (args.system_prompt) messages.push({ role: 'system', content: args.system_prompt });
+            messages.push({ role: 'user', content: args.prompt });
+
+            const data = await callChatGPT({
+                model: args.model || 'gpt-instant',
+                messages,
+                conversation_url: convUrl,
+            });
+
+            const result = formatResult(data);
+            // 自动保存会话
+            const finalUrl = data.conversation_url || convUrl;
+            if (finalUrl && !data.error) {
+                await recordSession({
+                    conversation_url: finalUrl,
+                    model: args.model,
+                    prompt: args.prompt,
+                    response_content: data.choices?.[0]?.message?.content || '',
+                    topic,
+                });
+            }
+            return result;
+        }
+
+        if (name === 'chatgpt_sessions') {
+            const action = args.action || 'list';
+
+            // 查看完整对话历史
+            if (action === 'history') {
+                if (!args.conversation_url) {
+                    return { content: [{ type: 'text', text: '请提供 conversation_url 指定要查看的会话。' }], isError: true };
+                }
+                const store = await loadSessions();
+                const session = store.sessions.find(s => s.conversation_url === args.conversation_url);
+                if (!session) {
+                    return { content: [{ type: 'text', text: `未找到会话: ${args.conversation_url}` }], isError: true };
+                }
+                const header = `[${session.model}] ${session.topic || '无主题'} | ${session.message_count}轮对话 | ${session.last_used?.replace('T', ' ').slice(0, 16)}`;
+                const msgs = (session.messages || []).map(m => {
+                    const tag = m.role === 'user' ? '👤 User' : '🤖 Assistant';
+                    const time = m.time?.replace('T', ' ').slice(11, 16) || '';
+                    return `[${time}] ${tag}:\n${m.content}`;
+                });
+                return { content: [{ type: 'text', text: `${header}\n${'─'.repeat(40)}\n${msgs.join('\n\n')}` }] };
+            }
+
+            // 删除指定会话
+            if (action === 'delete') {
+                if (!args.conversation_url) {
+                    return { content: [{ type: 'text', text: '请提供 conversation_url 指定要删除的会话。' }], isError: true };
+                }
+                const store = await loadSessions();
+                const before = store.sessions.length;
+                store.sessions = store.sessions.filter(s => s.conversation_url !== args.conversation_url);
+                const removed = before - store.sessions.length;
+                await saveSessions(store);
+
+                // 同步删除 ChatGPT 云端会话
+                let cloudResult = '';
+                if (args.delete_cloud) {
+                    try {
+                        const cloudResp = await fetch(`${API_URL}/admin/chatgpt/conversation`, {
+                            method: 'DELETE',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Authorization': `Bearer ${API_KEY}`,
+                            },
+                            body: JSON.stringify({ conversation_url: args.conversation_url }),
+                        });
+                        const cloudData = await cloudResp.json();
+                        cloudResult = cloudResp.ok ? ' | 云端已删除' : ` | 云端删除失败: ${cloudData.error || cloudResp.status}`;
+                    } catch (e) {
+                        cloudResult = ` | 云端删除异常: ${e.message}`;
+                    }
+                }
+
+                return { content: [{ type: 'text', text: `已删除 ${removed} 个本地会话。剩余 ${store.sessions.length} 个${cloudResult}` }] };
+            }
+
+            // 清空所有会话
+            if (action === 'clear') {
+                const store = await loadSessions();
+                const count = store.sessions.length;
+                const urls = store.sessions.map(s => s.conversation_url).filter(Boolean);
+
+                let cloudResult = '';
+                if (args.delete_cloud && urls.length > 0) {
+                    let deleted = 0;
+                    for (const url of urls) {
+                        try {
+                            await fetch(`${API_URL}/admin/chatgpt/conversation`, {
+                                method: 'DELETE',
+                                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${API_KEY}` },
+                                body: JSON.stringify({ conversation_url: url }),
+                            });
+                            deleted++;
+                        } catch {}
+                    }
+                    cloudResult = ` | 云端删除 ${deleted}/${urls.length}`;
+                }
+
+                store.sessions = [];
+                await saveSessions(store);
+                return { content: [{ type: 'text', text: `已清空全部 ${count} 个本地会话记录${cloudResult}。` }] };
+            }
+
+            // 同步云端状态（以云端为准，增量拉取到本地）
+            if (action === 'sync') {
+                try {
+                    const cloudResp = await fetch(`${API_URL}/admin/chatgpt/conversations?limit=50`, {
+                        headers: { 'Authorization': `Bearer ${API_KEY}` },
+                    });
+                    if (!cloudResp.ok) {
+                        return { content: [{ type: 'text', text: `同步失败: 无法获取云端会话 (${cloudResp.status})` }], isError: true };
+                    }
+                    const cloudData = await cloudResp.json();
+                    const cloudItems = cloudData.items || [];
+
+                    const store = await loadSessions();
+                    const before = store.sessions.length;
+
+                    // 以云端为准：拉取所有云端会话，更新本地已有/添加新的
+                    const localIdMap = new Map(
+                        store.sessions.map(s => {
+                            const id = s.conversation_url?.match(/\/c\/([0-9a-f-]+)/)?.[1];
+                            return [id, s];
+                        }).filter(([id]) => id)
+                    );
+
+                    let added = 0;
+                    let updated = 0;
+                    for (const cloud of cloudItems) {
+                        const existing = localIdMap.get(cloud.id);
+                        if (existing) {
+                            // 更新标题等元信息
+                            if (cloud.title && existing.topic !== cloud.title) {
+                                existing.topic = cloud.title;
+                                updated++;
+                            }
+                        } else {
+                            // 拉取新会话
+                            store.sessions.push({
+                                conversation_url: `https://chatgpt.com/c/${cloud.id}`,
+                                model: cloud.model || 'unknown',
+                                topic: cloud.title || '无主题',
+                                message_count: 0,
+                                first_prompt: '',
+                                messages: [],
+                                last_used: cloud.update_time?.replace('T', ' ').slice(0, 19) || new Date().toISOString(),
+                            });
+                            added++;
+                        }
+                    }
+
+                    await saveSessions(store);
+                    const parts = [`同步完成: 本地 ${before} → ${store.sessions.length} 个会话`];
+                    if (added > 0) parts.push(`从云端拉取了 ${added} 个新会话`);
+                    if (updated > 0) parts.push(`更新了 ${updated} 个会话标题`);
+                    if (added === 0 && updated === 0) parts.push('本地已与云端一致');
+                    return { content: [{ type: 'text', text: parts.join('；') + '。' }] };
+                } catch (e) {
+                    return { content: [{ type: 'text', text: `同步异常: ${e.message}` }], isError: true };
+                }
+            }
+
+            // 列表（默认）
+            const store = await loadSessions();
+            let sessions = store.sessions || [];
+            if (args.filter_topic) {
+                const kw = args.filter_topic.toLowerCase();
+                sessions = sessions.filter(s =>
+                    (s.topic || '').toLowerCase().includes(kw) ||
+                    (s.messages?.[0]?.content || '').toLowerCase().includes(kw)
+                );
+            }
+            const limit = args.limit || 10;
+            sessions = sessions.slice(0, limit);
+
+            if (sessions.length === 0) {
+                return { content: [{ type: 'text', text: '暂无会话记录。' }] };
+            }
+
+            const lines = sessions.map((s, i) => {
+                const time = s.last_used?.replace('T', ' ').slice(0, 16) || '';
+                const firstMsg = s.messages?.[0]?.content?.slice(0, 80) || '';
+                return `${i + 1}. [${s.model}] ${s.topic || '无主题'} (${s.message_count}轮, ${time})
+   URL: ${s.conversation_url}
+   首条: ${firstMsg}`;
+            });
+            return { content: [{ type: 'text', text: `ChatGPT 会话列表:\n\n${lines.join('\n\n')}` }] };
+        }
+
+        if (name === 'chatgpt_browse') {
+            const messages = [
+                { role: 'user', content: `请访问这个链接并回答问题：\nURL: ${args.url}\n\n问题：${args.question}` },
+            ];
+            const data = await callChatGPT({
+                model: args.model || 'gpt-instant',
+                messages,
+            });
+            const result = formatResult(data);
+            if (data.conversation_url && !data.error) {
+                await recordSession({
+                    conversation_url: data.conversation_url,
+                    model: args.model,
+                    prompt: `browse: ${args.url} - ${args.question}`,
+                    response_content: data.choices?.[0]?.message?.content || '',
+                    topic: 'browse',
+                });
+            }
+            return result;
+        }
+
+        return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
+    } catch (err) {
+        return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+    }
+});
+
+const transport = new StdioServerTransport();
+await server.connect(transport);

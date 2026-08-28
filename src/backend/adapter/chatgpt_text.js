@@ -19,8 +19,46 @@ import { logger } from '../../utils/logger.js';
 
 // --- 配置常量 ---
 const TARGET_URL = 'https://chatgpt.com/'; // 基础URL
-const INPUT_SELECTOR = '.ProseMirror';
+// ChatGPT has changed the composer markup more than once. Keep the stable
+// semantic fallbacks ahead of the generic contenteditable fallback so a stale
+// selector cannot make an otherwise healthy authenticated page unusable.
+const INPUT_SELECTORS = [
+    '#prompt-textarea',
+    '[contenteditable="true"][data-placeholder*="Ask ChatGPT"]',
+    '[contenteditable="true"][aria-label*="Ask ChatGPT"]',
+    '.ProseMirror[contenteditable="true"]',
+    '[contenteditable="true"][role="textbox"]',
+    'textarea[placeholder*="Ask ChatGPT"]',
+    '[contenteditable="true"]'
+];
 const DEBUG_DIR = path.join(process.cwd(), 'data', 'debug-chatgpt');
+
+async function findChatInput(page) {
+    for (const selector of INPUT_SELECTORS) {
+        const locator = page.locator(selector).first();
+        if (await locator.isVisible().catch(() => false)) return locator;
+    }
+    return null;
+}
+
+async function waitForChatInput(page, options = {}) {
+    const { timeout = 60000, click = false } = options;
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+        const input = await findChatInput(page);
+        if (input) {
+            await waitForInput(page, input, {
+                timeout: Math.max(deadline - Date.now(), 5000),
+                click
+            });
+            return input;
+        }
+        await page.waitForTimeout(250);
+    }
+
+    throw new Error(`ChatGPT composer not found (tried: ${INPUT_SELECTORS.join(', ')})`);
+}
 
 function normalizeConversationUrl(url) {
     if (!url || typeof url !== 'string') return null;
@@ -52,6 +90,13 @@ function isVisibleAssistantMessage(message) {
 
     const contentType = message.content?.content_type;
     return !contentType || contentType === 'text' || contentType === 'multimodal_text';
+}
+
+function isFinishedAssistantMessage(message) {
+    if (!isVisibleAssistantMessage(message)) return false;
+    return message.status === 'finished_successfully' ||
+        message.end_turn === true ||
+        message.metadata?.is_complete === true;
 }
 
 function cleanDomText(text) {
@@ -408,7 +453,8 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
         // 快速复用：如果页面已在目标 URL 且输入框可见，跳过导航（省 ~18s）
         const currentUrl = page.url();
-        const inputVisible = await page.locator(INPUT_SELECTOR).isVisible().catch(() => false);
+        const currentInput = await findChatInput(page);
+        const inputVisible = Boolean(currentInput);
         const canSkipNav = inputVisible && (
             // 新对话：页面在首页
             (!conversationUrl && (currentUrl === 'https://chatgpt.com/' || currentUrl === 'https://chatgpt.com')) ||
@@ -425,7 +471,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         }
 
         // 1. 等待输入框加载
-        await waitForInput(page, INPUT_SELECTOR, { click: false });
+        let inputLocator = await waitForChatInput(page, { click: false });
 
         // 2. 选择模型
         if (modelId) {
@@ -479,14 +525,19 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                         logger.info('全量监控', `★ stream_status BODY: ${body.slice(0, 1000)}`, meta);
                     }
 
-                    // 捕获 conversations 列表
-                    if (url.includes('/conversations?') && method === 'GET') {
+                    // Capture the newest normal-chat conversation only as an early fallback.
+                    // Never overwrite an ID once stream_status / a conversation URL has identified
+                    // the actual task. Sidebar/project/gizmo conversation lists are unrelated and
+                    // previously caused cross-chat response mixups.
+                    if (!capturedConversationId &&
+                        /\/backend-api\/conversations\?/.test(url) &&
+                        method === 'GET') {
                         try {
                             const data = JSON.parse(body);
                             if (Array.isArray(data?.items) && data.items.length > 0) {
                                 const c = data.items[0];
                                 capturedConversationId = c.id;
-                                logger.info('全量监控', `★ 从列表更新 conversation ID: ${c.id} title=${c.title}`, meta);
+                                logger.info('全量监控', `★ 从主会话列表捕获 conversation ID: ${c.id} title=${c.title}`, meta);
                             }
                         } catch {}
                     }
@@ -564,8 +615,44 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
         // 3. 输入提示词
         logger.info('适配器', '输入提示词...', meta);
-        await safeClick(page, INPUT_SELECTOR, { bias: 'input' });
-        await humanType(page, INPUT_SELECTOR, prompt);
+        inputLocator = await waitForChatInput(page, { click: false });
+        await safeClick(page, inputLocator, { bias: 'input' });
+        await humanType(page, inputLocator, prompt);
+
+        // If the target conversation is already streaming, prefer ChatGPT's native
+        // mid-stream steering UI. While thinking, the composer remains editable and
+        // ChatGPT may expose an enabled send button alongside the active stop button.
+        // If native steering is not available, interrupt the active answer first,
+        // preserve the typed steering prompt, then submit it as the next turn.
+        let activeSteerMode = null;
+        if (conversationUrl) {
+            const stopButton = page.locator('[data-testid=\"stop-button\"]');
+            const stopVisible = await stopButton.isVisible().catch(() => false);
+            if (stopVisible) {
+                const sendButton = page.locator('[data-testid=\"send-button\"]');
+                const sendVisible = await sendButton.isVisible().catch(() => false);
+                const sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
+                if (sendEnabled) {
+                    activeSteerMode = 'native';
+                    logger.info('适配器', '检测到正在生成的会话；使用 ChatGPT 原生中途 steer 提交新指令', meta);
+                } else {
+                    activeSteerMode = 'interrupt';
+                    logger.info('适配器', '检测到正在生成的会话；原生 steer 按钮不可用，先 Stop answering 再提交新指令', meta);
+                    await safeClick(page, stopButton, { bias: 'button' });
+                    await page.waitForSelector('[data-testid=\"stop-button\"]', { state: 'hidden', timeout: 15000 }).catch(() => { });
+                    await sleep(250, 450);
+
+                    // Some ChatGPT rerenders replace the composer when stopping. Make
+                    // sure the steering prompt survived before submitting it.
+                    inputLocator = await waitForChatInput(page, { click: false });
+                    const composerText = await inputLocator.innerText().catch(() => '');
+                    if (!composerText.includes(prompt)) {
+                        await safeClick(page, inputLocator, { bias: 'input' });
+                        await humanType(page, inputLocator, prompt);
+                    }
+                }
+            }
+        }
 
         // 4. 先启动 SSE 监听，再发送提示词（避免竞态）
         logger.info('适配器', '监听 SSE 流获取文本...', meta);
@@ -766,8 +853,21 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         }, { timeout: waitTimeout });
 
         // 5. 发送提示词
-        logger.debug('适配器', '发送提示词...', meta);
-        await page.keyboard.press('Enter');
+        logger.debug('适配器', activeSteerMode ? `发送 steer 提示词 (${activeSteerMode})...` : '发送提示词...', meta);
+        if (activeSteerMode === 'native') {
+            const steerSendButton = page.locator('[data-testid=\"send-button\"]');
+            const canClickSteer = await steerSendButton.isVisible().catch(() => false) &&
+                await steerSendButton.isEnabled().catch(() => false);
+            if (canClickSteer) {
+                await safeClick(page, steerSendButton, { bias: 'button' });
+            } else {
+                // The control can rerender between typing and submission. Fall back to
+                // the keyboard action, which is what the ChatGPT composer itself uses.
+                await page.keyboard.press('Enter');
+            }
+        } else {
+            await page.keyboard.press('Enter');
+        }
         if (debug) {
             pushLimited(debug.events, {
                 at: new Date().toISOString(),
@@ -787,7 +887,10 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                 return new Promise(() => { });
             });
 
-        const domTextPromise = waitForAssistantTextFromDom(page, assistantCountBefore, waitTimeout, meta);
+        // DOM renders assistant text incrementally, so it is not an authoritative
+        // completion signal. Wait for the ChatGPT response stream / handoff path to
+        // finish first; only use DOM after those completion-aware paths time out.
+        // This prevents returning a visibly-rendered prefix as the Codex model result.
 
         // stream_handoff 专用处理：并行等待 WebSocket / convId，convId 一到立即走 API
         const handoffTextPromise = streamHandoffPromise.then(async () => {
@@ -855,18 +958,31 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                         }, { url: apiUrl, hdrs });
 
                         if (apiResponse && !apiResponse.error && apiResponse.mapping) {
-                            let latestText = '';
-                            let latestTs = 0;
+                            // Anchor the reply to the exact user prompt we just sent. Without this,
+                            // an existing conversation can briefly return its previous assistant
+                            // message while the new turn is still being written to the cloud graph.
+                            let sentUserTs = 0;
                             for (const [, node] of Object.entries(apiResponse.mapping)) {
                                 const msg = node?.message;
-                                if (msg?.author?.role === 'assistant' &&
-                                    msg?.content?.content_type === 'text' &&
-                                    (msg?.create_time || 0) > latestTs) {
-                                    const parts = msg.content.parts;
-                                    const text = Array.isArray(parts) ? parts.join('') : '';
-                                    if (text && !isPlaceholderDomText(text)) {
-                                        latestText = text;
-                                        latestTs = msg.create_time || 0;
+                                if (msg?.author?.role !== 'user') continue;
+                                const userText = extractVisibleText(msg?.content?.parts);
+                                if (userText === prompt && (msg?.create_time || 0) > sentUserTs) {
+                                    sentUserTs = msg.create_time || 0;
+                                }
+                            }
+
+                            let latestText = '';
+                            let latestTs = 0;
+                            if (sentUserTs > 0) {
+                                for (const [, node] of Object.entries(apiResponse.mapping)) {
+                                    const msg = node?.message;
+                                    const ts = msg?.create_time || 0;
+                                    if (isFinishedAssistantMessage(msg) && ts > sentUserTs && ts > latestTs) {
+                                        const text = extractVisibleText(msg.content.parts);
+                                        if (text && !isPlaceholderDomText(text)) {
+                                            latestText = text;
+                                            latestTs = ts;
+                                        }
                                     }
                                 }
                             }
@@ -911,17 +1027,29 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             return '';
         });
 
-        textContent = await Promise.race([sseTextPromise, domTextPromise, handoffTextPromise]);
+        const authoritativeTimeoutPromise = new Promise(resolve => {
+            setTimeout(() => resolve(''), waitTimeout + 1000);
+        });
+        textContent = await Promise.race([
+            sseTextPromise,
+            handoffTextPromise,
+            authoritativeTimeoutPromise
+        ]);
 
         if (!textContent || textContent.trim() === '') {
-            logger.warn('适配器', 'SSE 未解析到文本，尝试从页面 DOM 读取最后一条回复', meta);
+            logger.warn('适配器', '完成感知通道未返回文本，尝试从页面 DOM 读取最后一条回复', meta);
             await page.waitForTimeout(1200);
             textContent = await extractLatestAssistantTextFromDom(page, assistantCountBefore);
         }
 
-        // 终极兜底：通过 ChatGPT 后端 API 直接获取对话内容（使用 Bearer token）
-        if ((!textContent || textContent.trim() === '') && capturedConversationId) {
-            logger.info('适配器', `尝试通过 API 获取对话内容: ${capturedConversationId}`, meta);
+        // Treat the finished message stored in the authenticated ChatGPT cloud
+        // conversation as authoritative. The DOM can expose a stable-looking prefix
+        // before the turn is actually complete; the cloud graph carries completion
+        // state and is also the transcript Mike can inspect manually.
+        const pageConversationMatch = page.url().match(/\/c\/([0-9a-f-]+)/i);
+        const authoritativeConversationId = pageConversationMatch?.[1] || capturedConversationId;
+        if (authoritativeConversationId) {
+            logger.info('适配器', `通过 API 验证已完成的最终回复: ${authoritativeConversationId}`, meta);
             try {
                 // 获取 access token（ChatGPT 使用 Auth0，需 Bearer token）
                 const accessToken = await page.evaluate(async () => {
@@ -934,7 +1062,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                 });
                 logger.info('适配器', `access token: ${accessToken ? '已获取' : '未获取'}`, meta);
 
-                const apiUrl = `https://chatgpt.com/backend-api/conversation/${capturedConversationId}`;
+                const apiUrl = `https://chatgpt.com/backend-api/conversation/${authoritativeConversationId}`;
                 const headers = { 'Accept': 'application/json' };
                 if (accessToken) {
                     headers['Authorization'] = `Bearer ${accessToken}`;
@@ -943,37 +1071,57 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                     headers['Cookie'] = cookies.map(c => `${c.name}=${c.value}`).join('; ');
                 }
 
-                const apiResponse = await page.evaluate(async ({ url, hdrs }) => {
-                    const res = await fetch(url, { headers: hdrs });
-                    if (!res.ok) return { error: `HTTP ${res.status}` };
-                    return await res.json();
-                }, { url: apiUrl, hdrs: headers });
+                const verifyDeadline = Date.now() + 15000;
+                let verifiedFinalText = '';
+                let lastApiError = null;
+                while (Date.now() < verifyDeadline && !verifiedFinalText) {
+                    const apiResponse = await page.evaluate(async ({ url, hdrs }) => {
+                        const res = await fetch(url, { headers: hdrs });
+                        if (!res.ok) return { error: `HTTP ${res.status}` };
+                        return await res.json();
+                    }, { url: apiUrl, hdrs: headers });
 
-                if (apiResponse && !apiResponse.error) {
-                    const messages = apiResponse?.mapping || {};
-                    let latestAssistantText = '';
-                    let latestTimestamp = 0;
-                    for (const [, node] of Object.entries(messages)) {
-                        const msg = node?.message;
-                        if (msg?.author?.role === 'assistant' &&
-                            msg?.content?.content_type === 'text' &&
-                            (msg?.create_time || 0) > latestTimestamp) {
-                            const parts = msg.content.parts;
-                            const text = Array.isArray(parts) ? parts.join('') : '';
-                            if (text && !isPlaceholderDomText(text)) {
-                                latestAssistantText = text;
-                                latestTimestamp = msg.create_time || 0;
+                    if (apiResponse && !apiResponse.error) {
+                        const messages = apiResponse?.mapping || {};
+                        let sentUserTs = 0;
+                        for (const [, node] of Object.entries(messages)) {
+                            const msg = node?.message;
+                            if (msg?.author?.role !== 'user') continue;
+                            const userText = extractVisibleText(msg?.content?.parts);
+                            if (userText === prompt && (msg?.create_time || 0) > sentUserTs) {
+                                sentUserTs = msg.create_time || 0;
                             }
                         }
-                    }
-                    if (latestAssistantText) {
-                        textContent = latestAssistantText;
-                        logger.info('适配器', `API 获取成功: ${textContent.length} 字符`, meta);
+
+                        let latestTimestamp = 0;
+                        if (sentUserTs > 0) {
+                            for (const [, node] of Object.entries(messages)) {
+                                const msg = node?.message;
+                                const ts = msg?.create_time || 0;
+                                if (isFinishedAssistantMessage(msg) && ts > sentUserTs && ts > latestTimestamp) {
+                                    const text = extractVisibleText(msg.content.parts);
+                                    if (text && !isPlaceholderDomText(text)) {
+                                        verifiedFinalText = text;
+                                        latestTimestamp = ts;
+                                    }
+                                }
+                            }
+                        }
+                        lastApiError = null;
                     } else {
-                        logger.info('适配器', 'API 返回对话但未找到 assistant 文本', meta);
+                        lastApiError = apiResponse?.error || 'unknown';
                     }
+
+                    if (!verifiedFinalText) await sleep(500, 650);
+                }
+
+                if (verifiedFinalText) {
+                    textContent = verifiedFinalText;
+                    logger.info('适配器', `已验证最终回复: ${textContent.length} 字符`, meta);
+                } else if (lastApiError) {
+                    logger.info('适配器', `最终回复验证 API 失败: ${lastApiError}`, meta);
                 } else {
-                    logger.info('适配器', `API 请求失败: ${apiResponse?.error || 'unknown'}`, meta);
+                    logger.info('适配器', '最终回复验证超时；保留完成感知通道的结果', meta);
                 }
             } catch (apiErr) {
                 logger.warn('适配器', `API 获取对话失败: ${apiErr.message}`, meta);
@@ -1041,6 +1189,21 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                 .catch(() => {});  // 忽略错误，不影响响应
         }
     }
+}
+
+/**
+ * Oracle deployment safety stub. The upstream admin route imports this symbol
+ * but the public release does not implement it. Keep cloud deletion disabled
+ * rather than guessing at ChatGPT private delete APIs.
+ */
+export async function deleteChatGptConversation(_page, conversationUrl, _options = {}) {
+    const match = String(conversationUrl || '').match(/\/c\/([^/?#]+)/);
+    return {
+        success: false,
+        conversationId: match ? match[1] : null,
+        status: 'disabled',
+        error: 'Cloud conversation deletion is disabled in this Oracle deployment'
+    };
 }
 
 /**

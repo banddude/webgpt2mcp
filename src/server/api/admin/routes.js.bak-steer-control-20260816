@@ -1,0 +1,1140 @@
+/**
+ * @fileoverview Admin API 路由模块
+ * @description 提供管理接口，包括系统状态、配置管理、适配器元数据等
+ */
+
+import { sendJson, sendApiError } from '../../respond.js';
+import { ERROR_CODES } from '../../errors.js';
+import { logger } from '../../../utils/logger.js';
+import yaml from 'yaml';
+import {
+    getSystemStatus,
+    getDataFolders,
+    deleteDataFolders,
+    clearTempFiles
+} from '../../../utils/systemInfo.js';
+import {
+    getServerConfig,
+    saveServerConfig,
+    getBrowserConfig,
+    saveBrowserConfig,
+    getQueueConfig,
+    saveQueueConfig,
+    getInstancesConfig,
+    saveInstancesConfig,
+    getAdaptersConfig,
+    saveAdaptersConfig,
+    getPoolConfig,
+    savePoolConfig
+} from '../../../config/manager.js';
+import {
+    validateServerConfig,
+    validateBrowserConfig,
+    validateInstancesConfig,
+    validatePoolConfig,
+    validateAdaptersConfig
+} from '../../../config/validator.js';
+import { registry } from '../../../backend/registry.js';
+import { sendRestartSignal, sendStopSignal, isUnderSupervisor, getVncInfo } from '../../../utils/ipc.js';
+import { getTodayStats, getStatsRange, clearStatsRange } from '../../../utils/stats.js';
+import {
+    getList as getHistoryList,
+    getDetail as getHistoryDetail,
+    getDeleteTargetsByIds,
+    getDeleteTargetsByDateRange,
+    deleteRecords as deleteHistoryRecords,
+    deleteByDateRange as deleteHistoryByDateRange,
+    retryMediaDownload,
+    getStats as getHistoryStats,
+    getModelList as getHistoryModelList,
+    getMediaDir
+} from '../../../utils/history.js';
+import path from 'path';
+import fs from 'fs/promises';
+import { useContextDownload } from '../../../backend/utils/download.js';
+import { deleteChatGptConversation } from '../../../backend/adapter/chatgpt_text.js';
+import { getBackend } from '../../../backend/index.js';
+
+/**
+ * 读取请求体
+ * @param {import('http').IncomingMessage} req
+ * @returns {Promise<object>}
+ */
+async function readBody(req) {
+    const chunks = [];
+    for await (const chunk of req) {
+        chunks.push(chunk);
+    }
+    const body = Buffer.concat(chunks).toString();
+    return body ? JSON.parse(body) : {};
+}
+
+function getConversationKey(record) {
+    if (!record?.conversationUrl) return null;
+    const match = record.conversationUrl.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+    return match ? match[1] : record.conversationUrl;
+}
+
+async function deleteCloudConversations(records, queueManager) {
+    const targets = new Map();
+    for (const record of records) {
+        if (!record.conversationUrl) continue;
+        const key = getConversationKey(record);
+        if (!key) continue;
+        if (!targets.has(key)) {
+            targets.set(key, {
+                conversationUrl: record.conversationUrl,
+                recordIds: []
+            });
+        }
+        targets.get(key).recordIds.push(record.id);
+    }
+
+    const summary = {
+        requested: targets.size,
+        deleted: 0,
+        failed: 0,
+        skipped: records.length - Array.from(targets.values()).reduce((sum, target) => sum + target.recordIds.length, 0),
+        results: []
+    };
+
+    if (targets.size === 0) return summary;
+
+    let poolContext = queueManager?.getPoolContext?.();
+    if (!poolContext) {
+        poolContext = await queueManager?.initializePool?.();
+    }
+
+    const page = poolContext?.poolManager?.getFirstPage?.();
+    if (!page) {
+        for (const target of targets.values()) {
+            summary.failed++;
+            summary.results.push({
+                conversationUrl: target.conversationUrl,
+                recordIds: target.recordIds,
+                success: false,
+                error: 'ChatGPT 浏览器页面不可用'
+            });
+        }
+        return summary;
+    }
+
+    for (const target of targets.values()) {
+        const result = await deleteChatGptConversation(page, target.conversationUrl, {
+            source: 'history-delete'
+        });
+        if (result.success) {
+            summary.deleted++;
+        } else {
+            summary.failed++;
+        }
+        summary.results.push({
+            conversationUrl: target.conversationUrl,
+            conversationId: result.conversationId,
+            recordIds: target.recordIds,
+            success: result.success,
+            status: result.status,
+            error: result.error
+        });
+    }
+
+    return summary;
+}
+
+/**
+ * 创建 Admin 路由处理器
+ * @param {object} context - 路由上下文
+ * @param {object} context.config - 完整配置对象
+ * @param {object} context.queueManager - 队列管理器
+ * @param {string} context.tempDir - 临时目录
+ * @returns {Function} Admin 路由处理函数
+ */
+export function createAdminRouter(context) {
+    const { config, queueManager, tempDir, getSafeMode } = context;
+
+    // ==================== Skill 系统 ====================
+
+    const SKILLS_DIR = path.join(process.cwd(), 'skills');
+
+    // Skill 任务状态追踪
+    const skillTasks = new Map();
+
+    /**
+     * 加载 skill 定义
+     * @param {string} name - skill 名称（不含扩展名）
+     * @returns {object|null}
+     */
+    async function loadSkill(name) {
+        const yamlPath = path.join(SKILLS_DIR, `${name}.yaml`);
+        const ymlPath = path.join(SKILLS_DIR, `${name}.yml`);
+        let filePath = null;
+        try { await fs.access(yamlPath); filePath = yamlPath; } catch { try { await fs.access(ymlPath); filePath = ymlPath; } catch {} }
+        if (!filePath) return null;
+        const content = await fs.readFile(filePath, 'utf-8');
+        return yaml.parse(content);
+    }
+
+    /**
+     * 列出所有可用 skills
+     */
+    async function listSkills() {
+        try {
+            const files = await fs.readdir(SKILLS_DIR);
+            const skills = [];
+            for (const file of files) {
+                if (!file.endsWith('.yaml') && !file.endsWith('.yml')) continue;
+                try {
+                    const content = await fs.readFile(path.join(SKILLS_DIR, file), 'utf-8');
+                    const skill = yaml.parse(content);
+                    if (skill?.name) {
+                        skills.push({
+                            name: skill.name,
+                            description: skill.description || '',
+                            model: skill.model || 'gpt-thinking',
+                            file: file
+                        });
+                    }
+                } catch { /* skip invalid */ }
+            }
+            return skills;
+        } catch {
+            return [];
+        }
+    }
+
+    /**
+     * Admin 路由处理函数
+     * @param {import('http').IncomingMessage} req
+     * @param {import('http').ServerResponse} res
+     * @param {string} pathname - 去除 /admin 前缀后的路径
+     */
+    return async function handleAdminRequest(req, res, pathname) {
+        const method = req.method;
+
+        try {
+            // ==================== 系统管理 ====================
+
+            // GET /admin/status - 系统状态
+            if (method === 'GET' && pathname === '/status') {
+                const status = getSystemStatus();
+                const safeMode = getSafeMode?.() || { enabled: false, reason: null };
+                sendJson(res, 200, { ...status, safeMode });
+                return;
+            }
+
+            // POST /admin/restart - 重启服务
+            if (method === 'POST' && pathname === '/restart') {
+                // 解析请求体获取重启参数
+                let loginMode = null;
+                let workerName = null;
+                try {
+                    const body = await readBody(req);
+                    loginMode = body.loginMode || null;
+                    workerName = body.workerName || null;
+                } catch { /* 无请求体时使用默认值 */ }
+
+                const modeDesc = loginMode
+                    ? (workerName ? `登录模式 (${workerName})` : '登录模式')
+                    : '普通模式';
+                sendJson(res, 200, { success: true, message: `服务正在以${modeDesc}重启...` });
+                logger.info('管理器', `收到重启请求: ${modeDesc}`);
+
+                setTimeout(async () => {
+                    // 构建启动参数（仅登录模式相关）
+                    const extraArgs = [];
+                    if (loginMode) {
+                        extraArgs.push(workerName ? `-login=${workerName}` : '-login');
+                    }
+
+                    if (isUnderSupervisor()) {
+                        // Supervisor 模式：通过 IPC 发送带参数的重启信号
+                        const sent = await sendRestartSignal(extraArgs);
+                        if (!sent) {
+                            logger.warn('管理器', 'IPC 重启信号发送失败，尝试自重启');
+                            // 降级到自重启
+                            const { spawn } = await import('child_process');
+                            const newArgs = process.argv.slice(1).filter(arg => !arg.startsWith('-login'));
+                            newArgs.push(...extraArgs);
+                            const child = spawn(process.execPath, newArgs, {
+                                cwd: process.cwd(),
+                                detached: true,
+                                stdio: 'ignore',
+                                env: process.env
+                            });
+                            child.unref();
+                            setTimeout(() => process.exit(0), 500);
+                        }
+                    } else {
+                        // 独立模式：使用子进程自重启
+                        const { spawn } = await import('child_process');
+                        const newArgs = process.argv.slice(1).filter(arg => !arg.startsWith('-login'));
+                        newArgs.push(...extraArgs);
+                        const child = spawn(process.execPath, newArgs, {
+                            cwd: process.cwd(),
+                            detached: true,
+                            stdio: 'ignore',
+                            env: process.env
+                        });
+                        child.unref();
+                        setTimeout(() => process.exit(0), 500);
+                    }
+                }, 500);
+                return;
+            }
+
+            // POST /admin/stop - 停止服务
+            if (method === 'POST' && pathname === '/stop') {
+                sendJson(res, 200, { success: true, message: '服务正在停止...' });
+                logger.info('管理器', '收到停止请求，将在 1 秒后退出');
+
+                setTimeout(() => process.exit(0), 1000);
+                return;
+            }
+
+            // GET /admin/vnc/status - VNC 状态
+            if (method === 'GET' && pathname === '/vnc/status') {
+                const vncInfo = await getVncInfo();
+                if (vncInfo) {
+                    sendJson(res, 200, vncInfo);
+                } else {
+                    // 非 Supervisor 模式或无法获取信息
+                    sendJson(res, 200, {
+                        enabled: false,
+                        port: 0,
+                        display: '',
+                        xvfbMode: false
+                    });
+                }
+                return;
+            }
+
+            // ==================== 缓存与数据管理 ====================
+
+            // POST /admin/cache/clear - 清理缓存
+            if (method === 'POST' && pathname === '/cache/clear') {
+                const result = clearTempFiles(tempDir);
+                sendJson(res, 200, { success: true, cleaned: result.cleaned });
+                return;
+            }
+
+            // GET /admin/logs - 读取系统日志
+            if (method === 'GET' && pathname === '/logs') {
+                const url = new URL(req.url, `http://${req.headers.host}`);
+                const lines = parseInt(url.searchParams.get('lines') || '200', 10);
+                const result = logger.readLogs(lines);
+                sendJson(res, 200, result);
+                return;
+            }
+
+            // DELETE /admin/logs - 清除系统日志
+            if (method === 'DELETE' && pathname === '/logs') {
+                const success = logger.clearLogs();
+                if (success) {
+                    logger.info('管理器', '系统日志已清除');
+                    sendJson(res, 200, { success: true, message: '日志已清除' });
+                } else {
+                    sendJson(res, 500, { success: false, message: '日志清除失败' });
+                }
+                return;
+            }
+
+            // GET /admin/data-folders - 列出数据文件夹
+            if (method === 'GET' && pathname === '/data-folders') {
+                const workers = config.backend?.pool?.workers || [];
+                const folders = getDataFolders(workers);
+                sendJson(res, 200, folders);
+                return;
+            }
+
+            // POST /admin/data-folders/delete - 删除数据文件夹
+            if (method === 'POST' && pathname === '/data-folders/delete') {
+                const body = await readBody(req);
+                if (!body.folders || !Array.isArray(body.folders)) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: '缺少 folders 数组' });
+                    return;
+                }
+                const workers = config.backend?.pool?.workers || [];
+                const result = deleteDataFolders(body.folders, workers);
+
+                if (result.errors.length > 0) {
+                    sendJson(res, 207, result); // 207 Multi-Status
+                } else {
+                    sendJson(res, 200, result);
+                }
+                return;
+            }
+
+            // ==================== 配置管理 ====================
+
+            // GET/POST /admin/config/server
+            if (pathname === '/config/server') {
+                if (method === 'GET') {
+                    const serverConfig = getServerConfig();
+                    const queueConfig = getQueueConfig();
+                    sendJson(res, 200, {
+                        ...serverConfig,
+                        queueBuffer: queueConfig.queueBuffer,
+                        imageLimit: queueConfig.imageLimit
+                    });
+                } else if (method === 'POST') {
+                    const body = await readBody(req);
+
+                    // 校验配置
+                    const validation = validateServerConfig(body);
+                    if (!validation.valid) {
+                        sendApiError(res, {
+                            code: ERROR_CODES.INVALID_REQUEST_BODY,
+                            message: `配置校验失败: ${validation.errors.join('; ')}`
+                        });
+                        return;
+                    }
+
+                    // 分别保存 server 和 queue 配置
+                    saveServerConfig(body);
+                    if (body.queueBuffer !== undefined || body.imageLimit !== undefined) {
+                        saveQueueConfig(body);
+                    }
+                    sendJson(res, 200, { success: true, message: '配置已保存，请重启服务生效' });
+                } else {
+                    res.writeHead(405);
+                    res.end();
+                }
+                return;
+            }
+
+            // GET/POST /admin/config/browser
+            if (pathname === '/config/browser') {
+                if (method === 'GET') {
+                    sendJson(res, 200, getBrowserConfig());
+                } else if (method === 'POST') {
+                    const body = await readBody(req);
+
+                    // 校验配置
+                    const validation = validateBrowserConfig(body);
+                    if (!validation.valid) {
+                        sendApiError(res, {
+                            code: ERROR_CODES.INVALID_REQUEST_BODY,
+                            message: `配置校验失败: ${validation.errors.join('; ')}`
+                        });
+                        return;
+                    }
+
+                    saveBrowserConfig(body);
+                    sendJson(res, 200, { success: true, message: '配置已保存，请重启服务生效' });
+                } else {
+                    res.writeHead(405);
+                    res.end();
+                }
+                return;
+            }
+
+            // GET/POST /admin/config/instances (对应原设计的 workers)
+            if (pathname === '/config/instances' || pathname === '/config/workers') {
+                if (method === 'GET') {
+                    sendJson(res, 200, getInstancesConfig());
+                } else if (method === 'POST') {
+                    const body = await readBody(req);
+
+                    // 校验配置（包括 Instance/Worker 名称唯一性）
+                    const validation = validateInstancesConfig(body);
+                    if (!validation.valid) {
+                        sendApiError(res, {
+                            code: ERROR_CODES.INVALID_REQUEST_BODY,
+                            message: `配置校验失败: ${validation.errors.join('; ')}`
+                        });
+                        return;
+                    }
+
+                    saveInstancesConfig(body);
+                    sendJson(res, 200, { success: true, message: '配置已保存，请重启服务生效' });
+                } else {
+                    res.writeHead(405);
+                    res.end();
+                }
+                return;
+            }
+
+            // GET/POST /admin/config/adapters
+            if (pathname === '/config/adapters') {
+                if (method === 'GET') {
+                    sendJson(res, 200, getAdaptersConfig());
+                } else if (method === 'POST') {
+                    const body = await readBody(req);
+
+                    // 校验配置
+                    const validation = validateAdaptersConfig(body);
+                    if (!validation.valid) {
+                        sendApiError(res, {
+                            code: ERROR_CODES.INVALID_REQUEST_BODY,
+                            message: `配置校验失败: ${validation.errors.join('; ')}`
+                        });
+                        return;
+                    }
+
+                    saveAdaptersConfig(body);
+                    sendJson(res, 200, { success: true, message: '配置已保存，请重启服务生效' });
+                } else {
+                    res.writeHead(405);
+                    res.end();
+                }
+                return;
+            }
+
+            // GET/POST /admin/config/pool - 负载均衡和故障转移配置
+            if (pathname === '/config/pool') {
+                if (method === 'GET') {
+                    sendJson(res, 200, getPoolConfig());
+                } else if (method === 'POST') {
+                    const body = await readBody(req);
+
+                    // 校验配置
+                    const validation = validatePoolConfig(body);
+                    if (!validation.valid) {
+                        sendApiError(res, {
+                            code: ERROR_CODES.INVALID_REQUEST_BODY,
+                            message: `配置校验失败: ${validation.errors.join('; ')}`
+                        });
+                        return;
+                    }
+
+                    savePoolConfig(body);
+                    sendJson(res, 200, { success: true, message: '配置已保存，请重启服务生效' });
+                } else {
+                    res.writeHead(405);
+                    res.end();
+                }
+                return;
+            }
+
+            // ==================== 元数据 ====================
+
+            // GET /admin/adapters - 获取适配器列表（含 configSchema）
+            if (method === 'GET' && pathname === '/adapters') {
+                const adapters = [];
+                const adapterIds = registry.getAdapterIds();
+                const adapterConfig = getAdaptersConfig();
+
+                for (const id of adapterIds) {
+                    const adapter = registry.getAdapter(id);
+                    if (adapter) {
+                        const config = adapterConfig[id] || {};
+                        adapters.push({
+                            id: adapter.id,
+                            displayName: adapter.displayName || adapter.id,
+                            description: adapter.description || '',
+                            modelCount: adapter.models?.length || 0,
+                            models: (adapter.models || []).map(m => m.id),
+                            modelFilter: config.modelFilter || { mode: 'blacklist', list: [] },
+                            configSchema: adapter.configSchema || []
+                        });
+                    }
+                }
+
+                sendJson(res, 200, adapters);
+                return;
+            }
+
+            // ==================== 统计与监控 ====================
+
+            // GET /admin/stats - 基本统计（包含今日成功/失败）
+            if (method === 'GET' && pathname === '/stats') {
+                const instances = config.backend?.pool?.instances || [];
+                const workers = config.backend?.pool?.workers || [];
+                const todayStats = getTodayStats();
+
+                sendJson(res, 200, {
+                    instances: instances.length,
+                    workers: workers.length,
+                    success: todayStats.success,
+                    failed: todayStats.failed
+                });
+                return;
+            }
+
+            // GET /admin/stats/range - 查询日期范围统计
+            if (method === 'GET' && pathname === '/stats/range') {
+                const url = new URL(req.url, `http://${req.headers.host}`);
+                const start = url.searchParams.get('start');
+                const end = url.searchParams.get('end');
+
+                if (!start || !end) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: '缺少 start 或 end 参数' });
+                    return;
+                }
+
+                const result = await getStatsRange(start, end);
+                sendJson(res, 200, result);
+                return;
+            }
+
+            // DELETE /admin/stats/range - 删除日期范围统计
+            if (method === 'DELETE' && pathname === '/stats/range') {
+                const url = new URL(req.url, `http://${req.headers.host}`);
+                const start = url.searchParams.get('start');
+                const end = url.searchParams.get('end');
+
+                if (!start || !end) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: '缺少 start 或 end 参数' });
+                    return;
+                }
+
+                const result = await clearStatsRange(start, end);
+                sendJson(res, 200, { success: true, deleted: result.deleted });
+                return;
+            }
+
+            // GET /admin/queue - 任务队列状态
+            if (method === 'GET' && pathname === '/queue') {
+                const queueStatus = queueManager.getStatus();
+                const detailedStatus = queueManager.getDetailedStatus();
+
+                sendJson(res, 200, {
+                    processing: queueStatus.processing,
+                    waiting: queueStatus.queueLength,
+                    total: queueStatus.total,
+                    processingTasks: detailedStatus.processing,
+                    waitingTasks: detailedStatus.waiting
+                });
+                return;
+            }
+
+            // GET /admin/chatgpt/page-state - diagnostic state for active ChatGPT page
+            if (method === 'GET' && pathname === '/chatgpt/page-state') {
+                let poolContext = queueManager?.getPoolContext?.();
+                if (!poolContext) poolContext = await queueManager?.initializePool?.();
+                const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                if (!page) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                    return;
+                }
+                const state = await page.evaluate(async () => {
+                    const buttons = Array.from(document.querySelectorAll('button')).map((b, i) => ({
+                        i,
+                        text: (b.innerText || '').trim().slice(0, 120),
+                        aria: b.getAttribute('aria-label'),
+                        testid: b.getAttribute('data-testid'),
+                        disabled: !!b.disabled,
+                        type: b.getAttribute('type')
+                    })).filter(b => b.text || b.aria || b.testid);
+                    let streamStatus = null;
+                    const m = location.pathname.match(/\/c\/([0-9a-f-]+)/i);
+                    if (m) {
+                        try {
+                            const r = await fetch(`/backend-api/conversation/${m[1]}/stream_status`, { credentials: 'include' });
+                            streamStatus = r.ok ? await r.json() : { http: r.status };
+                        } catch (e) { streamStatus = { error: e.message }; }
+                    }
+                    const composer = document.querySelector('.ProseMirror');
+                    return {
+                        url: location.href,
+                        title: document.title,
+                        streamStatus,
+                        composer: composer ? {
+                            text: (composer.innerText || '').slice(0, 500),
+                            contenteditable: composer.getAttribute('contenteditable'),
+                            ariaDisabled: composer.getAttribute('aria-disabled')
+                        } : null,
+                        buttons
+                    };
+                });
+                sendJson(res, 200, state);
+                return;
+            }
+
+            // ==================== 请求历史 ====================
+
+            // GET /admin/chatgpt/conversations - 列出最近的 ChatGPT 会话
+            if (method === 'GET' && pathname === '/chatgpt/conversations') {
+                const url = new URL(req.url, `http://${req.headers.host}`);
+                const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+                const limit = parseInt(url.searchParams.get('limit') || '28', 10);
+
+                let poolContext = queueManager?.getPoolContext?.();
+                if (!poolContext) poolContext = await queueManager?.initializePool?.();
+                const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                if (!page) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT 浏览器页面不可用' });
+                    return;
+                }
+
+                const result = await page.evaluate(async ({ offset: o, limit: l }) => {
+                    try {
+                        const sessionRes = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
+                        if (!sessionRes.ok) return { error: `session failed: ${sessionRes.status}` };
+                        const session = await sessionRes.json();
+                        const accessToken = session?.accessToken;
+                        if (!accessToken) return { error: `no access token, session keys: ${Object.keys(session || {}).join(',')}` };
+
+                        const res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, {
+                            headers: { 'Authorization': `Bearer ${accessToken}` }
+                        });
+                        if (!res.ok) return { error: `api failed: ${res.status}` };
+                        const data = await res.json();
+                        return { items: (data.items || []).map(c => ({
+                            id: c.id,
+                            title: c.title,
+                            create_time: c.create_time,
+                            update_time: c.update_time,
+                            model: c.model || null
+                        })) };
+                    } catch (e) { return { error: e.message }; }
+                }, { offset, limit });
+
+                if (result.error) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: result.error });
+                } else {
+                    sendJson(res, 200, result);
+                }
+                return;
+            }
+
+            // GET /admin/chatgpt/conversation/:id - 获取指定会话的完整历史
+            const convDetailMatch = pathname.match(/^\/chatgpt\/conversation\/([0-9a-f-]+)$/);
+            if (method === 'GET' && convDetailMatch) {
+                const convId = convDetailMatch[1];
+
+                let poolContext = queueManager?.getPoolContext?.();
+                if (!poolContext) poolContext = await queueManager?.initializePool?.();
+                const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                if (!page) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT 浏览器页面不可用' });
+                    return;
+                }
+
+                const result = await page.evaluate(async (id) => {
+                    try {
+                        const sessionRes = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
+                        if (!sessionRes.ok) return { error: `session failed: ${sessionRes.status}` };
+                        const session = await sessionRes.json();
+                        const accessToken = session?.accessToken;
+                        if (!accessToken) return { error: `no access token, session keys: ${Object.keys(session || {}).join(',')}` };
+
+                        const res = await fetch(`https://chatgpt.com/backend-api/conversation/${id}`, {
+                            headers: { 'Authorization': `Bearer ${accessToken}` }
+                        });
+                        if (!res.ok) return { error: `api failed: ${res.status}` };
+                        const data = await res.json();
+
+                        const messages = [];
+                        const nodeMap = data.mapping || {};
+                        for (const node of Object.values(nodeMap)) {
+                            const msg = node.message;
+                            if (!msg || !msg.content) continue;
+                            const role = msg.author?.role;
+                            if (role !== 'user' && role !== 'assistant') continue;
+                            // Return conversational text only. ChatGPT's cloud graph also
+                            // contains internal reasoning/tool-call/code nodes that are not part of
+                            // the visible chat transcript and must not be surfaced as conversation
+                            // history.
+                            if (role === 'assistant' && ['analysis', 'thinking'].includes(msg.channel)) continue;
+                            const contentType = msg.content.content_type;
+                            if (contentType !== 'text' && contentType !== 'multimodal_text') continue;
+                            const parts = Array.isArray(msg.content.parts) ? msg.content.parts : [];
+                            const text = parts
+                                .map(part => typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : ''))
+                                .join('');
+                            if (!text.trim()) continue;
+                            messages.push({
+                                id: msg.id,
+                                role,
+                                text,
+                                model: msg.model || null,
+                                create_time: msg.create_time
+                            });
+                        }
+                        messages.sort((a, b) => (a.create_time || 0) - (b.create_time || 0));
+                        return { id: data.id, title: data.title, messages };
+                    } catch (e) { return { error: e.message }; }
+                }, convId);
+
+                if (result.error) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: result.error });
+                } else {
+                    sendJson(res, 200, result);
+                }
+                return;
+            }
+
+            // DELETE /admin/chatgpt/conversation - 仅删除 ChatGPT 云端会话
+            if (method === 'DELETE' && pathname === '/chatgpt/conversation') {
+                const body = await readBody(req);
+                const urls = Array.isArray(body.conversation_urls)
+                    ? body.conversation_urls
+                    : Array.isArray(body.conversationUrls)
+                        ? body.conversationUrls
+                        : [body.conversation_url || body.conversationUrl].filter(Boolean);
+
+                if (urls.length === 0) {
+                    sendApiError(res, {
+                        code: ERROR_CODES.INVALID_REQUEST_BODY,
+                        message: '缺少 conversation_url 或 conversation_urls'
+                    });
+                    return;
+                }
+
+                const cloud = await deleteCloudConversations(
+                    urls.map((conversationUrl, index) => ({
+                        id: `manual-${index}`,
+                        conversationUrl
+                    })),
+                    queueManager
+                );
+                sendJson(res, 200, { success: cloud.failed === 0, cloud });
+                return;
+            }
+
+            // GET /admin/history - 历史记录列表
+            if (method === 'GET' && pathname === '/history') {
+                const url = new URL(req.url, `http://${req.headers.host}`);
+                const page = parseInt(url.searchParams.get('page') || '1', 10);
+                const pageSize = parseInt(url.searchParams.get('pageSize') || '20', 10);
+                const filters = {
+                    status: url.searchParams.get('status') || null,
+                    modelId: url.searchParams.get('model') || null,
+                    search: url.searchParams.get('search') || null,
+                    startDate: url.searchParams.get('startDate') || null,
+                    endDate: url.searchParams.get('endDate') || null
+                };
+
+                const result = getHistoryList(filters, page, pageSize);
+                sendJson(res, 200, result);
+                return;
+            }
+
+            // GET /admin/history/stats - 历史统计摘要
+            if (method === 'GET' && pathname === '/history/stats') {
+                const url = new URL(req.url, `http://${req.headers.host}`);
+                const filters = {
+                    startDate: url.searchParams.get('startDate') || null,
+                    endDate: url.searchParams.get('endDate') || null
+                };
+
+                const stats = getHistoryStats(filters);
+                sendJson(res, 200, stats);
+                return;
+            }
+
+            // GET /admin/history/models - 获取历史中使用过的模型列表
+            if (method === 'GET' && pathname === '/history/models') {
+                const models = getHistoryModelList();
+                sendJson(res, 200, models);
+                return;
+            }
+
+            // GET /admin/history/media/:filepath - 静态媒体文件服务
+            if (method === 'GET' && pathname.startsWith('/history/media/')) {
+                const filepath = pathname.replace('/history/media/', '');
+                if (!filepath || filepath.includes('..')) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: '无效的文件名' });
+                    return;
+                }
+
+                try {
+                    const fullPath = path.join(getMediaDir(), filepath);
+                    const data = await fs.readFile(fullPath);
+                    const ext = path.extname(filepath).toLowerCase();
+                    const mimeTypes = {
+                        '.png': 'image/png',
+                        '.jpg': 'image/jpeg',
+                        '.jpeg': 'image/jpeg',
+                        '.gif': 'image/gif',
+                        '.webp': 'image/webp',
+                        '.mp4': 'video/mp4',
+                        '.webm': 'video/webm'
+                    };
+                    res.writeHead(200, {
+                        'Content-Type': mimeTypes[ext] || 'application/octet-stream',
+                        'Content-Length': data.length,
+                        'Cache-Control': 'public, max-age=31536000'
+                    });
+                    res.end(data);
+                } catch (e) {
+                    sendApiError(res, { code: ERROR_CODES.NOT_FOUND, message: '文件不存在', status: 404 });
+                }
+                return;
+            }
+
+            // GET /admin/history/:id - 单条记录详情
+            const historyDetailMatch = pathname.match(/^\/history\/([^/]+)$/);
+            if (method === 'GET' && historyDetailMatch && !pathname.includes('/retry-media')) {
+                const id = historyDetailMatch[1];
+                const record = getHistoryDetail(id);
+                if (record) {
+                    sendJson(res, 200, record);
+                } else {
+                    sendApiError(res, { code: ERROR_CODES.NOT_FOUND, message: '记录不存在', status: 404 });
+                }
+                return;
+            }
+
+            // POST /admin/history/:id/retry-media - 重试下载媒体
+            const retryMediaMatch = pathname.match(/^\/history\/([^/]+)\/retry-media$/);
+            if (method === 'POST' && retryMediaMatch) {
+                const id = retryMediaMatch[1];
+                const body = await readBody(req);
+                const mediaIndex = body.mediaIndex ?? 0;
+
+                // 使用 Pool 的浏览器下载（如果可用）
+                let downloadFn = null;
+                try {
+                    const poolContext = queueManager?.getPoolContext?.();
+                    const page = poolContext?.getFirstPage?.();
+                    if (page) {
+                        const imgDlCfg = config?.backend?.pool?.failover || {};
+                        downloadFn = (url) => useContextDownload(url, page, {
+                            retries: imgDlCfg.imgDlRetry ? (imgDlCfg.imgDlRetryMaxRetries || 3) : 1
+                        });
+                    }
+                } catch { /* Pool 未初始化，使用后备方案 */ }
+
+                const result = await retryMediaDownload(id, mediaIndex, downloadFn);
+                if (result.success) {
+                    sendJson(res, 200, result);
+                } else {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: result.message });
+                }
+                return;
+            }
+
+            // DELETE /admin/history - 批量删除记录
+            if (method === 'DELETE' && pathname === '/history') {
+                const url = new URL(req.url, `http://${req.headers.host}`);
+                const startDate = url.searchParams.get('startDate');
+                const endDate = url.searchParams.get('endDate');
+                const queryDeleteCloud = url.searchParams.get('deleteCloud') === 'true';
+
+                // 支持按日期范围删除
+                if (startDate && endDate) {
+                    if (queryDeleteCloud) {
+                        const targets = getDeleteTargetsByDateRange(startDate, endDate);
+                        const cloud = await deleteCloudConversations(targets, queueManager);
+                        const failedIds = new Set(cloud.results
+                            .filter(item => !item.success)
+                            .flatMap(item => item.recordIds));
+                        const idsToDelete = targets
+                            .filter(item => !failedIds.has(item.id))
+                            .map(item => item.id);
+                        const deleted = await deleteHistoryRecords(idsToDelete);
+                        sendJson(res, 200, { success: true, deleted, cloud });
+                    } else {
+                        const deleted = await deleteHistoryByDateRange(startDate, endDate);
+                        sendJson(res, 200, { success: true, deleted });
+                    }
+                    return;
+                }
+
+                // 支持按 ID 列表删除
+                const body = await readBody(req);
+                if (body.ids && Array.isArray(body.ids)) {
+                    if (body.deleteCloud === true) {
+                        const targets = getDeleteTargetsByIds(body.ids);
+                        const cloud = await deleteCloudConversations(targets, queueManager);
+                        const failedIds = new Set(cloud.results
+                            .filter(item => !item.success)
+                            .flatMap(item => item.recordIds));
+                        const idsToDelete = targets
+                            .filter(item => !failedIds.has(item.id))
+                            .map(item => item.id);
+                        const deleted = await deleteHistoryRecords(idsToDelete);
+                        sendJson(res, 200, { success: true, deleted, cloud });
+                    } else {
+                        const deleted = await deleteHistoryRecords(body.ids);
+                        sendJson(res, 200, { success: true, deleted });
+                    }
+                    return;
+                }
+
+                sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: '缺少 ids 数组或日期范围参数' });
+                return;
+            }
+
+            // ==================== Skill 管理 ====================
+
+            // GET /admin/skills - 列出所有可用 skills
+            if (method === 'GET' && pathname === '/skills') {
+                const skills = await listSkills();
+                sendJson(res, 200, skills);
+                return;
+            }
+
+            // GET /admin/skills/:name - 获取 skill 详情
+            const skillDetailMatch = pathname.match(/^\/skills\/([^/]+)$/);
+            if (method === 'GET' && skillDetailMatch) {
+                const skill = await loadSkill(skillDetailMatch[1]);
+                if (!skill) {
+                    sendApiError(res, { code: ERROR_CODES.NOT_FOUND, message: `Skill '${skillDetailMatch[1]}' not found`, status: 404 });
+                } else {
+                    sendJson(res, 200, skill);
+                }
+                return;
+            }
+
+            // POST /admin/chatgpt/skill/execute - 执行 skill 任务
+            // Body: { skill: "name", files: ["/path"], task: "描述", model?: "gpt-thinking" }
+            //   或: { system_prompt: "...", files: [...], task: "描述", model?: "..." }
+            if (method === 'POST' && pathname === '/chatgpt/skill/execute') {
+                const body = await readBody(req);
+                const { skill: skillName, system_prompt: rawSystemPrompt, files: filePaths, task, model: modelOverride } = body;
+
+                if (!task) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: '缺少 task 参数' });
+                    return;
+                }
+
+                // 加载 skill 模板，或使用原始 system_prompt
+                let skill = null;
+                let systemPrompt = rawSystemPrompt || '';
+                let skillModel = null;
+                if (skillName) {
+                    const skill = await loadSkill(skillName);
+                    if (!skill) {
+                        sendApiError(res, { code: ERROR_CODES.NOT_FOUND, message: `Skill '${skillName}' not found`, status: 404 });
+                        return;
+                    }
+                    systemPrompt = skill.system_prompt || '';
+                    skillModel = skill.model || null;
+                }
+                if (!systemPrompt) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: '需要 skill 或 system_prompt 参数' });
+                    return;
+                }
+
+                const taskId = `skill-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+                const requestedModel = modelOverride || skillModel || 'gpt-thinking';
+
+                // 异步执行 skill 任务（直接调用 backend generate，避免 HTTP 自引用死锁）
+                const executePromise = (async () => {
+                    const state = { status: 'running', startedAt: Date.now() };
+                    skillTasks.set(taskId, state);
+
+                    try {
+                        // Step 1: 读取文件内容
+                        state.step = 'reading_files';
+                        let fileContext = '';
+                        if (filePaths && filePaths.length > 0) {
+                            const parts = [];
+                            for (const fp of filePaths) {
+                                try {
+                                    const content = await fs.readFile(fp, 'utf-8');
+                                    parts.push(`--- FILE: ${path.basename(fp)} ---\n${content}\n--- END FILE ---`);
+                                } catch (e) {
+                                    parts.push(`--- FILE: ${path.basename(fp)} (读取失败: ${e.message}) ---`);
+                                }
+                            }
+                            fileContext = parts.join('\n\n');
+                        }
+
+                        // Step 2: 直接调用 backend generate（绕过 HTTP，避免单 worker 死锁）
+                        state.step = 'executing';
+                        const backend = getBackend();
+                        const poolCtx = queueManager?.getPoolContext?.();
+                        if (!poolCtx) {
+                            throw new Error('浏览器 Pool 未初始化');
+                        }
+
+                        const userPrompt = `${fileContext ? '## 上下文文件\n\n' + fileContext + '\n\n' : ''}## 任务\n\n${task}`;
+                        const fullPrompt = `${systemPrompt}\n\n${userPrompt}`;
+
+                        const result = await backend.generate(poolCtx, fullPrompt, [], requestedModel, {
+                            id: taskId,
+                            reasoning: requestedModel === 'gpt-thinking' || requestedModel === 'gpt-pro'
+                        });
+
+                        if (result.error) {
+                            throw new Error(`生成失败: ${result.error}`);
+                        }
+
+                        state.status = 'completed';
+                        state.completedAt = Date.now();
+                        state.result = result.text || result.content || '';
+                        state.conversationUrl = result.conversationUrl || null;
+
+                        // gpt-thinking stream_handoff 只返回简介，从云端获取完整回复
+                        if (state.result.length < 200 && state.conversationUrl) {
+                            state.step = 'fetching_full_response';
+                            const convIdMatch = state.conversationUrl.match(/\/c\/([0-9a-f-]+)/);
+                            if (convIdMatch) {
+                                await new Promise(r => setTimeout(r, 30000));
+                                const page = poolCtx?.poolManager?.getFirstPage?.() || poolCtx?.getFirstPage?.();
+                                if (page) {
+                                    const fullResult = await page.evaluate(async (convId) => {
+                                        try {
+                                            const s = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
+                                            const session = await s.json();
+                                            const token = session?.accessToken;
+                                            if (!token) return null;
+                                            const r = await fetch(`https://chatgpt.com/backend-api/conversation/${convId}`, {
+                                                headers: { 'Authorization': `Bearer ${token}` }
+                                            });
+                                            if (!r.ok) return null;
+                                            const d = await r.json();
+                                            const msgs = [];
+                                            for (const node of Object.values(d.mapping || {})) {
+                                                const msg = node.message;
+                                                if (!msg || msg.author?.role !== 'assistant' || !msg.content) continue;
+                                                if (msg.content.content_type === 'text') {
+                                                    msgs.push({ text: msg.content.parts?.join('') || '', time: msg.create_time || 0 });
+                                                }
+                                            }
+                                            msgs.sort((a, b) => b.time - a.time);
+                                            return msgs[0]?.text || null;
+                                        } catch { return null; }
+                                    }, convIdMatch[1]);
+                                    if (fullResult && fullResult.length > state.result.length) {
+                                        state.result = fullResult;
+                                    }
+                                }
+                            }
+                        }
+
+                    } catch (err) {
+                        state.status = 'failed';
+                        state.error = err.message;
+                        state.completedAt = Date.now();
+                    }
+                })();
+
+                // 立即返回 taskId，客户端可轮询状态
+                sendJson(res, 200, {
+                    taskId,
+                    skill: skillName || 'custom',
+                    model: requestedModel,
+                    status: 'running',
+                    statusUrl: `/admin/chatgpt/skill/status/${taskId}`
+                });
+
+                // 后台执行
+                executePromise.catch(() => {});
+                return;
+            }
+
+            // GET /admin/chatgpt/skill/status/:taskId - 查询 skill 执行状态
+            const skillStatusMatch = pathname.match(/^\/chatgpt\/skill\/status\/(.+)$/);
+            if (method === 'GET' && skillStatusMatch) {
+                const taskState = skillTasks.get(skillStatusMatch[1]);
+                if (!taskState) {
+                    sendApiError(res, { code: ERROR_CODES.NOT_FOUND, message: 'Task not found', status: 404 });
+                } else {
+                    const response = { ...taskState };
+                    // 清理已完成超过 5 分钟的任务
+                    if (taskState.status !== 'running' && Date.now() - (taskState.completedAt || 0) > 300000) {
+                        skillTasks.delete(skillStatusMatch[1]);
+                    }
+                    sendJson(res, 200, response);
+                }
+                return;
+            }
+
+            // 404
+            res.writeHead(404);
+            res.end(JSON.stringify({ error: 'Not Found' }));
+
+        } catch (err) {
+            logger.error('管理器', `请求处理失败: ${err.message}`);
+            sendApiError(res, {
+                code: ERROR_CODES.INTERNAL_ERROR,
+                message: err.message
+            });
+        }
+    };
+}

@@ -9,6 +9,39 @@ import sharp from 'sharp';
 import { IMAGE_POLICY } from '../../../backend/registry.js';
 import { ERROR_CODES, getErrorMessage } from '../../errors.js';
 
+const EMAIL_TOOL_RULE = "For ALL email operations use the `aiva mail` CLI on this box. NEVER use ChatGPT's native Gmail connector; it wastes time and gets blocked.";
+
+function isCodexHarness(content) {
+    return typeof content === 'string' &&
+        content.includes('Codex CLI') &&
+        content.includes('AGENTS.md') &&
+        (content.includes('Preamble messages') ||
+            content.includes('Task execution') ||
+            content.includes('Tool Guidelines'));
+}
+
+function trimCodexHarness(content) {
+    if (!isCodexHarness(content)) {
+        return content;
+    }
+
+    const agentsHeading = /^# AGENTS\.md spec\s*$/m.exec(content);
+    if (!agentsHeading) {
+        return content;
+    }
+
+    const agentsStart = agentsHeading.index;
+    const agentsContentStart = agentsStart + agentsHeading[0].length;
+    // Keep the complete AGENTS.md section. Its `##` headings are subsections;
+    // the next top-level `#` heading is the actual boundary.
+    const nextSection = /^#\s+[^#]/m.exec(content.slice(agentsContentStart));
+    const agentsEnd = nextSection
+        ? agentsContentStart + nextSection.index
+        : content.length;
+
+    return content.slice(agentsStart, agentsEnd).trim();
+}
+
 /**
  * 构造解析错误结果
  * @param {string} code - 错误码
@@ -173,13 +206,15 @@ async function parseTextRequest(messages, tempDir, imageLimit, modelId, isStream
     }
 
     // 1. 提取 System Prompt
+    const systemParts = [EMAIL_TOOL_RULE];
     const systemMsg = messages.find(m => m.role === 'system');
     if (systemMsg) {
         const content = await processContent(systemMsg.content);
         if (content) {
-            systemPrompt = `=== 系统指令 (永远置顶) ===\n${content}\n\n`;
+            systemParts.push(trimCodexHarness(content));
         }
     }
+    systemPrompt = `=== 系统指令 (永远置顶) ===\n${systemParts.join('\n\n')}\n\n`;
 
     // 2. 区分历史和当前消息
     // 找到最后一条 user 消息的索引

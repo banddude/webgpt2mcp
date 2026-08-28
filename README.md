@@ -319,3 +319,20 @@ curl http://localhost:3000/v1/chat/completions \
 ---
 
 本项目基于 WebAI2API 开源项目构建，详见 [NOTICE.md](NOTICE.md)。
+
+
+## CAO / Codex worker authentication
+
+The Oracle CAO workers use this service as an OpenAI-compatible model provider at `http://127.0.0.1:17841/v1`. There are two separate authentication layers:
+
+1. **Codex -> webgpt2mcp:** `data/api.key` is the local bearer token accepted by webgpt2mcp. The CAO server wrapper reads that file at startup and exports it as `CAO_WEBGPT2MCP_API_KEY`. The worker Codex provider declares `model_providers.chatgpt_web.env_key = "CAO_WEBGPT2MCP_API_KEY"`. New CAO sessions receive `CAO_*` variables from the server environment. On every `cao-server` start, the wrapper also seeds this dedicated variable into the existing persistent **department** tmux session environments listed in the CAO manifest, so child windows spawned after a server restart still inherit it. The wrapper intentionally does not modify the canonical AIVA or Dev sessions. No token is copied into a profile or shell dotfile.
+2. **webgpt2mcp -> ChatGPT Web:** the browser uses the persistent profile in `data/camoufoxUserData`. It is a normal authenticated ChatGPT profile, not a temporary/private/incognito chat. A completed turn creates/continues a normal `https://chatgpt.com/c/...` conversation, and the adapter returns the final visible assistant message as the OpenAI-compatible response consumed by Codex.
+
+If workers receive HTTP 401, check these in order without printing token values:
+
+- Confirm `data/api.key` exists and is readable by the service account.
+- Confirm the running `cao-server` has `CAO_WEBGPT2MCP_API_KEY` set and that a newly spawned worker has the same variable set. Compare hashes or equality only; do not log the value.
+- Confirm the worker provider config names `CAO_WEBGPT2MCP_API_KEY` as its `env_key`. Do not fall back to generic `OPENAI_API_KEY`, which may contain an unrelated API credential inherited from the login shell or tmux server.
+- If local bearer auth succeeds but the upstream turn fails, verify the persistent browser profile is still logged into ChatGPT. That is a separate session from the local bearer token.
+
+After changing the token file or wrapper, restart only the `cao-server` service so it reloads the file and reseeds existing department tmux session environments. Existing department heads do not need to be recreated, and the canonical AIVA/Dev sessions are not modified.
