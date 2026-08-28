@@ -8,6 +8,7 @@ import path from 'path';
 import sharp from 'sharp';
 import { IMAGE_POLICY } from '../../../backend/registry.js';
 import { ERROR_CODES, getErrorMessage } from '../../errors.js';
+import { compileSystemPrompt } from './prompt.js';
 
 /**
  * 构造解析错误结果
@@ -174,11 +175,10 @@ async function parseTextRequest(messages, tempDir, imageLimit, modelId, isStream
 
     // 1. 提取 System Prompt
     const systemMsg = messages.find(m => m.role === 'system');
-    if (systemMsg) {
-        const content = await processContent(systemMsg.content);
-        if (content) {
-            systemPrompt = `=== 系统指令 (永远置顶) ===\n${content}\n\n`;
-        }
+    const systemContent = systemMsg ? await processContent(systemMsg.content) : '';
+    const compiledSystemPrompt = compileSystemPrompt(systemContent);
+    if (compiledSystemPrompt) {
+        systemPrompt = `=== 系统指令 (永远置顶) ===\n${compiledSystemPrompt}\n\n`;
     }
 
     // 2. 区分历史和当前消息

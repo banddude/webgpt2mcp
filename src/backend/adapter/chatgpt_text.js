@@ -19,8 +19,46 @@ import { logger } from '../../utils/logger.js';
 
 // --- 配置常量 ---
 const TARGET_URL = 'https://chatgpt.com/'; // 基础URL
-const INPUT_SELECTOR = '#prompt-textarea';
+// ChatGPT has changed the composer markup more than once. Keep the stable
+// semantic fallbacks ahead of the generic contenteditable fallback so a stale
+// selector cannot make an otherwise healthy authenticated page unusable.
+const INPUT_SELECTORS = [
+    '#prompt-textarea',
+    '[contenteditable="true"][data-placeholder*="Ask ChatGPT"]',
+    '[contenteditable="true"][aria-label*="Ask ChatGPT"]',
+    '.ProseMirror[contenteditable="true"]',
+    '[contenteditable="true"][role="textbox"]',
+    'textarea[placeholder*="Ask ChatGPT"]',
+    '[contenteditable="true"]'
+];
 const DEBUG_DIR = path.join(process.cwd(), 'data', 'debug-chatgpt');
+
+async function findChatInput(page) {
+    for (const selector of INPUT_SELECTORS) {
+        const locator = page.locator(selector).first();
+        if (await locator.isVisible().catch(() => false)) return locator;
+    }
+    return null;
+}
+
+async function waitForChatInput(page, options = {}) {
+    const { timeout = 60000, click = false } = options;
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+        const input = await findChatInput(page);
+        if (input) {
+            await waitForInput(page, input, {
+                timeout: Math.max(deadline - Date.now(), 5000),
+                click
+            });
+            return input;
+        }
+        await page.waitForTimeout(250);
+    }
+
+    throw new Error(`ChatGPT composer not found (tried: ${INPUT_SELECTORS.join(', ')})`);
+}
 
 function normalizeConversationUrl(url) {
     if (!url || typeof url !== 'string') return null;
@@ -408,7 +446,8 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
         // 快速复用：如果页面已在目标 URL 且输入框可见，跳过导航（省 ~18s）
         const currentUrl = page.url();
-        const inputVisible = await page.locator(INPUT_SELECTOR).isVisible().catch(() => false);
+        const currentInput = await findChatInput(page);
+        const inputVisible = Boolean(currentInput);
         const canSkipNav = inputVisible && (
             // 新对话：页面在首页
             (!conversationUrl && (currentUrl === 'https://chatgpt.com/' || currentUrl === 'https://chatgpt.com')) ||
@@ -425,7 +464,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         }
 
         // 1. 等待输入框加载
-        await waitForInput(page, INPUT_SELECTOR, { click: false });
+        let inputLocator = await waitForChatInput(page, { click: false });
 
         // 2. 选择模型
         if (modelId) {
@@ -569,8 +608,9 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
         // 3. 输入提示词
         logger.info('适配器', '输入提示词...', meta);
-        await safeClick(page, INPUT_SELECTOR, { bias: 'input' });
-        await humanType(page, INPUT_SELECTOR, prompt);
+        inputLocator = await waitForChatInput(page, { click: false });
+        await safeClick(page, inputLocator, { bias: 'input' });
+        await humanType(page, inputLocator, prompt);
 
         // If the target conversation is already streaming, prefer ChatGPT's native
         // mid-stream steering UI. While thinking, the composer remains editable and
@@ -597,10 +637,11 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
                     // Some ChatGPT rerenders replace the composer when stopping. Make
                     // sure the steering prompt survived before submitting it.
-                    const composerText = await page.locator(INPUT_SELECTOR).innerText().catch(() => '');
+                    inputLocator = await waitForChatInput(page, { click: false });
+                    const composerText = await inputLocator.innerText().catch(() => '');
                     if (!composerText.includes(prompt)) {
-                        await safeClick(page, INPUT_SELECTOR, { bias: 'input' });
-                        await humanType(page, INPUT_SELECTOR, prompt);
+                        await safeClick(page, inputLocator, { bias: 'input' });
+                        await humanType(page, inputLocator, prompt);
                     }
                 }
             }
