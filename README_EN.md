@@ -342,6 +342,11 @@ IDs against the live project list, falls back to `default` when a mapped project
 is missing, and never creates a project automatically. A failed move is logged
 and does not fail the conversation request.
 
+The MCP `create`, compatibility `chatgpt`, and exact `send` tools expose the
+same optional `agent` and `project` fields for callers that need to override
+the automatic routing. `project: none` explicitly leaves a conversation out of
+all projects.
+
 ## Hardware Requirements
 
 | Resource | Minimum | Recommended |

@@ -83,8 +83,11 @@ async function recordSession({ conversation_url, model, prompt, response_content
 // API 调用
 // ==========================================
 
-async function dispatchExactConversation({ conversation_url, prompt, timeout = 120000 }) {
+async function dispatchExactConversation({ conversation_url, prompt, agent, project, timeout = 120000 }) {
     if (!conversation_url || !prompt) throw new Error('conversation_url and prompt are required');
+    const body = { conversation_url, prompt };
+    if (typeof agent === 'string' && agent.trim()) body.agent = agent.trim();
+    if (typeof project === 'string' && project.trim()) body.project = project.trim();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
     try {
@@ -94,7 +97,7 @@ async function dispatchExactConversation({ conversation_url, prompt, timeout = 1
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${API_KEY}`,
             },
-            body: JSON.stringify({ conversation_url, prompt }),
+            body: JSON.stringify(body),
             signal: controller.signal,
         });
         const data = await response.json().catch(() => ({}));
@@ -112,9 +115,11 @@ async function dispatchExactConversation({ conversation_url, prompt, timeout = 1
     }
 }
 
-async function callChatGPT({ model = 'gpt-instant', messages, conversation_url, timeout = 300000 }) {
+async function callChatGPT({ model = 'gpt-instant', messages, conversation_url, agent, project, timeout = 300000 }) {
     const body = { model, messages };
     if (conversation_url) body.conversation_url = conversation_url;
+    if (typeof agent === 'string' && agent.trim()) body.agent = agent.trim();
+    if (typeof project === 'string' && project.trim()) body.project = project.trim();
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
@@ -327,6 +332,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                         description: 'ChatGPT model to use.',
                     },
                     conversation_url: { type: 'string', description: 'Optional exact conversation URL to continue.' },
+                    agent: { type: 'string', description: 'Optional project-routing agent key, such as dev or aiva.' },
+                    project: { type: 'string', description: 'Optional exact project ID or project URL; use none to leave the conversation unmapped.' },
                     system_prompt: { type: 'string', description: 'Optional system instruction.' },
                     topic: { type: 'string', description: 'Optional local topic label.' },
                 },
@@ -374,6 +381,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 properties: {
                     conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
                     message: { type: 'string', description: 'Message to send to the exact conversation.' },
+                    agent: { type: 'string', description: 'Optional project-routing agent key, such as dev or aiva.' },
+                    project: { type: 'string', description: 'Optional exact project ID or project URL; use none to leave the conversation unmapped.' },
                 },
                 required: ['conversation', 'message'],
             },
@@ -385,6 +394,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 type: 'object',
                 properties: {
                     message: { type: 'string', description: 'First message for the new conversation.' },
+                    agent: { type: 'string', description: 'Optional project-routing agent key, such as dev or aiva.' },
+                    project: { type: 'string', description: 'Optional exact project ID or project URL; use none to leave the conversation unmapped.' },
                     model: {
                         type: 'string',
                         enum: ['gpt-instant', 'gpt-thinking', 'gpt-pro'],
@@ -545,6 +556,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 model,
                 messages,
                 conversation_url: typeof args.conversation_url === 'string' ? args.conversation_url.trim() : undefined,
+                agent: typeof args.agent === 'string' ? args.agent.trim() : undefined,
+                project: typeof args.project === 'string' ? args.project.trim() : undefined,
             });
             const result = formatResult(data);
             const convUrl = data.conversation_url || '';
@@ -641,7 +654,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const message = typeof args.message === 'string' ? args.message.trim() : '';
             if (!message) return { content: [{ type: 'text', text: 'Error: message is required.' }], isError: true };
 
-            const dispatched = await dispatchExactConversation({ conversation_url: ref.url, prompt: message });
+            const dispatched = await dispatchExactConversation({
+                conversation_url: ref.url,
+                prompt: message,
+                agent: typeof args.agent === 'string' ? args.agent.trim() : undefined,
+                project: typeof args.project === 'string' ? args.project.trim() : undefined,
+            });
             await recordSession({ conversation_url: ref.url, model: 'unknown', prompt: message, response_content: '', topic: '' });
             const behavior = dispatched.active_before ? 'The previous active response was stopped first, then the message was sent.' : 'The message was sent to the idle conversation.';
             return {
@@ -660,7 +678,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const message = typeof args.message === 'string' ? args.message.trim() : '';
             if (!message) return { content: [{ type: 'text', text: 'Error: message is required.' }], isError: true };
             const model = args.model || 'gpt-instant';
-            const data = await callChatGPT({ model, messages: [{ role: 'user', content: message }] });
+            const data = await callChatGPT({
+                model,
+                messages: [{ role: 'user', content: message }],
+                agent: typeof args.agent === 'string' ? args.agent.trim() : undefined,
+                project: typeof args.project === 'string' ? args.project.trim() : undefined,
+            });
             const result = formatResult(data);
             const convUrl = data.conversation_url || '';
             if (convUrl && !data.error) {
