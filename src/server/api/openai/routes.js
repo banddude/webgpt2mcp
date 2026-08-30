@@ -84,7 +84,7 @@ export function createOpenAIRouter(context) {
             // 限流检查
             if (!isStreaming && !queueManager.canAcceptNonStreaming()) {
                 const status = queueManager.getStatus();
-                logger.warn('服务器', '非流式请求被拒绝 (队列已满)', { id: requestId, queueSize: status.total });
+                logger.warn('服务器', 'Non-streaming request rejected (queue is full)', { id: requestId, queueSize: status.total });
                 sendApiError(res, {
                     code: ERROR_CODES.SERVER_BUSY,
                     message: `Server busy (queue: ${status.total} task(s) waiting). Use streaming mode (stream: true) or retry later.`

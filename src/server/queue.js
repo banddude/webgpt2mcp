@@ -342,14 +342,14 @@ export function createQueueManager(queueConfig, callbacks) {
         if (browserControlLocked) return null;
         browserControlLocked = true;
         browserControlReason = reason;
-        logger.info('服务器', `[控制锁] 已获取: ${reason}`);
+        logger.info('服务器', `[control-lock] acquired: ${reason}`);
         let released = false;
         return () => {
             if (released) return;
             released = true;
             browserControlLocked = false;
             browserControlReason = null;
-            logger.info('服务器', `[控制锁] 已释放: ${reason}`);
+            logger.info('服务器', `[control-lock] released: ${reason}`);
             processQueue();
         };
     }

@@ -244,10 +244,10 @@ export function createAdminRouter(context) {
                 } catch { /* 无请求体时使用默认值 */ }
 
                 const modeDesc = loginMode
-                    ? (workerName ? `登录模式 (${workerName})` : '登录模式')
-                    : '普通模式';
-                sendJson(res, 200, { success: true, message: `服务正在以${modeDesc}重启...` });
-                logger.info('管理器', `收到重启请求: ${modeDesc}`);
+                    ? (workerName ? `login mode (${workerName})` : 'login mode')
+                    : 'normal mode';
+                sendJson(res, 200, { success: true, message: `Service is restarting in ${modeDesc}...` });
+                logger.info('管理器', `Restart requested: ${modeDesc}`);
 
                 setTimeout(async () => {
                     // 构建启动参数（仅登录模式相关）

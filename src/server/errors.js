@@ -55,62 +55,62 @@ export const ERROR_CODES = {
  */
 const ERROR_DETAILS = {
     [ERROR_CODES.UNAUTHORIZED]: {
-        message: '未授权（Token 无效或缺失）',
+        message: 'Unauthorized (token invalid or missing)',
         status: 401,
         type: ERROR_TYPES.INVALID_REQUEST,
     },
     [ERROR_CODES.BROWSER_NOT_INITIALIZED]: {
-        message: '浏览器未初始化',
+        message: 'Browser not initialized',
         status: 503,
         type: ERROR_TYPES.SERVER_ERROR,
     },
     [ERROR_CODES.SERVER_BUSY]: {
-        message: '服务器繁忙（队列已满）',
+        message: 'Server busy (queue is full)',
         status: 429,
         type: ERROR_TYPES.RATE_LIMIT,
     },
     [ERROR_CODES.NO_MESSAGES]: {
-        message: '请求参数缺少 messages',
+        message: 'Request body is missing the messages parameter',
         status: 400,
         type: ERROR_TYPES.INVALID_REQUEST,
     },
     [ERROR_CODES.NO_USER_MESSAGES]: {
-        message: 'messages 中缺少 role=user 的消息',
+        message: 'messages must contain at least one role=user message',
         status: 400,
         type: ERROR_TYPES.INVALID_REQUEST,
     },
     [ERROR_CODES.TOO_MANY_IMAGES]: {
-        message: '图片数量超过限制',
+        message: 'Too many images',
         status: 400,
         type: ERROR_TYPES.INVALID_REQUEST,
     },
     [ERROR_CODES.INVALID_MODEL]: {
-        message: '模型无效/后端不支持',
+        message: 'Invalid model or unsupported by the backend',
         status: 400,
         type: ERROR_TYPES.INVALID_REQUEST,
     },
     [ERROR_CODES.IMAGE_REQUIRED]: {
-        message: '该模型需要参考图',
+        message: 'This model requires a reference image',
         status: 400,
         type: ERROR_TYPES.INVALID_REQUEST,
     },
     [ERROR_CODES.IMAGE_FORBIDDEN]: {
-        message: '该模型不支持图片输入',
+        message: 'This model does not accept image input',
         status: 400,
         type: ERROR_TYPES.INVALID_REQUEST,
     },
     [ERROR_CODES.RECAPTCHA]: {
-        message: '触发人机验证（reCAPTCHA）',
+        message: 'Human verification triggered (reCAPTCHA)',
         status: 403,
         type: ERROR_TYPES.SERVER_ERROR,
     },
     [ERROR_CODES.INTERNAL_ERROR]: {
-        message: '服务器内部错误',
+        message: 'Internal server error',
         status: 500,
         type: ERROR_TYPES.SERVER_ERROR,
     },
     [ERROR_CODES.GENERATION_FAILED]: {
-        message: '图片生成失败',
+        message: 'Image generation failed',
         status: 502,
         type: ERROR_TYPES.SERVER_ERROR,
     },
@@ -122,7 +122,7 @@ const ERROR_DETAILS = {
  * @returns {string} 中文错误消息
  */
 export function getErrorMessage(code) {
-    return ERROR_DETAILS[code]?.message || '未知错误';
+    return ERROR_DETAILS[code]?.message || 'Unknown error';
 }
 
 /**
@@ -140,7 +140,7 @@ export function getErrorStatus(code) {
  * @returns {{message: string, status: number}} 错误详情
  */
 export function getErrorDetails(code) {
-    return ERROR_DETAILS[code] || { message: '未知错误', status: 500 };
+    return ERROR_DETAILS[code] || { message: 'Unknown error', status: 500 };
 }
 
 // ==========================================

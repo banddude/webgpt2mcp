@@ -79,7 +79,7 @@ export function sendApiError(res, options) {
 
     // 获取错误详情
     const details = code ? getErrorDetails(code) : null;
-    const errorMessage = message || (details ? details.message : '未知错误');
+    const errorMessage = message || (details ? details.message : 'Unknown error');
     const errorType = details?.type || 'server_error';
     const httpStatus = status || (details ? details.status : 500);
 
