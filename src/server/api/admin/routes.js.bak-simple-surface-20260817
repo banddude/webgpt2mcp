@@ -52,15 +52,7 @@ import {
 import path from 'path';
 import fs from 'fs/promises';
 import { useContextDownload } from '../../../backend/utils/download.js';
-import {
-    deleteChatGptConversation,
-    renameChatGptConversation,
-    setChatGptConversationArchived,
-    listChatGptProjects,
-    listChatGptProjectConversations,
-    moveChatGptConversationToProject,
-    chatgptCloudRequest
-} from '../../../backend/adapter/chatgpt_text.js';
+import { deleteChatGptConversation } from '../../../backend/adapter/chatgpt_text.js';
 import { getBackend } from '../../../backend/index.js';
 import { gotoWithCheck, waitForInput } from '../../../backend/utils/page.js';
 import { safeClick, humanType } from '../../../backend/engine/utils.js';
@@ -123,7 +115,7 @@ async function deleteCloudConversations(records, queueManager) {
                 conversationUrl: target.conversationUrl,
                 recordIds: target.recordIds,
                 success: false,
-                error: 'ChatGPT browser page unavailable'
+                error: 'ChatGPT 浏览器页面不可用'
             });
         }
         return summary;
@@ -999,108 +991,6 @@ export function createAdminRouter(context) {
                 return { idle: status.processing === 0, status };
             };
 
-            // POST /admin/chatgpt/stop - stop one exact active conversation without sending a replacement message
-            if (method === 'POST' && pathname === '/chatgpt/stop') {
-                const body = await readBody(req);
-                const conversationUrl = body.conversation_url || body.conversationUrl;
-                const convMatch = typeof conversationUrl === 'string'
-                    ? conversationUrl.match(/^https:\/\/chatgpt\.com\/c\/([0-9a-f-]+)\/?$/i)
-                    : null;
-                if (!convMatch) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation_url must be an exact ChatGPT conversation URL' });
-                    return;
-                }
-
-                const releaseControlLock = queueManager?.acquireControlLock?.('chatgpt-stop');
-                if (typeof releaseControlLock !== 'function') {
-                    sendJson(res, 409, { success: false, error: 'browser_control_locked', conversation_url: conversationUrl });
-                    return;
-                }
-
-                try {
-                    let poolContext = queueManager?.getPoolContext?.();
-                    if (!poolContext) poolContext = await queueManager?.initializePool?.();
-                    const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
-                    if (!page) {
-                        sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
-                        return;
-                    }
-
-                    const targetUrl = normalizeChatUrl(conversationUrl);
-                    if (normalizeChatUrl(page.url()) !== targetUrl) {
-                        const idle = await waitForExistingGenerationToFinish(queueManager, 120000);
-                        if (!idle.idle) {
-                            sendJson(res, 409, {
-                                success: false,
-                                error: 'existing_generation_did_not_finish',
-                                processing: idle.status.processing,
-                                waiting: idle.status.queueLength,
-                                conversation_url: conversationUrl,
-                            });
-                            return;
-                        }
-                    }
-
-                    const nav = await navigateExactChat(page, conversationUrl);
-                    if (!nav.ok) {
-                        sendJson(res, 503, {
-                            success: false,
-                            error: nav.ready === false ? 'composer_unavailable' : 'conversation_navigation_mismatch',
-                            actual_url: nav.actualUrl || page.url(),
-                            conversation_url: conversationUrl,
-                        });
-                        return;
-                    }
-
-                    const convId = convMatch[1];
-                    const attached = await attachOraclePageToActiveStream(page, conversationUrl, convId);
-                    if (attached.error) {
-                        sendJson(res, 409, { success: false, error: attached.error, stream_status_before: attached.state?.status || null });
-                        return;
-                    }
-                    if (!attached.state?.status && !attached.stopVisible) {
-                        sendJson(res, 503, { success: false, error: 'stream_status_unavailable', stream_http: attached.state?.http || null });
-                        return;
-                    }
-                    if (attached.state?.status !== 'IS_STREAMING' && !attached.stopVisible) {
-                        sendJson(res, 200, {
-                            success: true,
-                            already_idle: true,
-                            conversation_url: conversationUrl,
-                            stream_status_after: attached.state?.status || null,
-                        });
-                        return;
-                    }
-                    if (!attached.stopVisible) {
-                        sendJson(res, 409, { success: false, error: 'active_stream_not_attached', stream_status_before: attached.state?.status || null });
-                        return;
-                    }
-
-                    await clickVerifiedChatGptControl(page, page.locator('[data-testid="stop-button"]'));
-                    const stopped = await waitForStoppedStream(page, convId);
-                    if (!stopped.stopped) {
-                        sendJson(res, 409, {
-                            success: false,
-                            error: 'stop_not_confirmed',
-                            stream_status_after: stopped.state?.status || null,
-                            stop_ui: stopped.ui || null,
-                        });
-                        return;
-                    }
-
-                    logger.info('Admin', `Stopped exact ChatGPT conversation: ${convId}`);
-                    sendJson(res, 200, {
-                        success: true,
-                        already_idle: false,
-                        conversation_url: conversationUrl,
-                        stream_status_after: stopped.state?.status || null,
-                    });
-                    return;
-                } finally {
-                    releaseControlLock();
-                }
-            }
-
             // POST /admin/chatgpt/steer - bypass the generation queue to interrupt and steer an active stream
             if (method === 'POST' && pathname === '/chatgpt/steer') {
                 const body = await readBody(req);
@@ -1374,7 +1264,7 @@ export function createAdminRouter(context) {
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
                 const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
                 if (!page) {
-                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT 浏览器页面不可用' });
                     return;
                 }
 
@@ -1387,13 +1277,8 @@ export function createAdminRouter(context) {
                         if (!accessToken) return { error: `no access token, session keys: ${Object.keys(session || {}).join(',')}` };
                         const headers = { 'Authorization': `Bearer ${accessToken}` };
 
-                        let res = null;
-                        for (let attempt = 0; attempt < 4; attempt += 1) {
-                            res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { headers });
-                            if (res.ok || res.status !== 429) break;
-                            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
-                        }
-                        if (!res?.ok) return { error: `api failed: ${res?.status || 'unknown'}` };
+                        const res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { headers });
+                        if (!res.ok) return { error: `api failed: ${res.status}` };
                         const data = await res.json();
                         const items = (data.items || []).map(c => ({
                             id: c.id,
@@ -1464,7 +1349,7 @@ export function createAdminRouter(context) {
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
                 const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
                 if (!page) {
-                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT 浏览器页面不可用' });
                     return;
                 }
 
@@ -1510,25 +1395,7 @@ export function createAdminRouter(context) {
                             });
                         }
                         messages.sort((a, b) => (a.create_time || 0) - (b.create_time || 0));
-
-                        let stream_status = null;
-                        try {
-                            const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${id}/stream_status`, {
-                                headers: { 'Authorization': `Bearer ${accessToken}` }
-                            });
-                            stream_status = sr.ok ? ((await sr.json())?.status || null) : `HTTP_${sr.status}`;
-                        } catch { }
-
-                        return {
-                            id: data.id,
-                            title: data.title,
-                            create_time: data.create_time || null,
-                            update_time: data.update_time || null,
-                            is_archived: data.is_archived === true,
-                            project_id: data.gizmo_id || null,
-                            stream_status,
-                            messages,
-                        };
+                        return { id: data.id, title: data.title, messages };
                     } catch (e) { return { error: e.message }; }
                 }, convId);
 
@@ -1552,7 +1419,7 @@ export function createAdminRouter(context) {
                 if (urls.length === 0) {
                     sendApiError(res, {
                         code: ERROR_CODES.INVALID_REQUEST_BODY,
-                        message: 'conversation_url or conversation_urls is required'
+                        message: '缺少 conversation_url 或 conversation_urls'
                     });
                     return;
                 }
@@ -1565,250 +1432,6 @@ export function createAdminRouter(context) {
                     queueManager
                 );
                 sendJson(res, 200, { success: cloud.failed === 0, cloud });
-                return;
-            }
-
-            // Shared helper for the management operations below. They only issue
-            // authenticated backend-api fetches inside the already-logged-in page;
-            // they never navigate and never touch the DOM, so they must not take
-            // the browser control lock and can run while a generation streams.
-            const getManagementPage = async () => {
-                let poolContext = queueManager?.getPoolContext?.();
-                if (!poolContext) poolContext = await queueManager?.initializePool?.();
-                return poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
-            };
-
-            const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
-            // Verified live: ChatGPT web projects are "snorlax" gizmos with g-p-*
-            // ids, surfaced as https://chatgpt.com/g/<g-p-id>[-slug] URLs.
-            const PROJECT_ID_RE = /^g-p-[0-9a-z]+$/i;
-            const PROJECT_URL_RE = /^https:\/\/chatgpt\.com\/g\/(g-p-[0-9a-z]+)/i;
-
-            // Accept an exact conversation UUID or an exact /c/ URL only. Titles
-            // and fuzzy references are rejected: every mutating operation in this
-            // family must target exactly one known conversation.
-            const parseExactConversationRef = (value) => {
-                const raw = typeof value === 'string' ? value.trim() : '';
-                if (!raw) return null;
-                if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw)) {
-                    return { id: raw.toLowerCase(), url: `https://chatgpt.com/c/${raw.toLowerCase()}` };
-                }
-                const match = raw.match(CONVERSATION_URL_RE);
-                if (!match) return null;
-                return { id: match[1].toLowerCase(), url: `https://chatgpt.com/c/${match[1].toLowerCase()}` };
-            };
-
-            const parseExactProjectRef = (value) => {
-                const raw = typeof value === 'string' ? value.trim() : '';
-                if (!raw) return null;
-                if (PROJECT_ID_RE.test(raw)) return raw;
-                const match = raw.match(PROJECT_URL_RE);
-                if (match) return match[1];
-                return null;
-            };
-
-            // POST /admin/chatgpt/rename - rename one exact conversation
-            if (method === 'POST' && pathname === '/chatgpt/rename') {
-                const body = await readBody(req);
-                const ref = parseExactConversationRef(body.conversation_url || body.conversationUrl || body.conversation);
-                const title = typeof body.title === 'string' ? body.title.trim() : '';
-                if (!ref) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation must be an exact ChatGPT conversation ID or exact https://chatgpt.com/c/... URL; titles are not accepted' });
-                    return;
-                }
-                if (!title) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'title is required' });
-                    return;
-                }
-                const page = await getManagementPage();
-                if (!page) {
-                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
-                    return;
-                }
-                const result = await renameChatGptConversation(page, ref.id, title);
-                if (!result.success) {
-                    sendJson(res, 502, { success: false, conversation_url: ref.url, error: result.error });
-                    return;
-                }
-                logger.info('Admin', `Renamed exact ChatGPT conversation: ${ref.id} -> "${title}"`);
-                sendJson(res, 200, {
-                    success: true,
-                    conversation_url: ref.url,
-                    conversation_id: ref.id,
-                    title: result.title,
-                    verified: result.verified !== false,
-                    is_archived: result.isArchived
-                });
-                return;
-            }
-
-            // POST /admin/chatgpt/archive - archive or restore one exact conversation
-            if (method === 'POST' && pathname === '/chatgpt/archive') {
-                const body = await readBody(req);
-                const ref = parseExactConversationRef(body.conversation_url || body.conversationUrl || body.conversation);
-                const archived = body.archived === true || body.archive === true;
-                const unarchive = body.archived === false || body.unarchive === true;
-                if (!ref) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation must be an exact ChatGPT conversation ID or exact https://chatgpt.com/c/... URL; titles are not accepted' });
-                    return;
-                }
-                if (!archived && !unarchive) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'archived=true or archived=false is required' });
-                    return;
-                }
-                const targetState = archived === true;
-                const page = await getManagementPage();
-                if (!page) {
-                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
-                    return;
-                }
-                const result = await setChatGptConversationArchived(page, ref.id, targetState);
-                if (!result.success) {
-                    sendJson(res, 502, { success: false, conversation_url: ref.url, error: result.error });
-                    return;
-                }
-                logger.info('Admin', `${targetState ? 'Archived' : 'Restored'} exact ChatGPT conversation: ${ref.id}`);
-                sendJson(res, 200, {
-                    success: true,
-                    conversation_url: ref.url,
-                    conversation_id: ref.id,
-                    title: result.title,
-                    verified: result.verified !== false,
-                    is_archived: result.isArchived
-                });
-                return;
-            }
-
-            // GET /admin/chatgpt/projects - list ChatGPT projects
-            if (method === 'GET' && pathname === '/chatgpt/projects') {
-                const url = new URL(req.url, `http://${req.headers.host}`);
-                const limit = Math.max(1, Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 100));
-                const page = await getManagementPage();
-                if (!page) {
-                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
-                    return;
-                }
-                const result = await listChatGptProjects(page, { limit });
-                if (!result.success) {
-                    sendJson(res, 502, { success: false, error: result.error });
-                    return;
-                }
-                sendJson(res, 200, {
-                    success: true,
-                    projects: result.projects.map(project => ({
-                        ...project,
-                        url: `https://chatgpt.com/g/${project.id}`
-                    }))
-                });
-                return;
-            }
-
-            // GET /admin/chatgpt/projects/:id/conversations - list conversations in one project
-            const projectConversationsMatch = pathname.match(/^\/chatgpt\/projects\/([^/]+)\/conversations$/);
-            if (method === 'GET' && projectConversationsMatch) {
-                const projectId = parseExactProjectRef(decodeURIComponent(projectConversationsMatch[1]));
-                if (!projectId) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'project must be an exact ChatGPT project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL' });
-                    return;
-                }
-                const url = new URL(req.url, `http://${req.headers.host}`);
-                const limit = Math.max(1, Math.min(parseInt(url.searchParams.get('limit') || '28', 10) || 28, 100));
-                const page = await getManagementPage();
-                if (!page) {
-                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
-                    return;
-                }
-                const result = await listChatGptProjectConversations(page, projectId, { limit });
-                if (!result.success) {
-                    sendJson(res, 502, { success: false, project_id: projectId, error: result.error });
-                    return;
-                }
-                sendJson(res, 200, {
-                    success: true,
-                    project_id: projectId,
-                    conversations: result.conversations.map(conversation => ({
-                        ...conversation,
-                        url: `https://chatgpt.com/c/${conversation.id}`
-                    }))
-                });
-                return;
-            }
-
-            // POST /admin/chatgpt/move - move one exact conversation into a project,
-            // or out of any project when project is explicitly null
-            if (method === 'POST' && pathname === '/chatgpt/move') {
-                const body = await readBody(req);
-                const ref = parseExactConversationRef(body.conversation_url || body.conversationUrl || body.conversation);
-                if (!ref) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation must be an exact ChatGPT conversation ID or exact https://chatgpt.com/c/... URL; titles are not accepted' });
-                    return;
-                }
-                let projectId = null;
-                if (body.project === null || body.project === undefined) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'project is required: an exact project ID/URL to move into, or "none" to move the conversation out of any project' });
-                    return;
-                }
-                if (typeof body.project === 'string' && body.project.trim().toLowerCase() === 'none') {
-                    projectId = null;
-                } else {
-                    const rawProject = typeof body.project === 'string' ? body.project.trim() : '';
-                    projectId = parseExactProjectRef(rawProject);
-                    if (!projectId) {
-                        sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'project must be an exact ChatGPT project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL' });
-                        return;
-                    }
-                }
-                const page = await getManagementPage();
-                if (!page) {
-                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
-                    return;
-                }
-                const result = await moveChatGptConversationToProject(page, ref.id, projectId);
-                if (!result.success) {
-                    sendJson(res, 502, { success: false, conversation_url: ref.url, error: result.error });
-                    return;
-                }
-                logger.info('Admin', `Moved exact ChatGPT conversation ${ref.id} ${projectId ? `into project ${projectId}` : 'out of any project'}`);
-                sendJson(res, 200, {
-                    success: true,
-                    conversation_url: ref.url,
-                    conversation_id: ref.id,
-                    project_id: result.projectId,
-                    verified: result.verified !== false,
-                    moved_to: result.projectId ? `https://chatgpt.com/g/${result.projectId}` : null
-                });
-                return;
-            }
-
-            // TEMPORARY live endpoint probe for development. Executes one
-            // authenticated backend-api request in the logged-in page and returns
-            // the raw status/body. Restricted to GET/PATCH/POST/DELETE under
-            // /backend-api/. Remove this route once the management endpoints are
-            // verified against the live session.
-            if (method === 'POST' && pathname === '/chatgpt/probe') {
-                const body = await readBody(req);
-                const probeMethod = String(body.method || 'GET').toUpperCase();
-                const probePath = String(body.path || '');
-                if (!['GET', 'PATCH', 'POST', 'DELETE'].includes(probeMethod) || !probePath.startsWith('/backend-api/')) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'probe requires method GET/PATCH/POST/DELETE and a path starting with /backend-api/' });
-                    return;
-                }
-                // chatgptCloudRequest prefixes backend-api/ itself; accept the
-                // full path form for convenient probing.
-                const normalizedProbePath = probePath.replace(/^\/backend-api\/?/, '/');
-                const page = await getManagementPage();
-                if (!page) {
-                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
-                    return;
-                }
-                const result = await chatgptCloudRequest(page, {
-                    method: probeMethod,
-                    path: normalizedProbePath,
-                    query: body.query || null,
-                    body: body.body === undefined ? null : body.body,
-                    retries: 0
-                });
-                sendJson(res, 200, { success: true, probe: { method: probeMethod, path: probePath }, result });
                 return;
             }
 

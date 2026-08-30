@@ -83,6 +83,35 @@ async function recordSession({ conversation_url, model, prompt, response_content
 // API 调用
 // ==========================================
 
+async function dispatchExactConversation({ conversation_url, prompt, timeout = 120000 }) {
+    if (!conversation_url || !prompt) throw new Error('conversation_url and prompt are required');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+        const response = await fetch(`${API_URL}/admin/chatgpt/dispatch`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${API_KEY}`,
+            },
+            body: JSON.stringify({ conversation_url, prompt }),
+            signal: controller.signal,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.success || !data?.submitted) {
+            const rawReason = data?.error || `HTTP ${response.status}`;
+            const reason = typeof rawReason === 'string' ? rawReason : (rawReason?.message || JSON.stringify(rawReason));
+            const error = new Error(reason);
+            error.status = response.status;
+            error.data = data;
+            throw error;
+        }
+        return data;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function callChatGPT({ model = 'gpt-instant', messages, conversation_url, timeout = 300000 }) {
     const body = { model, messages };
     if (conversation_url) body.conversation_url = conversation_url;
@@ -123,323 +152,638 @@ function formatResult(data) {
 // ==========================================
 
 const server = new Server(
-    { name: 'webgpt2mcp', version: '1.0.0' },
+    { name: 'webgpt2mcp', version: '2.0.0' },
     { capabilities: { tools: {} } },
 );
+
+const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
+
+function parseConversationRef(value) {
+    const raw = typeof value === 'string' ? value.trim() : '';
+    if (!raw) return null;
+    if (CONVERSATION_ID_RE.test(raw)) {
+        return { id: raw.toLowerCase(), url: `https://chatgpt.com/c/${raw.toLowerCase()}` };
+    }
+    const match = raw.match(CONVERSATION_URL_RE);
+    if (!match) return null;
+    const id = match[1].toLowerCase();
+    return { id, url: `https://chatgpt.com/c/${id}` };
+}
+
+function exactRefError() {
+    return {
+        content: [{
+            type: 'text',
+            text: 'Error: conversation must be an exact ChatGPT conversation ID or an exact https://chatgpt.com/c/... URL. Titles, topics, and fuzzy names are not accepted for this operation.',
+        }],
+        isError: true,
+    };
+}
+
+// Verified live: ChatGPT web projects are "snorlax" gizmos with g-p-* ids,
+// surfaced as https://chatgpt.com/g/<g-p-id>[-slug] URLs.
+const PROJECT_ID_RE = /^g-p-[0-9a-z]+$/i;
+const PROJECT_URL_RE = /^https:\/\/chatgpt\.com\/g\/(g-p-[0-9a-z]+)/i;
+
+function parseProjectRef(value) {
+    const raw = typeof value === 'string' ? value.trim() : '';
+    if (!raw) return null;
+    if (PROJECT_ID_RE.test(raw)) return raw;
+    const match = raw.match(PROJECT_URL_RE);
+    if (match) return match[1];
+    return null;
+}
+
+function projectRefError() {
+    return {
+        content: [{
+            type: 'text',
+            text: 'Error: project must be an exact ChatGPT project ID (g-p-...) or an exact https://chatgpt.com/g/g-p-... URL. Project names are not accepted for this operation.',
+        }],
+        isError: true,
+    };
+}
+
+async function adminJson(pathname, options = {}) {
+    const response = await fetch(`${API_URL}${pathname}`, {
+        ...options,
+        headers: {
+            'Authorization': `Bearer ${API_KEY}`,
+            ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+            ...(options.headers || {}),
+        },
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const rawReason = data?.error?.message || data?.error || data?.message || `HTTP ${response.status}`;
+        const reason = typeof rawReason === 'string' ? rawReason : JSON.stringify(rawReason);
+        const error = new Error(reason);
+        error.status = response.status;
+        error.data = data;
+        throw error;
+    }
+    return data;
+}
+
+async function listCloudConversations({ limit = 20, includeStatus = true, includeLastMessage = false } = {}) {
+    const safeLimit = Math.max(1, Math.min(Number(limit || 20), 50));
+    const params = new URLSearchParams({ limit: String(safeLimit) });
+    if (includeStatus) params.set('include_status', '1');
+    if (includeLastMessage) params.set('include_last_message', '1');
+    const data = await adminJson(`/admin/chatgpt/conversations?${params.toString()}`);
+    return Array.isArray(data.items) ? data.items : [];
+}
+
+async function readCloudConversation(id) {
+    return adminJson(`/admin/chatgpt/conversation/${id}`);
+}
+
+async function updateConversationIndex(items) {
+    if (!Array.isArray(items) || items.length === 0) return;
+    const store = await loadSessions();
+    const byUrl = new Map(store.sessions.map(session => [session.conversation_url, session]));
+    for (const item of items) {
+        if (!item?.id) continue;
+        const url = `https://chatgpt.com/c/${item.id}`;
+        const existing = byUrl.get(url);
+        if (existing) {
+            if (item.title) existing.topic = item.title;
+            if (item.model) existing.model = item.model;
+            if (item.update_time) existing.last_used = item.update_time;
+        } else {
+            const created = {
+                conversation_url: url,
+                model: item.model || 'unknown',
+                topic: item.title || 'Untitled',
+                messages: [],
+                message_count: 0,
+                created_at: item.create_time || new Date().toISOString(),
+                last_used: item.update_time || new Date().toISOString(),
+            };
+            store.sessions.push(created);
+            byUrl.set(url, created);
+        }
+    }
+    await saveSessions(store);
+}
+
+function localConversationIndexItems(store) {
+    return (store.sessions || []).map(session => {
+        const ref = parseConversationRef(session.conversation_url);
+        if (!ref) return null;
+        return {
+            id: ref.id,
+            title: session.topic || 'Untitled',
+            update_time: session.last_used || null,
+            model: session.model || null,
+        };
+    }).filter(Boolean);
+}
+
+async function stopExactConversation({ conversation_url, timeout = 120000 }) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+        const response = await fetch(`${API_URL}/admin/chatgpt/stop`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${API_KEY}`,
+            },
+            body: JSON.stringify({ conversation_url }),
+            signal: controller.signal,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.success) {
+            const rawReason = data?.error || `HTTP ${response.status}`;
+            const reason = typeof rawReason === 'string' ? rawReason : (rawReason?.message || JSON.stringify(rawReason));
+            const error = new Error(reason);
+            error.status = response.status;
+            error.data = data;
+            throw error;
+        }
+        return data;
+    } finally {
+        clearTimeout(timer);
+    }
+}
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
         {
+            // Keep the published connector name working while clients migrate
+            // to the explicit create/send surface below.
             name: 'chatgpt',
-            description: `向 ChatGPT 发送消息并获取回复，自动保存会话记录。
-会话路由规则（按优先级）：
-1. 传 conversation_url → 精确继续指定会话
-2. 不传 conversation_url 但传 topic → 自动匹配同 topic 的最近会话，无匹配则新建
-3. 都不传 → 创建新会话
-
-决策示例：
-- "开个新会话问 ChatGPT …" → 不传 conversation_url，可传 topic
-- "继续上次关于 X 的讨论" → 传 topic="X"，不传 conversation_url
-- 用户提供了会话链接 → 传 conversation_url
-- "列出我最近的会话" → 调用 chatgpt_sessions`,
+            description: 'Compatibility entry point for sending a ChatGPT message. It creates a new conversation unless an exact conversation URL is supplied.',
             inputSchema: {
                 type: 'object',
                 properties: {
-                    prompt: { type: 'string', description: '发送给 ChatGPT 的消息' },
+                    prompt: { type: 'string', description: 'Message to send to ChatGPT.' },
                     model: {
                         type: 'string',
                         enum: ['gpt-instant', 'gpt-thinking', 'gpt-pro'],
-                        description: '模型选择: gpt-instant 最快，gpt-thinking 用于复杂推理',
                         default: 'gpt-instant',
+                        description: 'ChatGPT model to use.',
                     },
-                    conversation_url: { type: 'string', description: '已有会话 URL，传入则继续该会话。不传则创建新会话。' },
-                    system_prompt: { type: 'string', description: '系统提示词，设定角色和上下文（可选）' },
-                    topic: { type: 'string', description: '会话主题标签，用于后续查找（可选）' },
+                    conversation_url: { type: 'string', description: 'Optional exact conversation URL to continue.' },
+                    system_prompt: { type: 'string', description: 'Optional system instruction.' },
+                    topic: { type: 'string', description: 'Optional local topic label.' },
                 },
                 required: ['prompt'],
             },
         },
         {
-            name: 'chatgpt_sessions',
-            description: `管理 ChatGPT 会话：列表、查看完整对话历史、删除（本地+云端）。
-操作说明：
-- list: 列出最近会话，显示主题、消息数、首条预览
-- history: 查看指定会话的完整本地对话记录（user/assistant 逐条展示）
-- delete: 删除指定会话。delete_cloud=true 时同步删除 ChatGPT 云端会话
-- clear: 清空所有本地会话记录
-- sync: 同步云端状态。清理本地中已从云端删除的会话；pull_cloud=true 时同时拉取云端新会话
-决策示例：
-- "看看最近的 ChatGPT 会话" → action=list
-- "查看上次 KGQA 讨论的完整记录" → action=history, conversation_url=...
-- "删除这个会话，云端也一起删" → action=delete, conversation_url=..., delete_cloud=true`,
+            name: 'conversations_list',
+            description: 'List recent ChatGPT conversations. Returns exact conversation IDs and URLs, titles, last activity, and current streaming state. This is a discovery tool only and never changes a conversation.',
             inputSchema: {
                 type: 'object',
                 properties: {
-                    filter_topic: { type: 'string', description: '按主题过滤（模糊匹配）' },
-                    limit: { type: 'number', description: '返回数量，默认 10', default: 10 },
-                    action: { type: 'string', enum: ['list', 'history', 'delete', 'clear', 'sync'], description: '操作: list(默认)=列出, history=查看完整对话, delete=删除会话, clear=清空所有, sync=同步云端状态', default: 'list' },
-                    conversation_url: { type: 'string', description: 'history/delete 操作时指定会话 URL' },
-                    delete_cloud: { type: 'boolean', description: 'delete 时是否同步删除 ChatGPT 云端会话（默认 false，仅删本地）', default: false },
+                    limit: { type: 'number', minimum: 1, maximum: 50, default: 20, description: 'Maximum number of recent conversations to return.' },
                 },
             },
         },
         {
-            name: 'chatgpt_browse',
-            description: '让 ChatGPT 访问一个 URL 并回答关于该页面内容的问题。适用于阅读网页、GitHub 项目、文档等。',
+            name: 'conversation_read',
+            description: 'Read one exact ChatGPT conversation and return its metadata, current streaming state, and full visible user/assistant transcript. Requires an exact conversation ID or exact ChatGPT conversation URL. Titles and fuzzy names are rejected.',
             inputSchema: {
                 type: 'object',
                 properties: {
-                    url: { type: 'string', description: '要访问的 URL' },
-                    question: { type: 'string', description: '关于页面内容的问题' },
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                },
+                required: ['conversation'],
+            },
+        },
+        {
+            name: 'conversations_search',
+            description: 'Search recent ChatGPT conversation titles. Returns matching exact conversation IDs and URLs for later read/send operations. Discovery only: it never selects a match automatically and never changes a conversation.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    query: { type: 'string', description: 'Text to search for in recent conversation titles.' },
+                    limit: { type: 'number', minimum: 1, maximum: 20, default: 10, description: 'Maximum number of matches to return.' },
+                },
+                required: ['query'],
+            },
+        },
+        {
+            name: 'send',
+            description: 'Send a message to one exact existing ChatGPT conversation. Requires an exact conversation ID or URL and never creates a new chat. If that conversation is currently generating, send automatically performs Stop, waits for the old response to stop, then sends the new message through the normal exact-send path.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                    message: { type: 'string', description: 'Message to send to the exact conversation.' },
+                },
+                required: ['conversation', 'message'],
+            },
+        },
+        {
+            name: 'create',
+            description: 'Create a brand-new ChatGPT conversation and send its first message. This is the only tool in this MCP that is allowed to create a new conversation.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    message: { type: 'string', description: 'First message for the new conversation.' },
                     model: {
                         type: 'string',
-                        enum: ['gpt-instant', 'gpt-thinking'],
+                        enum: ['gpt-instant', 'gpt-thinking', 'gpt-pro'],
                         default: 'gpt-instant',
-                        description: '使用的模型',
+                        description: 'ChatGPT model to use for the new conversation.',
                     },
                 },
-                required: ['url', 'question'],
+                required: ['message'],
+            },
+        },
+        {
+            name: 'stop',
+            description: 'Stop the active response in one exact ChatGPT conversation without sending a replacement message. Requires an exact conversation ID or URL and never guesses by title or topic.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                },
+                required: ['conversation'],
+            },
+        },
+        {
+            name: 'delete',
+            description: 'Delete one exact ChatGPT conversation from ChatGPT cloud storage. Requires an exact conversation ID or URL and explicit confirm=true. Only use after the user explicitly approved deletion.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                    confirm: { type: 'boolean', description: 'Must be true to confirm the destructive deletion.' },
+                },
+                required: ['conversation', 'confirm'],
+            },
+        },
+        {
+            name: 'rename',
+            description: 'Rename one exact ChatGPT conversation. Requires an exact conversation ID or URL; never matches by title. The new title is read back from the ChatGPT cloud API to confirm the change.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                    title: { type: 'string', description: 'New title for the conversation.' },
+                },
+                required: ['conversation', 'title'],
+            },
+        },
+        {
+            name: 'archive',
+            description: 'Archive one exact ChatGPT conversation (removes it from the active sidebar, keeps it retrievable). Requires an exact conversation ID or URL; never matches by title. The archive state is read back to confirm.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                },
+                required: ['conversation'],
+            },
+        },
+        {
+            name: 'unarchive',
+            description: 'Restore one exact archived ChatGPT conversation back to the active sidebar. Requires an exact conversation ID or URL; never matches by title. The archive state is read back to confirm.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                },
+                required: ['conversation'],
+            },
+        },
+        {
+            name: 'projects_list',
+            description: 'List ChatGPT projects with their exact project IDs and URLs. Discovery only; it never changes anything. Use the returned exact ID with project_conversations or move.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    limit: { type: 'number', minimum: 1, maximum: 100, default: 50, description: 'Maximum number of projects to return.' },
+                },
+            },
+        },
+        {
+            name: 'project_conversations',
+            description: 'List the conversations inside one exact ChatGPT project. Requires an exact project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL. Discovery only; it never changes anything.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    project: { type: 'string', description: 'Exact ChatGPT project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL.' },
+                    limit: { type: 'number', minimum: 1, maximum: 100, default: 28, description: 'Maximum number of conversations to return.' },
+                },
+                required: ['project'],
+            },
+        },
+        {
+            name: 'move',
+            description: 'Move one exact conversation into a ChatGPT project, or out of any project. Requires an exact conversation ID or URL and an exact project ID or URL (or "none" to remove it from its project). Never matches by title. The resulting project membership is read back to confirm.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                    project: { type: 'string', description: 'Exact project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL to move into, or the literal string "none" to move the conversation out of any project.' },
+                },
+                required: ['conversation', 'project'],
             },
         },
     ],
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
+    const { name, arguments: args = {} } = request.params;
 
     try {
         if (name === 'chatgpt') {
-            let convUrl = args.conversation_url || null;
-            const topic = args.topic || '';
+            const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+            if (!prompt) return { content: [{ type: 'text', text: 'Error: prompt is required.' }], isError: true };
 
-            // 自动匹配：有 topic 但没传 conversation_url 时，查找已有会话复用
-            if (!convUrl && topic) {
-                const store = await loadSessions();
-                const matched = store.sessions.find(s =>
-                    s.topic && s.topic.toLowerCase() === topic.toLowerCase()
-                );
-                if (matched) {
-                    convUrl = matched.conversation_url;
-                }
-            }
-
+            const allowedModels = new Set(['gpt-instant', 'gpt-thinking', 'gpt-pro']);
+            const model = allowedModels.has(args.model) ? args.model : 'gpt-instant';
             const messages = [];
-            if (args.system_prompt) messages.push({ role: 'system', content: args.system_prompt });
-            messages.push({ role: 'user', content: args.prompt });
+            if (typeof args.system_prompt === 'string' && args.system_prompt.trim()) {
+                messages.push({ role: 'system', content: args.system_prompt.trim() });
+            }
+            messages.push({ role: 'user', content: prompt });
 
             const data = await callChatGPT({
-                model: args.model || 'gpt-instant',
+                model,
                 messages,
-                conversation_url: convUrl,
+                conversation_url: typeof args.conversation_url === 'string' ? args.conversation_url.trim() : undefined,
             });
-
             const result = formatResult(data);
-            // 自动保存会话
-            const finalUrl = data.conversation_url || convUrl;
-            if (finalUrl && !data.error) {
+            const convUrl = data.conversation_url || '';
+            if (convUrl && !data.error) {
                 await recordSession({
-                    conversation_url: finalUrl,
-                    model: args.model,
-                    prompt: args.prompt,
+                    conversation_url: convUrl,
+                    model,
+                    prompt,
                     response_content: data.choices?.[0]?.message?.content || '',
-                    topic,
+                    topic: typeof args.topic === 'string' ? args.topic.trim() : '',
                 });
             }
             return result;
         }
 
-        if (name === 'chatgpt_sessions') {
-            const action = args.action || 'list';
+        if (name === 'conversations_list') {
+            let items = await listCloudConversations({ limit: args.limit, includeStatus: true, includeLastMessage: false });
+            await updateConversationIndex(items);
+            const limit = Math.max(1, Math.min(Number(args.limit || 20), 50));
+            items = items.slice(0, limit);
 
-            // 查看完整对话历史
-            if (action === 'history') {
-                if (!args.conversation_url) {
-                    return { content: [{ type: 'text', text: '请提供 conversation_url 指定要查看的会话。' }], isError: true };
-                }
-                const store = await loadSessions();
-                const session = store.sessions.find(s => s.conversation_url === args.conversation_url);
-                if (!session) {
-                    return { content: [{ type: 'text', text: `未找到会话: ${args.conversation_url}` }], isError: true };
-                }
-                const header = `[${session.model}] ${session.topic || '无主题'} | ${session.message_count}轮对话 | ${session.last_used?.replace('T', ' ').slice(0, 16)}`;
-                const msgs = (session.messages || []).map(m => {
-                    const tag = m.role === 'user' ? '👤 User' : '🤖 Assistant';
-                    const time = m.time?.replace('T', ' ').slice(11, 16) || '';
-                    return `[${time}] ${tag}:\n${m.content}`;
+            if (!items.length) {
+                return { content: [{ type: 'text', text: 'No ChatGPT conversations found.' }] };
+            }
+
+            const lines = items.map((item, index) => {
+                const url = `https://chatgpt.com/c/${item.id}`;
+                const title = item.title || 'Untitled';
+                const status = item.stream_status || 'UNKNOWN';
+                const updated = item.last_message_time || item.update_time || 'unknown';
+                return `${index + 1}. ${title}\n   ID: ${item.id}\n   URL: ${url}\n   Status: ${status}\n   Last activity: ${updated}`;
+            });
+            return { content: [{ type: 'text', text: lines.join('\n\n') }] };
+        }
+
+        if (name === 'conversation_read') {
+            const ref = parseConversationRef(args.conversation);
+            if (!ref) return exactRefError();
+            const data = await readCloudConversation(ref.id);
+            if (!Array.isArray(data.messages)) throw new Error('Conversation transcript was unavailable.');
+
+            const status = data.stream_status || 'UNKNOWN';
+            const header = `${data.title || 'Untitled'}\nID: ${ref.id}\nURL: ${ref.url}\nStatus: ${status}\nMessages: ${data.messages.length}`;
+            const transcript = data.messages.map((message, index) => {
+                const role = message.role === 'user' ? 'User' : 'Assistant';
+                const time = message.create_time ? new Date(message.create_time * 1000).toISOString() : '';
+                const model = message.model ? ` | model: ${message.model}` : '';
+                return `${index + 1}. ${role}${time ? ` | ${time}` : ''}${model}\n${message.text || ''}`;
+            }).join('\n\n');
+            return {
+                content: [{ type: 'text', text: `${header}\n${'-'.repeat(40)}\n${transcript}` }],
+                _meta: { conversation_id: ref.id, conversation_url: ref.url, stream_status: status },
+            };
+        }
+
+        if (name === 'conversations_search') {
+            const query = typeof args.query === 'string' ? args.query.trim().toLowerCase() : '';
+            if (!query) return { content: [{ type: 'text', text: 'Error: query is required.' }], isError: true };
+            const requested = Math.max(1, Math.min(Number(args.limit || 10), 20));
+
+            let items = [];
+            let source = 'cloud';
+            let cloudError = null;
+            try {
+                items = await listCloudConversations({ limit: 20, includeStatus: false, includeLastMessage: false });
+                await updateConversationIndex(items);
+            } catch (error) {
+                cloudError = error;
+                source = 'local-index';
+                items = localConversationIndexItems(await loadSessions());
+            }
+
+            const matches = items
+                .filter(item => (item.title || '').toLowerCase().includes(query))
+                .slice(0, requested);
+
+            if (!matches.length) {
+                const suffix = source === 'local-index'
+                    ? ' ChatGPT discovery was unavailable, and the local conversation index had no matching title.'
+                    : '';
+                return { content: [{ type: 'text', text: `No recent ChatGPT conversations matched "${args.query}".${suffix}` }] };
+            }
+
+            const lines = matches.map((item, index) => `${index + 1}. ${item.title || 'Untitled'}\n   ID: ${item.id}\n   URL: https://chatgpt.com/c/${item.id}\n   Last activity: ${item.update_time || 'unknown'}`);
+            const prefix = source === 'local-index'
+                ? `ChatGPT discovery is temporarily unavailable (${cloudError?.message || 'unknown error'}). Results below come from the local conversation index; use the returned exact ID/URL for any real operation.\n\n`
+                : '';
+            return { content: [{ type: 'text', text: prefix + lines.join('\n\n') }] };
+        }
+
+        if (name === 'send') {
+            const ref = parseConversationRef(args.conversation);
+            if (!ref) return exactRefError();
+            const message = typeof args.message === 'string' ? args.message.trim() : '';
+            if (!message) return { content: [{ type: 'text', text: 'Error: message is required.' }], isError: true };
+
+            const dispatched = await dispatchExactConversation({ conversation_url: ref.url, prompt: message });
+            await recordSession({ conversation_url: ref.url, model: 'unknown', prompt: message, response_content: '', topic: '' });
+            const behavior = dispatched.active_before ? 'The previous active response was stopped first, then the message was sent.' : 'The message was sent to the idle conversation.';
+            return {
+                content: [{ type: 'text', text: `${behavior}\n\n[conversation: ${ref.url}]` }],
+                _meta: {
+                    conversation_id: ref.id,
+                    conversation_url: ref.url,
+                    active_before: !!dispatched.active_before,
+                    exact_user_turn_confirmed: !!dispatched.exact_user_turn_confirmed,
+                    response_started: dispatched.response_started ?? null,
+                },
+            };
+        }
+
+        if (name === 'create') {
+            const message = typeof args.message === 'string' ? args.message.trim() : '';
+            if (!message) return { content: [{ type: 'text', text: 'Error: message is required.' }], isError: true };
+            const model = args.model || 'gpt-instant';
+            const data = await callChatGPT({ model, messages: [{ role: 'user', content: message }] });
+            const result = formatResult(data);
+            const convUrl = data.conversation_url || '';
+            if (convUrl && !data.error) {
+                await recordSession({
+                    conversation_url: convUrl,
+                    model,
+                    prompt: message,
+                    response_content: data.choices?.[0]?.message?.content || '',
+                    topic: '',
                 });
-                return { content: [{ type: 'text', text: `${header}\n${'─'.repeat(40)}\n${msgs.join('\n\n')}` }] };
             }
+            return result;
+        }
 
-            // 删除指定会话
-            if (action === 'delete') {
-                if (!args.conversation_url) {
-                    return { content: [{ type: 'text', text: '请提供 conversation_url 指定要删除的会话。' }], isError: true };
-                }
-                const store = await loadSessions();
-                const before = store.sessions.length;
-                store.sessions = store.sessions.filter(s => s.conversation_url !== args.conversation_url);
-                const removed = before - store.sessions.length;
-                await saveSessions(store);
+        if (name === 'stop') {
+            const ref = parseConversationRef(args.conversation);
+            if (!ref) return exactRefError();
+            const stopped = await stopExactConversation({ conversation_url: ref.url });
+            const text = stopped.already_idle
+                ? `Conversation was already idle.\n\n[conversation: ${ref.url}]`
+                : `Stopped the active ChatGPT response.\n\n[conversation: ${ref.url}]`;
+            return {
+                content: [{ type: 'text', text }],
+                _meta: { conversation_id: ref.id, conversation_url: ref.url, already_idle: !!stopped.already_idle },
+            };
+        }
 
-                // 同步删除 ChatGPT 云端会话
-                let cloudResult = '';
-                if (args.delete_cloud) {
-                    try {
-                        const cloudResp = await fetch(`${API_URL}/admin/chatgpt/conversation`, {
-                            method: 'DELETE',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'Authorization': `Bearer ${API_KEY}`,
-                            },
-                            body: JSON.stringify({ conversation_url: args.conversation_url }),
-                        });
-                        const cloudData = await cloudResp.json();
-                        cloudResult = cloudResp.ok ? ' | 云端已删除' : ` | 云端删除失败: ${cloudData.error || cloudResp.status}`;
-                    } catch (e) {
-                        cloudResult = ` | 云端删除异常: ${e.message}`;
-                    }
-                }
-
-                return { content: [{ type: 'text', text: `已删除 ${removed} 个本地会话。剩余 ${store.sessions.length} 个${cloudResult}` }] };
+        if (name === 'delete') {
+            const ref = parseConversationRef(args.conversation);
+            if (!ref) return exactRefError();
+            if (args.confirm !== true) {
+                return { content: [{ type: 'text', text: 'Error: delete requires confirm=true after explicit user approval.' }], isError: true };
             }
+            const deletion = await adminJson('/admin/chatgpt/conversation', {
+                method: 'DELETE',
+                body: JSON.stringify({ conversation_url: ref.url }),
+            });
+            if (deletion?.success !== true) throw new Error('ChatGPT cloud deletion failed.');
 
-            // 清空所有会话
-            if (action === 'clear') {
-                const store = await loadSessions();
-                const count = store.sessions.length;
-                const urls = store.sessions.map(s => s.conversation_url).filter(Boolean);
-
-                let cloudResult = '';
-                if (args.delete_cloud && urls.length > 0) {
-                    let deleted = 0;
-                    for (const url of urls) {
-                        try {
-                            await fetch(`${API_URL}/admin/chatgpt/conversation`, {
-                                method: 'DELETE',
-                                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${API_KEY}` },
-                                body: JSON.stringify({ conversation_url: url }),
-                            });
-                            deleted++;
-                        } catch {}
-                    }
-                    cloudResult = ` | 云端删除 ${deleted}/${urls.length}`;
-                }
-
-                store.sessions = [];
-                await saveSessions(store);
-                return { content: [{ type: 'text', text: `已清空全部 ${count} 个本地会话记录${cloudResult}。` }] };
-            }
-
-            // 同步云端状态（以云端为准，增量拉取到本地）
-            if (action === 'sync') {
-                try {
-                    const cloudResp = await fetch(`${API_URL}/admin/chatgpt/conversations?limit=50`, {
-                        headers: { 'Authorization': `Bearer ${API_KEY}` },
-                    });
-                    if (!cloudResp.ok) {
-                        return { content: [{ type: 'text', text: `同步失败: 无法获取云端会话 (${cloudResp.status})` }], isError: true };
-                    }
-                    const cloudData = await cloudResp.json();
-                    const cloudItems = cloudData.items || [];
-
-                    const store = await loadSessions();
-                    const before = store.sessions.length;
-
-                    // 以云端为准：拉取所有云端会话，更新本地已有/添加新的
-                    const localIdMap = new Map(
-                        store.sessions.map(s => {
-                            const id = s.conversation_url?.match(/\/c\/([0-9a-f-]+)/)?.[1];
-                            return [id, s];
-                        }).filter(([id]) => id)
-                    );
-
-                    let added = 0;
-                    let updated = 0;
-                    for (const cloud of cloudItems) {
-                        const existing = localIdMap.get(cloud.id);
-                        if (existing) {
-                            // 更新标题等元信息
-                            if (cloud.title && existing.topic !== cloud.title) {
-                                existing.topic = cloud.title;
-                                updated++;
-                            }
-                        } else {
-                            // 拉取新会话
-                            store.sessions.push({
-                                conversation_url: `https://chatgpt.com/c/${cloud.id}`,
-                                model: cloud.model || 'unknown',
-                                topic: cloud.title || '无主题',
-                                message_count: 0,
-                                first_prompt: '',
-                                messages: [],
-                                last_used: cloud.update_time?.replace('T', ' ').slice(0, 19) || new Date().toISOString(),
-                            });
-                            added++;
-                        }
-                    }
-
-                    await saveSessions(store);
-                    const parts = [`同步完成: 本地 ${before} → ${store.sessions.length} 个会话`];
-                    if (added > 0) parts.push(`从云端拉取了 ${added} 个新会话`);
-                    if (updated > 0) parts.push(`更新了 ${updated} 个会话标题`);
-                    if (added === 0 && updated === 0) parts.push('本地已与云端一致');
-                    return { content: [{ type: 'text', text: parts.join('；') + '。' }] };
-                } catch (e) {
-                    return { content: [{ type: 'text', text: `同步异常: ${e.message}` }], isError: true };
-                }
-            }
-
-            // 列表（默认）
             const store = await loadSessions();
-            let sessions = store.sessions || [];
-            if (args.filter_topic) {
-                const kw = args.filter_topic.toLowerCase();
-                sessions = sessions.filter(s =>
-                    (s.topic || '').toLowerCase().includes(kw) ||
-                    (s.messages?.[0]?.content || '').toLowerCase().includes(kw)
-                );
-            }
-            const limit = args.limit || 10;
-            sessions = sessions.slice(0, limit);
-
-            if (sessions.length === 0) {
-                return { content: [{ type: 'text', text: '暂无会话记录。' }] };
-            }
-
-            const lines = sessions.map((s, i) => {
-                const time = s.last_used?.replace('T', ' ').slice(0, 16) || '';
-                const firstMsg = s.messages?.[0]?.content?.slice(0, 80) || '';
-                return `${i + 1}. [${s.model}] ${s.topic || '无主题'} (${s.message_count}轮, ${time})
-   URL: ${s.conversation_url}
-   首条: ${firstMsg}`;
-            });
-            return { content: [{ type: 'text', text: `ChatGPT 会话列表:\n\n${lines.join('\n\n')}` }] };
+            store.sessions = store.sessions.filter(session => session.conversation_url !== ref.url);
+            await saveSessions(store);
+            return { content: [{ type: 'text', text: `Deleted ChatGPT conversation ${ref.id}.` }], _meta: { conversation_id: ref.id, conversation_url: ref.url } };
         }
 
-        if (name === 'chatgpt_browse') {
-            const messages = [
-                { role: 'user', content: `请访问这个链接并回答问题：\nURL: ${args.url}\n\n问题：${args.question}` },
-            ];
-            const data = await callChatGPT({
-                model: args.model || 'gpt-instant',
-                messages,
+        if (name === 'rename') {
+            const ref = parseConversationRef(args.conversation);
+            if (!ref) return exactRefError();
+            const title = typeof args.title === 'string' ? args.title.trim() : '';
+            if (!title) return { content: [{ type: 'text', text: 'Error: title is required.' }], isError: true };
+
+            const result = await adminJson('/admin/chatgpt/rename', {
+                method: 'POST',
+                body: JSON.stringify({ conversation_url: ref.url, title }),
             });
-            const result = formatResult(data);
-            if (data.conversation_url && !data.error) {
-                await recordSession({
-                    conversation_url: data.conversation_url,
-                    model: args.model,
-                    prompt: `browse: ${args.url} - ${args.question}`,
-                    response_content: data.choices?.[0]?.message?.content || '',
-                    topic: 'browse',
-                });
+            if (result?.success !== true) throw new Error(result?.error || 'ChatGPT rename failed.');
+
+            // Keep the local index title in sync so later searches reflect reality.
+            const store = await loadSessions();
+            const existing = store.sessions.find(session => session.conversation_url === ref.url);
+            if (existing) {
+                existing.topic = result.title || title;
+                await saveSessions(store);
             }
-            return result;
+            return {
+                content: [{ type: 'text', text: `Renamed conversation to "${result.title}".${result.verified === false ? ' Warning: the new title could not be verified by reading the conversation back.' : ''}\n\n[conversation: ${ref.url}]` }],
+                _meta: { conversation_id: ref.id, conversation_url: ref.url, title: result.title, verified: result.verified !== false },
+            };
         }
 
-        return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
+        if (name === 'archive' || name === 'unarchive') {
+            const ref = parseConversationRef(args.conversation);
+            if (!ref) return exactRefError();
+            const archived = name === 'archive';
+
+            const result = await adminJson('/admin/chatgpt/archive', {
+                method: 'POST',
+                body: JSON.stringify({ conversation_url: ref.url, archived }),
+            });
+            if (result?.success !== true) throw new Error(result?.error || `ChatGPT ${name} failed.`);
+
+            const state = result.is_archived === true ? 'archived' : 'active';
+            return {
+                content: [{ type: 'text', text: `Conversation "${result.title || 'Untitled'}" is now ${state}.${result.verified === false ? ' Warning: the new state could not be verified by reading the conversation back.' : ''}\n\n[conversation: ${ref.url}]` }],
+                _meta: { conversation_id: ref.id, conversation_url: ref.url, is_archived: result.is_archived === true, title: result.title || null, verified: result.verified !== false },
+            };
+        }
+
+        if (name === 'projects_list') {
+            const limit = Math.max(1, Math.min(Number(args.limit || 50), 100));
+            const data = await adminJson(`/admin/chatgpt/projects?limit=${limit}`);
+            const projects = Array.isArray(data.projects) ? data.projects : [];
+            if (!projects.length) {
+                return { content: [{ type: 'text', text: 'No ChatGPT projects found.' }] };
+            }
+            const lines = projects.map((project, index) =>
+                `${index + 1}. ${project.title}\n   ID: ${project.id}\n   URL: ${project.url || `https://chatgpt.com/g/${project.id}`}\n   Last activity: ${project.last_interacted_at || project.update_time || 'unknown'}`);
+            return {
+                content: [{ type: 'text', text: lines.join('\n\n') }],
+                _meta: { count: projects.length },
+            };
+        }
+
+        if (name === 'project_conversations') {
+            const projectId = parseProjectRef(args.project);
+            if (!projectId) return projectRefError();
+            const limit = Math.max(1, Math.min(Number(args.limit || 28), 100));
+            const data = await adminJson(`/admin/chatgpt/projects/${encodeURIComponent(projectId)}/conversations?limit=${limit}`);
+            const conversations = Array.isArray(data.conversations) ? data.conversations : [];
+            if (!conversations.length) {
+                return { content: [{ type: 'text', text: `Project ${projectId} has no conversations.` }] };
+            }
+            const lines = conversations.map((conversation, index) =>
+                `${index + 1}. ${conversation.title}\n   ID: ${conversation.id}\n   URL: https://chatgpt.com/c/${conversation.id}\n   Last activity: ${conversation.update_time || 'unknown'}`);
+            return {
+                content: [{ type: 'text', text: lines.join('\n\n') }],
+                _meta: { project_id: projectId, count: conversations.length },
+            };
+        }
+
+        if (name === 'move') {
+            const ref = parseConversationRef(args.conversation);
+            if (!ref) return exactRefError();
+            if (args.project === undefined || args.project === null) return projectRefError();
+
+            let projectId = null;
+            let movingOut = false;
+            if (typeof args.project === 'string' && args.project.trim().toLowerCase() === 'none') {
+                movingOut = true;
+            } else {
+                projectId = parseProjectRef(args.project);
+                if (!projectId) return projectRefError();
+            }
+
+            const result = await adminJson('/admin/chatgpt/move', {
+                method: 'POST',
+                body: JSON.stringify({ conversation_url: ref.url, project: movingOut ? 'none' : projectId }),
+            });
+            if (result?.success !== true) throw new Error(result?.error || 'ChatGPT move failed.');
+
+            const target = result.project_id
+                ? `project ${result.project_id} (${result.moved_to})`
+                : 'no project (removed from any project)';
+            return {
+                content: [{ type: 'text', text: `Moved conversation to ${target}.${result.verified === false ? ' Warning: the new project membership could not be verified by reading the conversation back.' : ''}\n\n[conversation: ${ref.url}]` }],
+                _meta: {
+                    conversation_id: ref.id,
+                    conversation_url: ref.url,
+                    project_id: result.project_id || null,
+                    project_url: result.moved_to || null,
+                    verified: result.verified !== false,
+                },
+            };
+        }
+
+        return { content: [{ type: 'text', text: `Error: unknown tool "${name}".` }], isError: true };
     } catch (err) {
-        return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+        const detail = err?.data?.actual_url ? ` Browser URL: ${err.data.actual_url}.` : '';
+        return { content: [{ type: 'text', text: `Error: ${err.message}.${detail}` }], isError: true };
     }
 });
 

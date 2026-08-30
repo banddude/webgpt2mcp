@@ -138,7 +138,7 @@ export async function parseRequest(data, options) {
             }
 
         } else {
-            return parseError(ERROR_CODES.INVALID_MODEL, `Invalid model / backend ${backendName} does not support: ${data.model}`);
+            return parseError(ERROR_CODES.INVALID_MODEL, `模型无效/后端 ${backendName} 不支持: ${data.model}`);
         }
     } else {
         logger.info('服务器', '未指定模型，使用网页默认', { id: requestId });
@@ -182,7 +182,7 @@ async function parseTextRequest(messages, tempDir, imageLimit, modelId, isStream
 
                     // 图片数量限制检查
                     if (imageLimit > 0 && globalImageCount > imageLimit) {
-                        textBuffer += `[Image ${globalImageCount} (ignored: over limit)]`;
+                        textBuffer += `[图片${globalImageCount} (已忽略:超过限制)]`;
                         continue;
                     }
 
@@ -192,12 +192,12 @@ async function parseTextRequest(messages, tempDir, imageLimit, modelId, isStream
                         if (imagePath) {
                             imagePaths.push(imagePath);
                             // 插入占位符
-                            textBuffer += `[Image ${globalImageCount}]`;
+                            textBuffer += `[图片${globalImageCount}]`;
                         } else {
-                            textBuffer += `[Image ${globalImageCount} (upload failed)]`;
+                            textBuffer += `[图片${globalImageCount} (上传失败)]`;
                         }
                     } else {
-                        textBuffer += `[Image ${globalImageCount} (invalid link)]`;
+                        textBuffer += `[图片${globalImageCount} (无效链接)]`;
                     }
                 }
             }
@@ -214,7 +214,7 @@ async function parseTextRequest(messages, tempDir, imageLimit, modelId, isStream
             systemParts.push(trimCodexHarness(content));
         }
     }
-    systemPrompt = `=== SYSTEM INSTRUCTIONS (ALWAYS PINNED) ===\n${systemParts.join('\n\n')}\n\n`;
+    systemPrompt = `=== 系统指令 (永远置顶) ===\n${systemParts.join('\n\n')}\n\n`;
 
     // 2. 区分历史和当前消息
     // 找到最后一条 user 消息的索引
@@ -236,7 +236,7 @@ async function parseTextRequest(messages, tempDir, imageLimit, modelId, isStream
     });
 
     if (historyMessages.length > 0) {
-        historyPrompt += `=== CONVERSATION HISTORY (sliding window or summary) ===\n`;
+        historyPrompt += `=== 历史对话 (滑动窗口或摘要) ===\n`;
         for (const msg of historyMessages) {
             const roleName = msg.role === 'user' ? 'User' : 'AI';
             const content = await processContent(msg.content);
@@ -253,7 +253,7 @@ async function parseTextRequest(messages, tempDir, imageLimit, modelId, isStream
     const hasContext = systemPrompt || historyPrompt;
     if (hasContext) {
         // 有上下文，添加分割符
-        currentPrompt = `=== CURRENT INPUT ===\nUser: ${currentContent}`;
+        currentPrompt = `=== 当前输入 ===\nUser: ${currentContent}`;
     } else {
         // 没有上下文，直接使用内容
         currentPrompt = currentContent;
@@ -301,7 +301,7 @@ async function parseImageRequest(messages, tempDir, imageLimit, modelId, isStrea
                 // 图片数量检查
                 if (imageLimit <= 10) {
                     if (imageCount > imageLimit) {
-                        return parseError(ERROR_CODES.TOO_MANY_IMAGES, `Image count exceeds limit (max ${imageLimit})`);
+                        return parseError(ERROR_CODES.TOO_MANY_IMAGES, `图片数量超过限制（最大 ${imageLimit} 张）`);
                     }
                 } else {
                     // imageLimit > 10：超过浏览器硬限制时忽略
@@ -331,11 +331,11 @@ async function parseImageRequest(messages, tempDir, imageLimit, modelId, isStrea
     const policy = modelId ? getImagePolicy(modelId) : IMAGE_POLICY.OPTIONAL;
 
     if (policy === IMAGE_POLICY.REQUIRED && !hasImage) {
-        return parseError(ERROR_CODES.IMAGE_REQUIRED, `Model ${modelId} requires a reference image`);
+        return parseError(ERROR_CODES.IMAGE_REQUIRED, `模型 ${modelId} 需要参考图`);
     }
 
     if (policy === IMAGE_POLICY.FORBIDDEN && hasImage) {
-        return parseError(ERROR_CODES.IMAGE_FORBIDDEN, `Model ${modelId} does not support image input`);
+        return parseError(ERROR_CODES.IMAGE_FORBIDDEN, `模型 ${modelId} 不支持图片输入`);
     }
 
     return {
