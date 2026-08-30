@@ -641,26 +641,70 @@ export function createAdminRouter(context) {
                 return;
             }
 
-            const normalizeChatUrl = (value) => String(value || '').replace(/\/$/, '');
+            // ChatGPT redirects conversations assigned to a project from the public
+            // /c/<id> URL to /g/<project>/c/<id>. Keep exact-ID validation at the
+            // request boundary, but compare the browser page by conversation ID so
+            // that a legitimate project redirect is not reported as a mismatch.
+            const normalizeChatUrl = (value) => {
+                const raw = String(value || '').trim();
+                try {
+                    const parsed = new URL(raw);
+                    if (parsed.hostname === 'chatgpt.com') {
+                        const match = parsed.pathname.match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+                        if (match) return `https://chatgpt.com/c/${match[1].toLowerCase()}`;
+                    }
+                } catch { }
+                return raw.replace(/\/$/, '');
+            };
+
+            const projectIdPattern = /^g-p-[0-9a-z]+$/i;
+            const configuredProjectIds = () => {
+                const routing = config?.projects && typeof config.projects === 'object'
+                    ? config.projects
+                    : {};
+                const byAgent = routing.byAgent || routing.by_agent || {};
+                return [...new Set([
+                    routing.default,
+                    routing.defaultProject,
+                    ...Object.values(byAgent)
+                ].filter(value => typeof value === 'string' && projectIdPattern.test(value.trim()))
+                    .map(value => value.trim().toLowerCase()))];
+            };
+
+            const navigationCandidates = (conversationUrl) => {
+                const normalized = normalizeChatUrl(conversationUrl);
+                const match = normalized.match(/^https:\/\/chatgpt\.com\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+                if (!match) return [conversationUrl];
+                const conversationId = match[1].toLowerCase();
+                return [
+                    conversationUrl,
+                    ...configuredProjectIds().map(projectId =>
+                        `https://chatgpt.com/g/${projectId}/c/${conversationId}`)
+                ];
+            };
 
             // Use the same navigation and composer-wait helpers as the normal ChatGPT
             // adapter. Steering should not maintain a second browser-navigation stack.
             const navigateExactChat = async (page, conversationUrl) => {
                 const targetUrl = normalizeChatUrl(conversationUrl);
+                const candidates = navigationCandidates(conversationUrl);
                 let lastError = null;
 
                 for (let attempt = 1; attempt <= 2; attempt += 1) {
-                    try {
-                        if (normalizeChatUrl(page.url()) !== targetUrl) {
-                            await gotoWithCheck(page, conversationUrl, { timeout: 60000 });
+                    for (const candidate of candidates) {
+                        try {
+                            if (normalizeChatUrl(page.url()) !== targetUrl ||
+                                (candidate !== conversationUrl && page.url() !== candidate)) {
+                                await gotoWithCheck(page, candidate, { timeout: 60000 });
+                            }
+                            await waitForInput(page, '#prompt-textarea', { click: false, timeout: 60000 });
+                            if (normalizeChatUrl(page.url()) === targetUrl) {
+                                return { ok: true, ready: true, actualUrl: page.url() };
+                            }
+                            lastError = new Error(`conversation_navigation_mismatch:${page.url()}`);
+                        } catch (err) {
+                            lastError = err;
                         }
-                        await waitForInput(page, '#prompt-textarea', { click: false, timeout: 60000 });
-                        if (normalizeChatUrl(page.url()) === targetUrl) {
-                            return { ok: true, ready: true, actualUrl: page.url() };
-                        }
-                        lastError = new Error(`conversation_navigation_mismatch:${page.url()}`);
-                    } catch (err) {
-                        lastError = err;
                     }
 
                     if (attempt < 2) {
