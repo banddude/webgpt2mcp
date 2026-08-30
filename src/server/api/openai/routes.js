@@ -25,6 +25,35 @@ export function createOpenAIRouter(context) {
         queueManager
     } = context;
 
+    function firstText(...values) {
+        for (const value of values) {
+            if (typeof value === 'string' && value.trim()) return value.trim();
+        }
+        return null;
+    }
+
+    function requestAgentHint(data, req) {
+        return firstText(
+            data.agent,
+            data.agent_name,
+            data.metadata?.agent,
+            data.metadata?.agent_name,
+            req.headers?.['x-aiva-agent'],
+            req.headers?.['x-chatgpt-agent']
+        );
+    }
+
+    function requestProjectHint(data, req) {
+        return firstText(
+            data.project,
+            data.project_id,
+            data.metadata?.project,
+            data.metadata?.project_id,
+            req.headers?.['x-aiva-project'],
+            req.headers?.['x-chatgpt-project']
+        );
+    }
+
     /**
      * 处理 GET /v1/models
      */
@@ -129,6 +158,8 @@ export function createOpenAIRouter(context) {
                 data.metadata?.conversation_url ||
                 data.metadata?.chatgpt_conversation_url ||
                 null;
+            const agent = requestAgentHint(data, req);
+            const project = requestProjectHint(data, req);
 
             logger.info('服务器', `[队列] 请求入队: ${prompt.slice(0, 100)}...`, { id: requestId, images: imagePaths.length });
 
@@ -143,7 +174,9 @@ export function createOpenAIRouter(context) {
                 id: requestId,
                 isStreaming,
                 reasoning,
-                conversationUrl
+                conversationUrl,
+                agent,
+                project
             });
 
         } catch (err) {
@@ -242,7 +275,9 @@ export function createOpenAIRouter(context) {
             stream: data.stream === true,
             reasoning: false,
             metadata: data.metadata,
-            conversation_url: data.metadata?.conversation_url || data.metadata?.chatgpt_conversation_url || null
+            conversation_url: data.metadata?.conversation_url || data.metadata?.chatgpt_conversation_url || null,
+            agent: data.agent || data.agent_name || data.metadata?.agent || data.metadata?.agent_name,
+            project: data.project || data.project_id || data.metadata?.project || data.metadata?.project_id
         };
     }
 
@@ -447,6 +482,7 @@ export function createOpenAIRouter(context) {
 
             const adapter = createResponsesAdapter(res, data, requestId);
             const fakeReq = {
+                headers: req.headers || {},
                 async *[Symbol.asyncIterator]() {
                     yield Buffer.from(JSON.stringify(chatData));
                 }

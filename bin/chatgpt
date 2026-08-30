@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""Command-line client for the local ChatGPT web-management API."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+
+
+CONVERSATION_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+CONVERSATION_URL_RE = re.compile(
+    r"https://chatgpt\.com/c/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/?",
+    re.IGNORECASE,
+)
+PROJECT_ID_RE = re.compile(r"g-p-[0-9a-z]+", re.IGNORECASE)
+PROJECT_URL_RE = re.compile(
+    r"https://chatgpt\.com/g/(g-p-[0-9a-z]+)(?:-[^/?#]+)?/?",
+    re.IGNORECASE,
+)
+
+EXACT_CONVERSATION_ERROR = (
+    "conversation must be an exact ChatGPT conversation ID or exact "
+    "https://chatgpt.com/c/... URL; titles and fuzzy names are not accepted"
+)
+EXACT_PROJECT_ERROR = (
+    "project must be an exact ChatGPT project ID (g-p-...) or exact "
+    "https://chatgpt.com/g/g-p-... URL; project names are not accepted"
+)
+DEFAULT_LIST_LIMIT = 20
+DEFAULT_SEARCH_LIMIT = 20
+DEFAULT_PROJECT_LIMIT = 50
+DEFAULT_PROJECT_CONVERSATION_LIMIT = 28
+DEFAULT_TIMEOUT_SECONDS = 300
+
+
+class ChatGPTError(Exception):
+    """An API or local configuration error suitable for CLI output."""
+
+    def __init__(self, message: str, *, status: int | None = None, data: Any = None):
+        super().__init__(message)
+        self.status = status
+        self.data = data
+
+
+class CliUsageError(ChatGPTError):
+    """An invalid command argument."""
+
+
+def _service_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _config_path() -> Path:
+    configured = os.environ.get("CHATGPT_CONFIG")
+    return Path(configured).expanduser() if configured else _service_root() / "data" / "config.yaml"
+
+
+def _strip_yaml_comment(value: str) -> str:
+    quote_char: str | None = None
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote_char == '"':
+            escaped = True
+            continue
+        if char in {'"', "'"}:
+            if quote_char is None:
+                quote_char = char
+            elif quote_char == char:
+                quote_char = None
+            continue
+        if char == "#" and quote_char is None and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+    return value.strip()
+
+
+def _yaml_scalar(value: str) -> str:
+    value = _strip_yaml_comment(value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        if value[0] == '"':
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ChatGPTError(f"invalid quoted value in {_config_path()}: {exc}") from exc
+            if not isinstance(parsed, str):
+                raise ChatGPTError(f"expected a string value in {_config_path()}")
+            return parsed
+        return value[1:-1].replace("''", "'")
+    return value
+
+
+def _read_server_config(path: Path) -> tuple[str, int]:
+    """Read server.auth and server.port without requiring a YAML package."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ChatGPTError(f"cannot read config file {path}: {exc}") from exc
+
+    server_indent: int | None = None
+    values: dict[str, str] = {}
+    for raw_line in lines:
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        content = raw_line.strip()
+        if server_indent is None:
+            if re.fullmatch(r"server:\s*(?:#.*)?", content):
+                server_indent = indent
+            continue
+        if indent <= server_indent:
+            break
+        match = re.fullmatch(r"(auth|port):\s*(.*?)\s*", content)
+        if match:
+            values[match.group(1)] = _yaml_scalar(match.group(2))
+
+    auth = values.get("auth", "").strip()
+    if not auth:
+        raise ChatGPTError(f"server.auth is missing or empty in {path}")
+    try:
+        port = int(values.get("port", "17841"))
+    except ValueError as exc:
+        raise ChatGPTError(f"server.port is not an integer in {path}") from exc
+    if not 1 <= port <= 65535:
+        raise ChatGPTError(f"server.port is outside 1-65535 in {path}")
+    return auth, port
+
+
+def _endpoint() -> tuple[str, str]:
+    auth, port = _read_server_config(_config_path())
+    base_url = os.environ.get("CHATGPT_API_URL", f"http://127.0.0.1:{port}").rstrip("/")
+    if not base_url:
+        raise ChatGPTError("CHATGPT_API_URL cannot be empty")
+    return base_url, auth
+
+
+def _json_or_text(raw: bytes) -> Any:
+    if not raw:
+        return {}
+    text = raw.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _error_message(data: Any, fallback: str) -> str:
+    if isinstance(data, dict):
+        error = data.get("error")
+        if isinstance(error, dict):
+            message = error.get("message") or error.get("error") or error.get("code")
+            if message:
+                return str(message)
+        elif error:
+            return str(error)
+        if data.get("message"):
+            return str(data["message"])
+    if isinstance(data, str) and data.strip():
+        return data.strip()
+    return fallback
+
+
+class ApiClient:
+    def __init__(self) -> None:
+        self.base_url, self.auth = _endpoint()
+        try:
+            self.timeout = float(os.environ.get("CHATGPT_CLI_TIMEOUT", DEFAULT_TIMEOUT_SECONDS))
+        except ValueError as exc:
+            raise ChatGPTError("CHATGPT_CLI_TIMEOUT must be a number") from exc
+        if self.timeout <= 0:
+            raise ChatGPTError("CHATGPT_CLI_TIMEOUT must be greater than zero")
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict[str, Any] | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> Any:
+        url = f"{self.base_url}{path}"
+        if query:
+            url = f"{url}?{urlencode({key: str(value) for key, value in query.items()})}"
+        payload = json.dumps(body).encode("utf-8") if body is not None else None
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.auth}",
+            "User-Agent": "chatgpt-cli/1.0",
+        }
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        request = Request(url, data=payload, headers=headers, method=method.upper())
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                data = _json_or_text(response.read())
+                status = getattr(response, "status", 200)
+        except HTTPError as exc:
+            data = _json_or_text(exc.read())
+            raise ChatGPTError(
+                _error_message(data, f"HTTP {exc.code}"),
+                status=exc.code,
+                data=data,
+            ) from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise ChatGPTError(f"local ChatGPT API is unreachable: {exc}") from exc
+
+        if status >= 400:
+            raise ChatGPTError(_error_message(data, f"HTTP {status}"), status=status, data=data)
+        return data
+
+
+def _conversation_ref(value: str) -> tuple[str, str] | None:
+    raw = value.strip()
+    if CONVERSATION_ID_RE.fullmatch(raw):
+        identifier = raw.lower()
+        return identifier, f"https://chatgpt.com/c/{identifier}"
+    match = CONVERSATION_URL_RE.fullmatch(raw)
+    if match:
+        identifier = match.group(1).lower()
+        return identifier, f"https://chatgpt.com/c/{identifier}"
+    return None
+
+
+def _project_ref(value: str) -> str | None:
+    raw = value.strip()
+    if PROJECT_ID_RE.fullmatch(raw):
+        return raw
+    match = PROJECT_URL_RE.fullmatch(raw)
+    return match.group(1) if match else None
+
+
+def _require_conversation(value: str) -> tuple[str, str]:
+    reference = _conversation_ref(value)
+    if reference is None:
+        raise CliUsageError(EXACT_CONVERSATION_ERROR)
+    return reference
+
+
+def _require_project(value: str) -> str:
+    project_id = _project_ref(value)
+    if project_id is None:
+        raise CliUsageError(EXACT_PROJECT_ERROR)
+    return project_id
+
+
+def _positive_limit(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("limit must be an integer") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("limit must be at least 1")
+    return min(number, 50)
+
+
+def _message(parts: Iterable[str], label: str) -> str:
+    value = " ".join(parts).strip()
+    if not value:
+        raise CliUsageError(f"{label} is required")
+    return value
+
+
+def _print_json(data: Any) -> None:
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def _display_time(value: Any) -> str:
+    if value is None or value == "":
+        return "unknown"
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            pass
+    return str(value)
+
+
+def _conversation_lines(items: list[dict[str, Any]], *, empty: str) -> list[str]:
+    if not items:
+        return [empty]
+    lines: list[str] = []
+    for index, item in enumerate(items, start=1):
+        identifier = item.get("id") or "unknown"
+        lines.extend(
+            [
+                f"{index}. {item.get('title') or 'Untitled'}",
+                f"   ID: {identifier}",
+                f"   URL: {item.get('url') or f'https://chatgpt.com/c/{identifier}'}",
+                f"   Status: {item.get('stream_status') or 'UNKNOWN'}",
+                f"   Last activity: {_display_time(item.get('last_message_time') or item.get('update_time'))}",
+                "",
+            ]
+        )
+    return lines[:-1]
+
+
+def _project_lines(items: list[dict[str, Any]]) -> list[str]:
+    if not items:
+        return ["No ChatGPT projects found."]
+    lines: list[str] = []
+    for index, item in enumerate(items, start=1):
+        identifier = item.get("id") or "unknown"
+        lines.extend(
+            [
+                f"{index}. {item.get('title') or 'Untitled'}",
+                f"   ID: {identifier}",
+                f"   URL: {item.get('url') or f'https://chatgpt.com/g/{identifier}'}",
+                f"   Last activity: {_display_time(item.get('last_interacted_at') or item.get('update_time'))}",
+                "",
+            ]
+        )
+    return lines[:-1]
+
+
+def _readable_conversations(data: Any) -> list[dict[str, Any]]:
+    items = data.get("items", []) if isinstance(data, dict) else []
+    if not isinstance(items, list):
+        return []
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        result.append(
+            {
+                **item,
+                "url": item.get("url") or f"https://chatgpt.com/c/{item.get('id', '')}",
+            }
+        )
+    return result
+
+
+def _cmd_conversations_list(client: ApiClient, args: argparse.Namespace) -> Any:
+    data = client.request(
+        "GET",
+        "/admin/chatgpt/conversations",
+        query={"offset": 0, "limit": args.limit, "include_status": 1},
+    )
+    if args.json_output:
+        _print_json(data)
+    else:
+        print("\n".join(_conversation_lines(_readable_conversations(data), empty="No ChatGPT conversations found.")))
+    return data
+
+
+def _cmd_conversations_search(client: ApiClient, args: argparse.Namespace) -> Any:
+    query = _message(args.query, "query")
+    data = client.request(
+        "GET",
+        "/admin/chatgpt/conversations",
+        query={"offset": 0, "limit": 50},
+    )
+    items = _readable_conversations(data)
+    matches = [item for item in items if query.casefold() in str(item.get("title") or "").casefold()]
+    matches = matches[: args.limit]
+    result = {"query": query, "items": matches}
+    if args.json_output:
+        _print_json(result)
+    elif matches:
+        print("\n".join(_conversation_lines(matches, empty="")))
+    else:
+        print(f'No recent ChatGPT conversations matched "{query}".')
+    return result
+
+
+def _cmd_read(client: ApiClient, args: argparse.Namespace) -> Any:
+    identifier, url = _require_conversation(args.conversation)
+    data = client.request("GET", f"/admin/chatgpt/conversation/{identifier}")
+    if args.json_output:
+        _print_json(data)
+        return data
+
+    print(data.get("title") or "Untitled")
+    print(f"ID: {identifier}")
+    print(f"URL: {url}")
+    print(f"Status: {data.get('stream_status') or 'UNKNOWN'}")
+    messages = data.get("messages") if isinstance(data, dict) else None
+    messages = messages if isinstance(messages, list) else []
+    print(f"Messages: {len(messages)}")
+    print("-" * 40)
+    for index, message in enumerate(messages, start=1):
+        role = "User" if message.get("role") == "user" else "Assistant"
+        timestamp = _display_time(message.get("create_time"))
+        model = f" | model: {message['model']}" if message.get("model") else ""
+        print(f"{index}. {role} | {timestamp}{model}")
+        print(message.get("text") or "")
+        if index != len(messages):
+            print()
+    return data
+
+
+def _cmd_send(client: ApiClient, args: argparse.Namespace) -> Any:
+    _, url = _require_conversation(args.conversation)
+    message = _message(args.message, "message")
+    data = client.request(
+        "POST",
+        "/admin/chatgpt/dispatch",
+        body={"conversation_url": url, "prompt": message},
+    )
+    if args.json_output:
+        _print_json(data)
+    else:
+        behavior = (
+            "The previous active response was stopped first, then the message was sent."
+            if data.get("active_before")
+            else "The message was sent to the idle conversation."
+        )
+        print(behavior)
+        print(f"Conversation: {url}")
+    return data
+
+
+def _cmd_new(client: ApiClient, args: argparse.Namespace) -> Any:
+    message = _message(args.message, "message")
+    data = client.request(
+        "POST",
+        "/v1/chat/completions",
+        body={"model": "gpt-instant", "messages": [{"role": "user", "content": message}]},
+    )
+    if isinstance(data, dict) and data.get("error"):
+        raise ChatGPTError(_error_message(data, "ChatGPT returned an error"), data=data)
+    if args.json_output:
+        _print_json(data)
+    else:
+        content = (((data.get("choices") or [{}])[0] or {}).get("message") or {}).get("content")
+        print(content or "No response")
+        conversation_url = data.get("conversation_url")
+        if conversation_url:
+            print(f"\nConversation: {conversation_url}")
+    return data
+
+
+def _cmd_rename(client: ApiClient, args: argparse.Namespace) -> Any:
+    _, url = _require_conversation(args.conversation)
+    title = _message(args.title, "title")
+    data = client.request("POST", "/admin/chatgpt/rename", body={"conversation_url": url, "title": title})
+    if args.json_output:
+        _print_json(data)
+    else:
+        print(f"Renamed conversation to \"{data.get('title') or title}\".")
+        print(f"Conversation: {url}")
+    return data
+
+
+def _cmd_archive(client: ApiClient, args: argparse.Namespace, archived: bool) -> Any:
+    _, url = _require_conversation(args.conversation)
+    data = client.request(
+        "POST",
+        "/admin/chatgpt/archive",
+        body={"conversation_url": url, "archived": archived},
+    )
+    if args.json_output:
+        _print_json(data)
+    else:
+        state = "archived" if data.get("is_archived") else "active"
+        print(f"Conversation \"{data.get('title') or 'Untitled'}\" is now {state}.")
+        print(f"Conversation: {url}")
+    return data
+
+
+def _cmd_projects_list(client: ApiClient, args: argparse.Namespace) -> Any:
+    data = client.request("GET", "/admin/chatgpt/projects", query={"limit": args.limit})
+    projects = data.get("projects", []) if isinstance(data, dict) else []
+    projects = projects if isinstance(projects, list) else []
+    if args.json_output:
+        _print_json(data)
+    else:
+        print("\n".join(_project_lines(projects)))
+    return data
+
+
+def _cmd_projects_create(client: ApiClient, args: argparse.Namespace) -> Any:
+    name = _message(args.name, "name")
+    data = client.request(
+        "POST",
+        "/admin/chatgpt/projects",
+        body={"name": name, "instructions": ""},
+    )
+    if args.json_output:
+        _print_json(data)
+    else:
+        project = data.get("project") if isinstance(data, dict) else None
+        project = project if isinstance(project, dict) else {}
+        identifier = project.get("id") or "unknown"
+        print(f"Created ChatGPT project \"{project.get('title') or name}\".")
+        print(f"ID: {identifier}")
+        print(f"URL: {project.get('url') or f'https://chatgpt.com/g/{identifier}'}")
+        if data.get("verified") is False:
+            print("Warning: the new project was not confirmed in the project list.")
+    return data
+
+
+def _cmd_project_conversations(client: ApiClient, args: argparse.Namespace) -> Any:
+    project_id = _require_project(args.project)
+    data = client.request(
+        "GET",
+        f"/admin/chatgpt/projects/{quote(project_id, safe='')}/conversations",
+        query={"limit": args.limit},
+    )
+    conversations = data.get("conversations", []) if isinstance(data, dict) else []
+    conversations = conversations if isinstance(conversations, list) else []
+    normalized = [
+        {
+            **item,
+            "url": item.get("url") or f"https://chatgpt.com/c/{item.get('id', '')}",
+        }
+        for item in conversations
+        if isinstance(item, dict)
+    ]
+    if args.json_output:
+        _print_json(data)
+    elif normalized:
+        print("\n".join(_conversation_lines(normalized, empty="")))
+    else:
+        print(f"Project {project_id} has no conversations.")
+    return data
+
+
+def _cmd_move(client: ApiClient, args: argparse.Namespace) -> Any:
+    _, url = _require_conversation(args.conversation)
+    raw_project = args.project.strip()
+    project = "none" if raw_project.casefold() == "none" else _require_project(raw_project)
+    data = client.request("POST", "/admin/chatgpt/move", body={"conversation_url": url, "project": project})
+    if args.json_output:
+        _print_json(data)
+    else:
+        if data.get("project_id"):
+            target = f"project {data['project_id']} ({data.get('moved_to') or 'no URL'})"
+        else:
+            target = "no project (removed from any project)"
+        print(f"Moved conversation to {target}.")
+        print(f"Conversation: {url}")
+    return data
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="chatgpt",
+        description="Manage ChatGPT conversations and projects through the local web bridge.",
+    )
+    parser.add_argument("--version", action="version", version="chatgpt 1.0")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    conversations = commands.add_parser("conversations", help="list or search conversations")
+    conversation_commands = conversations.add_subparsers(dest="conversations_command", required=True)
+    list_command = conversation_commands.add_parser("list", help="list recent conversations")
+    list_command.add_argument("--limit", type=_positive_limit, default=DEFAULT_LIST_LIMIT)
+    search_command = conversation_commands.add_parser("search", help="search recent conversation titles")
+    search_command.add_argument("query", nargs="+", help="text to find in conversation titles")
+    search_command.add_argument("--limit", type=_positive_limit, default=DEFAULT_SEARCH_LIMIT)
+
+    read = commands.add_parser("read", help="read one exact conversation")
+    read.add_argument("conversation", help="exact conversation ID or exact ChatGPT URL")
+
+    send = commands.add_parser("send", help="send to one exact conversation")
+    send.add_argument("conversation", help="exact conversation ID or exact ChatGPT URL")
+    send.add_argument("message", nargs="+", help="message to send")
+
+    new = commands.add_parser("new", help="create a new conversation")
+    new.add_argument("message", nargs="+", help="first message")
+
+    rename = commands.add_parser("rename", help="rename one exact conversation")
+    rename.add_argument("conversation", help="exact conversation ID or exact ChatGPT URL")
+    rename.add_argument("title", nargs="+", help="new title")
+
+    archive = commands.add_parser("archive", help="archive one exact conversation")
+    archive.add_argument("conversation", help="exact conversation ID or exact ChatGPT URL")
+    unarchive = commands.add_parser("unarchive", help="restore one exact conversation")
+    unarchive.add_argument("conversation", help="exact conversation ID or exact ChatGPT URL")
+
+    projects = commands.add_parser("projects", help="list or inspect projects")
+    project_commands = projects.add_subparsers(dest="projects_command", required=True)
+    project_list = project_commands.add_parser("list", help="list projects")
+    project_list.add_argument("--limit", type=_positive_limit, default=DEFAULT_PROJECT_LIMIT)
+    project_create = project_commands.add_parser("create", help="create a project")
+    project_create.add_argument("name", nargs="+", help="name for the new project")
+    project_conversations = project_commands.add_parser("conversations", help="list conversations in a project")
+    project_conversations.add_argument("project", help="exact project ID or exact ChatGPT project URL")
+    project_conversations.add_argument("--limit", type=_positive_limit, default=DEFAULT_PROJECT_CONVERSATION_LIMIT)
+
+    move = commands.add_parser("move", help="move one exact conversation")
+    move.add_argument("conversation", help="exact conversation ID or exact ChatGPT URL")
+    move.add_argument("project", help="exact project ID or the literal none")
+    return parser
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    json_output = False
+    remaining: list[str] = []
+    for argument in argv:
+        if argument == "--json":
+            json_output = True
+        else:
+            remaining.append(argument)
+    args = _build_parser().parse_args(remaining)
+    args.json_output = json_output
+    return args
+
+
+def _dispatch(client: ApiClient, args: argparse.Namespace) -> Any:
+    if args.command == "conversations":
+        if args.conversations_command == "list":
+            return _cmd_conversations_list(client, args)
+        return _cmd_conversations_search(client, args)
+    if args.command == "read":
+        return _cmd_read(client, args)
+    if args.command == "send":
+        return _cmd_send(client, args)
+    if args.command == "new":
+        return _cmd_new(client, args)
+    if args.command == "rename":
+        return _cmd_rename(client, args)
+    if args.command == "archive":
+        return _cmd_archive(client, args, True)
+    if args.command == "unarchive":
+        return _cmd_archive(client, args, False)
+    if args.command == "projects":
+        if args.projects_command == "list":
+            return _cmd_projects_list(client, args)
+        if args.projects_command == "create":
+            return _cmd_projects_create(client, args)
+        return _cmd_project_conversations(client, args)
+    if args.command == "move":
+        return _cmd_move(client, args)
+    raise CliUsageError(f"unknown command: {args.command}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        args = _parse_args(list(sys.argv[1:] if argv is None else argv))
+        _dispatch(ApiClient(), args)
+        return 0
+    except ChatGPTError as exc:
+        if getattr(exc, "data", None) is not None and "--json" in (argv if argv is not None else sys.argv[1:]):
+            print(json.dumps(exc.data, indent=2, ensure_ascii=False), file=sys.stderr)
+        else:
+            print(f"chatgpt: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

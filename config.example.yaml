@@ -1,6 +1,15 @@
 # 日志等级: debug | info | warn | error
 logLevel: info
 
+# Optional ChatGPT project routing for bridge-created and dispatched conversations.
+# Use exact g-p-* IDs; projects are never created automatically at runtime.
+# An agent-specific entry wins over default.
+projects:
+  default: "g-p-your-default-project-id"
+  byAgent:
+    dev: "g-p-your-dev-project-id"
+    aiva: "g-p-your-aiva-project-id"
+
 server:
   # 监听端口
   port: 3000

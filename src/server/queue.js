@@ -27,6 +27,8 @@ import { createRecord, updateRecord, processResponseMedia } from '../utils/histo
  * @property {string|null} modelName - 模型名称
  * @property {string} id - 请求唯一标识
  * @property {boolean} isStreaming - 是否流式请求
+ * @property {string|null} agent - Optional project-routing agent hint
+ * @property {string|null} project - Optional project-routing hint
  */
 
 /**
@@ -101,7 +103,7 @@ export function createQueueManager(queueConfig, callbacks) {
      * @param {TaskContext} task - 任务上下文
      */
     async function processTask(task) {
-        const { res, prompt, imagePaths, modelId, modelName, id, isStreaming, reasoning, conversationUrl } = task;
+        const { res, prompt, imagePaths, modelId, modelName, id, isStreaming, reasoning, conversationUrl, agent, project } = task;
         const startTime = Date.now();
 
         logger.info('服务器', '[队列] 开始处理任务', { id, remaining: queue.length });
@@ -140,7 +142,13 @@ export function createQueueManager(queueConfig, callbacks) {
             }
 
             // 调用核心生图逻辑 (通过 Pool 分发)
-            const result = await generate(poolContext, prompt, imagePaths, modelId, { id, reasoning, conversationUrl });
+            const result = await generate(poolContext, prompt, imagePaths, modelId, {
+                id,
+                reasoning,
+                conversationUrl,
+                agent,
+                project
+            });
 
             // 清除心跳
             if (heartbeatInterval) clearInterval(heartbeatInterval);

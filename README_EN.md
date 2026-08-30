@@ -295,6 +295,53 @@ curl http://localhost:3000/v1/chat/completions \
 | `GET /admin/chatgpt/conversations` | List ChatGPT cloud conversations |
 | `GET /admin/chatgpt/conversation/:id` | Get full history of a specific conversation |
 
+## Local `chatgpt` CLI
+
+The AIVA installation includes a `chatgpt` command on `PATH`. It reads the
+bearer token from `data/config.yaml` and talks to the local server, so callers
+never need to paste an API key.
+
+```bash
+chatgpt conversations list
+chatgpt conversations search "takeoff"
+chatgpt read <conversation-id-or-exact-url>
+chatgpt send <conversation-id-or-exact-url> "Continue this conversation"
+chatgpt new "Start a new conversation"
+chatgpt rename <conversation-id-or-exact-url> "New title"
+chatgpt archive <conversation-id-or-exact-url>
+chatgpt unarchive <conversation-id-or-exact-url>
+chatgpt projects list
+chatgpt projects conversations <project-id-or-exact-url>
+chatgpt move <conversation-id-or-exact-url> <project-id-or-exact-url>
+chatgpt move <conversation-id-or-exact-url> none
+chatgpt projects create "Project name"
+```
+
+Mutating conversation commands require an exact UUID or exact
+`https://chatgpt.com/c/...` URL. Project operations require an exact `g-p-...`
+ID or exact project URL; titles and fuzzy names are rejected. Add `--json`
+before or after a command for the raw API response.
+
+### Automatic ChatGPT project routing
+
+The bridge can organize new completion conversations and `/admin/chatgpt/dispatch`
+requests using the top-level `projects` map in `data/config.yaml`:
+
+```yaml
+projects:
+  default: "g-p-your-default-project-id"
+  byAgent:
+    dev: "g-p-your-dev-project-id"
+    aiva: "g-p-your-aiva-project-id"
+```
+
+An exact request `project` hint takes precedence, followed by the `agent` map
+and then `default`. Requests may provide these hints as JSON fields or through
+`X-AIVA-Agent` and `X-AIVA-Project` headers. The bridge validates configured
+IDs against the live project list, falls back to `default` when a mapped project
+is missing, and never creates a project automatically. A failed move is logged
+and does not fail the conversation request.
+
 ## Hardware Requirements
 
 | Resource | Minimum | Recommended |

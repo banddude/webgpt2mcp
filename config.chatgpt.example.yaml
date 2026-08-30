@@ -1,5 +1,13 @@
 logLevel: info
 
+# Optional ChatGPT project routing. Replace these with existing exact g-p-* IDs.
+# The bridge validates them and never creates projects automatically.
+projects:
+  default: "g-p-your-default-project-id"
+  byAgent:
+    dev: "g-p-your-dev-project-id"
+    aiva: "g-p-your-aiva-project-id"
+
 server:
   port: 3000
   # Use a private value with at least 10 characters.

@@ -1292,6 +1292,12 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             logger.info('适配器', `会话 URL: ${convUrl}`, meta);
         }
 
+        const projectRouting = await routeChatGptConversationToProject(page, convUrl, config, {
+            agent: meta?.agent,
+            project: meta?.project,
+            source: 'completion'
+        });
+
         logger.info('适配器', '文本生成完成，任务完成', meta);
         if (debug) {
             debug.result = {
@@ -1301,7 +1307,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             };
             await writeDebugDump(debug, page, meta, 'success', assistantCountBefore);
         }
-        return { text: textContent.trim(), conversationUrl: convUrl };
+        return { text: textContent.trim(), conversationUrl: convUrl, projectRouting };
 
     } catch (err) {
         // 顶层错误处理
@@ -1519,6 +1525,251 @@ export async function listChatGptProjects(page, { limit = 50 } = {}) {
             last_interacted_at: gizmo.last_interacted_at || null
         }));
     return { success: true, projects };
+}
+
+const CHATGPT_PROJECT_ID_RE = /^g-p-[0-9a-z]+$/i;
+const CHATGPT_PROJECT_URL_RE = /^https:\/\/chatgpt\.com\/g\/(g-p-[0-9a-z]+)/i;
+const CHATGPT_CONVERSATION_ID_RE = /\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/?#]|$)/i;
+const projectRoutingWarnings = new Set();
+
+function normalizeProjectReference(value) {
+    if (typeof value !== 'string') return null;
+    const raw = value.trim();
+    if (CHATGPT_PROJECT_ID_RE.test(raw)) return raw.toLowerCase();
+    const match = raw.match(CHATGPT_PROJECT_URL_RE);
+    return match ? match[1].toLowerCase() : null;
+}
+
+function normalizeAgentHint(value) {
+    return typeof value === 'string' && value.trim() ? value.trim().toLowerCase() : null;
+}
+
+function configuredAgentProject(byAgent, agent) {
+    if (!byAgent || typeof byAgent !== 'object' || !agent) return undefined;
+    const entry = Object.entries(byAgent).find(([key]) => String(key).trim().toLowerCase() === agent);
+    return entry ? entry[1] : undefined;
+}
+
+/**
+ * Resolve the configured target without contacting ChatGPT. The caller still
+ * validates the selected project against the live sidebar before moving.
+ */
+export function resolveChatGptProjectTarget(config, { agent = null, project = undefined } = {}) {
+    const routing = config?.projects && typeof config.projects === 'object' ? config.projects : {};
+    const byAgent = routing.byAgent || routing.by_agent || {};
+    const normalizedAgent = normalizeAgentHint(agent);
+    const defaultProjectId = normalizeProjectReference(routing.default || routing.defaultProject);
+    const hasProjectHint = typeof project === 'string' && project.trim() !== '';
+
+    if (hasProjectHint) {
+        const rawProject = project.trim();
+        if (rawProject.toLowerCase() === 'none') {
+            return {
+                agent: normalizedAgent,
+                projectId: null,
+                defaultProjectId,
+                source: 'explicit-none',
+                explicitNone: true,
+                invalidProjectHint: null
+            };
+        }
+        const explicitProjectId = normalizeProjectReference(rawProject);
+        if (explicitProjectId) {
+            return {
+                agent: normalizedAgent,
+                projectId: explicitProjectId,
+                defaultProjectId,
+                source: 'explicit',
+                explicitNone: false,
+                invalidProjectHint: null
+            };
+        }
+        return {
+            agent: normalizedAgent,
+            projectId: defaultProjectId,
+            defaultProjectId,
+            source: defaultProjectId ? 'default' : 'none',
+            explicitNone: false,
+            invalidProjectHint: rawProject
+        };
+    }
+
+    const mappedValue = configuredAgentProject(byAgent, normalizedAgent);
+    const mappedProjectId = normalizeProjectReference(mappedValue);
+    if (mappedProjectId) {
+        return {
+            agent: normalizedAgent,
+            projectId: mappedProjectId,
+            defaultProjectId,
+            source: 'agent',
+            explicitNone: false,
+            invalidProjectHint: null,
+            invalidAgentMapping: null
+        };
+    }
+
+    return {
+        agent: normalizedAgent,
+        projectId: defaultProjectId,
+        defaultProjectId,
+        source: defaultProjectId ? 'default' : 'none',
+        explicitNone: false,
+        invalidProjectHint: null,
+        invalidAgentMapping: mappedValue === undefined ? null : String(mappedValue)
+    };
+}
+
+function warnProjectRoutingOnce(key, message, meta = {}) {
+    if (projectRoutingWarnings.has(key)) return;
+    projectRoutingWarnings.add(key);
+    logger.warn('Project routing', message, meta);
+}
+
+/**
+ * Apply the configured project after a conversation has been created or
+ * dispatched. This helper deliberately swallows routing failures: project
+ * organization is auxiliary and must never turn a usable ChatGPT response
+ * into a failed bridge request.
+ */
+export async function routeChatGptConversationToProject(page, conversationUrl, config, {
+    agent = null,
+    project = undefined,
+    source = 'completion'
+} = {}) {
+    const conversationMatch = typeof conversationUrl === 'string'
+        ? conversationUrl.match(CHATGPT_CONVERSATION_ID_RE)
+        : null;
+    if (!conversationMatch) {
+        return { success: true, moved: false, skipped: true, reason: 'conversation_url_unavailable' };
+    }
+
+    const resolved = resolveChatGptProjectTarget(config, { agent, project });
+    const meta = { conversationId: conversationMatch[1], agent: resolved.agent, source };
+    if (resolved.invalidProjectHint) {
+        warnProjectRoutingOnce(
+            `invalid-project-hint:${resolved.invalidProjectHint}`,
+            `Ignoring invalid ChatGPT project hint "${resolved.invalidProjectHint}"; using the configured fallback`,
+            meta
+        );
+    }
+    if (resolved.invalidAgentMapping) {
+        warnProjectRoutingOnce(
+            `invalid-agent-mapping:${resolved.agent || 'unknown'}:${resolved.invalidAgentMapping}`,
+            `ChatGPT project mapping for agent ${resolved.agent || 'unknown'} is invalid; using the configured default`,
+            meta
+        );
+    }
+    if (!resolved.explicitNone && !resolved.projectId) {
+        return { success: true, moved: false, skipped: true, reason: 'no_project_configured', ...meta };
+    }
+
+    try {
+        let availableProjects = null;
+        if (!resolved.explicitNone) {
+            const catalog = await listChatGptProjects(page);
+            if (catalog.success) {
+                availableProjects = new Set(catalog.projects.map(item => item.id.toLowerCase()));
+            } else {
+                logger.warn('Project routing', `Could not validate ChatGPT project mapping: ${catalog.error}`, meta);
+            }
+        }
+
+        let targetProjectId = resolved.projectId;
+        let fallbackUsed = false;
+        if (targetProjectId && availableProjects && !availableProjects.has(targetProjectId)) {
+            warnProjectRoutingOnce(
+                `missing-project:${targetProjectId}`,
+                `Configured ChatGPT project ${targetProjectId} does not exist; falling back to the default project`,
+                meta
+            );
+            if (resolved.defaultProjectId && resolved.defaultProjectId !== targetProjectId &&
+                availableProjects.has(resolved.defaultProjectId)) {
+                targetProjectId = resolved.defaultProjectId;
+                fallbackUsed = true;
+            } else {
+                if (resolved.defaultProjectId && resolved.defaultProjectId !== targetProjectId) {
+                    warnProjectRoutingOnce(
+                        `missing-project:${resolved.defaultProjectId}`,
+                        `Configured default ChatGPT project ${resolved.defaultProjectId} does not exist; leaving the conversation unmapped`,
+                        meta
+                    );
+                }
+                return {
+                    success: false,
+                    moved: false,
+                    skipped: true,
+                    reason: 'configured_project_missing',
+                    projectId: null,
+                    requestedProjectId: resolved.projectId,
+                    fallbackUsed,
+                    ...meta
+                };
+            }
+        }
+
+        const move = async (projectId) => moveChatGptConversationToProject(page, conversationMatch[1], projectId);
+        let result = await move(targetProjectId);
+        if (result.success) {
+            logger.info('Project routing', `Moved ChatGPT conversation to project ${targetProjectId || 'none'}`, meta);
+            return {
+                success: true,
+                moved: true,
+                skipped: false,
+                projectId: targetProjectId,
+                requestedProjectId: resolved.projectId,
+                fallbackUsed,
+                ...meta
+            };
+        }
+
+        if (targetProjectId && resolved.defaultProjectId && targetProjectId !== resolved.defaultProjectId) {
+            if (!availableProjects || availableProjects.has(resolved.defaultProjectId)) {
+                logger.warn('Project routing', `Moving ChatGPT conversation to project ${targetProjectId} failed; trying the default project`, {
+                    ...meta,
+                    error: result.error
+                });
+                result = await move(resolved.defaultProjectId);
+                if (result.success) {
+                    logger.info('Project routing', `Moved ChatGPT conversation to default project ${resolved.defaultProjectId}`, meta);
+                    return {
+                        success: true,
+                        moved: true,
+                        skipped: false,
+                        projectId: resolved.defaultProjectId,
+                        requestedProjectId: resolved.projectId,
+                        fallbackUsed: true,
+                        ...meta
+                    };
+                }
+            }
+        }
+
+        logger.warn('Project routing', `Could not move ChatGPT conversation to project ${targetProjectId || 'none'}; continuing without project routing`, {
+            ...meta,
+            error: result.error
+        });
+        return {
+            success: false,
+            moved: false,
+            skipped: false,
+            projectId: null,
+            requestedProjectId: resolved.projectId,
+            fallbackUsed,
+            error: result.error,
+            ...meta
+        };
+    } catch (error) {
+        logger.warn('Project routing', `ChatGPT project routing failed; continuing without project routing: ${error.message}`, meta);
+        return {
+            success: false,
+            moved: false,
+            skipped: false,
+            projectId: null,
+            requestedProjectId: resolved.projectId,
+            error: error.message,
+            ...meta
+        };
+    }
 }
 
 /**

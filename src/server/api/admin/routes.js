@@ -62,6 +62,7 @@ import {
     renameChatGptProject,
     deleteChatGptProject,
     moveChatGptConversationToProject,
+    routeChatGptConversationToProject,
     chatgptCloudRequest
 } from '../../../backend/adapter/chatgpt_text.js';
 import { getBackend } from '../../../backend/index.js';
@@ -80,6 +81,35 @@ async function readBody(req) {
     }
     const body = Buffer.concat(chunks).toString();
     return body ? JSON.parse(body) : {};
+}
+
+function firstText(...values) {
+    for (const value of values) {
+        if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return null;
+}
+
+function requestAgentHint(body, req) {
+    return firstText(
+        body.agent,
+        body.agent_name,
+        body.metadata?.agent,
+        body.metadata?.agent_name,
+        req.headers?.['x-aiva-agent'],
+        req.headers?.['x-chatgpt-agent']
+    );
+}
+
+function requestProjectHint(body, req) {
+    return firstText(
+        body.project,
+        body.project_id,
+        body.metadata?.project,
+        body.metadata?.project_id,
+        req.headers?.['x-aiva-project'],
+        req.headers?.['x-chatgpt-project']
+    );
 }
 
 function getConversationKey(record) {
@@ -1345,6 +1375,12 @@ export function createAdminRouter(context) {
                     return;
                 }
 
+                const projectRouting = await routeChatGptConversationToProject(page, conversationUrl, config, {
+                    agent: requestAgentHint(body, req),
+                    project: requestProjectHint(body, req),
+                    source: 'admin-dispatch'
+                });
+
                 logger.info('Admin', `Dispatched prompt to exact ChatGPT conversation (${mode}): ${convId}`);
                 sendJson(res, 200, {
                     success: true,
@@ -1356,6 +1392,7 @@ export function createAdminRouter(context) {
                     stream_status_after: sent.stream_status_after || null,
                     exact_user_turn_confirmed: true,
                     response_started: sent.response_started,
+                    project_routing: projectRouting,
                 });
                 return;
                 } finally {
@@ -1810,6 +1847,14 @@ export function createAdminRouter(context) {
             // conversation inside it; this route is destructive beyond the
             // project itself and callers must surface that.
             if (method === 'DELETE' && pathname === '/chatgpt/projects') {
+                // DISABLED 2026-08-30 by Mike's standing order: "There's no need
+                // to ever delete a project." A project deletion cascades to its
+                // contained conversations, and a false-empty membership read from
+                // upstream cost real threads today. Archive instead.
+                sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'Project deletion is disabled by standing order (2026-08-30). Archive conversations or rename the project instead.' });
+                return;
+            }
+            if (false && method === 'DELETE' && pathname === '/chatgpt/projects') {
                 const body = await readBody(req);
                 const projectId = parseExactProjectRef(
                     typeof (body.project || body.project_id) === 'string' ? (body.project || body.project_id).trim() : ''
