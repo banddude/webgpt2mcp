@@ -1482,6 +1482,11 @@ export function createAdminRouter(context) {
                         const items = (data.items || []).map(c => ({
                             id: c.id,
                             title: c.title,
+                            // Expose project membership so sorters can skip
+                            // already-sorted chats (2026-08-30). Upstream field
+                            // is gizmo_id; null means unfiled.
+                            project_id: c.gizmo_id || null,
+                            is_archived: c.is_archived === true,
                             create_time: c.create_time,
                             update_time: c.update_time,
                             model: c.model || null
@@ -1539,10 +1544,15 @@ export function createAdminRouter(context) {
                 return;
             }
 
-            // GET /admin/chatgpt/conversation/:id - 获取指定会话的完整历史
-            const convDetailMatch = pathname.match(/^\/chatgpt\/conversation\/([0-9a-f-]+)$/);
-            if (method === 'GET' && convDetailMatch) {
-                const convId = convDetailMatch[1];
+            // GET /admin/chatgpt/search - Search ChatGPT conversation content
+            if (method === 'GET' && pathname === '/chatgpt/search') {
+                const url = new URL(req.url, `http://${req.headers.host}`);
+                const query = (url.searchParams.get('q') || url.searchParams.get('query') || '').trim();
+                const cursor = (url.searchParams.get('c') || url.searchParams.get('cursor') || '').trim();
+                if (!query) {
+                    sendJson(res, 400, { error: 'q is required' });
+                    return;
+                }
 
                 let poolContext = queueManager?.getPoolContext?.();
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
@@ -1552,7 +1562,75 @@ export function createAdminRouter(context) {
                     return;
                 }
 
-                const result = await page.evaluate(async (id) => {
+                const result = await page.evaluate(async ({ query: q, cursor: c }) => {
+                    try {
+                        const sessionRes = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
+                        if (!sessionRes.ok) return { error: `session failed: ${sessionRes.status}` };
+                        const session = await sessionRes.json();
+                        const accessToken = session?.accessToken;
+                        if (!accessToken) return { error: `no access token, session keys: ${Object.keys(session || {}).join(',')}` };
+                        const headers = { 'Authorization': `Bearer ${accessToken}` };
+
+                        const searchUrl = new URL('https://chatgpt.com/backend-api/conversations/search');
+                        searchUrl.searchParams.set('query', q);
+                        if (c) searchUrl.searchParams.set('cursor', c);
+
+                        let res = null;
+                        for (let attempt = 0; attempt < 4; attempt += 1) {
+                            res = await fetch(searchUrl.toString(), { headers });
+                            if (res.ok || res.status !== 429) break;
+                            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+                        }
+                        if (!res?.ok) return { error: `api failed: ${res?.status || 'unknown'}` };
+                        return await res.json();
+                    } catch (e) { return { error: e.message }; }
+                }, { query, cursor });
+
+                if (result.error) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: result.error });
+                } else {
+                    sendJson(res, 200, result);
+                }
+                return;
+            }
+
+            // GET /admin/chatgpt/conversation?conversation=<exact id> or
+            // GET /admin/chatgpt/conversation/:id - 获取指定会话的完整历史
+            const convDetailMatch = pathname.match(/^\/chatgpt\/conversation\/([0-9a-f-]+)$/);
+            let convDetailId = convDetailMatch?.[1] || null;
+            if (method === 'GET' && pathname === '/chatgpt/conversation') {
+                const url = new URL(req.url, `http://${req.headers.host}`);
+                const requestedId = (url.searchParams.get('conversation') || '').trim();
+                if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestedId)) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation must be an exact ChatGPT conversation ID' });
+                    return;
+                }
+                convDetailId = requestedId.toLowerCase();
+            }
+            if (method === 'GET' && convDetailId) {
+                const convId = convDetailId;
+
+                let poolContext = queueManager?.getPoolContext?.();
+                if (!poolContext) poolContext = await queueManager?.initializePool?.();
+                const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                if (!page) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                    return;
+                }
+
+                let result = null;
+                for (let attempt = 0; attempt < 6; attempt += 1) {
+                    if (attempt > 0) {
+                        poolContext = queueManager?.getPoolContext?.();
+                        if (!poolContext) poolContext = await queueManager?.initializePool?.();
+                    }
+                    const attemptPage = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                    if (!attemptPage) {
+                        result = { error: 'ChatGPT browser page unavailable' };
+                        break;
+                    }
+                    try {
+                        result = await attemptPage.evaluate(async (id) => {
                     try {
                         const sessionRes = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
                         if (!sessionRes.ok) return { error: `session failed: ${sessionRes.status}` };
@@ -1604,7 +1682,7 @@ export function createAdminRouter(context) {
                         } catch { }
 
                         return {
-                            id: data.id,
+                            id: data.id || id,
                             title: data.title,
                             create_time: data.create_time || null,
                             update_time: data.update_time || null,
@@ -1614,7 +1692,18 @@ export function createAdminRouter(context) {
                             messages,
                         };
                     } catch (e) { return { error: e.message }; }
-                }, convId);
+                        }, convId);
+                    } catch (e) {
+                        result = { error: e.message };
+                    }
+                    const retryable = result?.error && (
+                        result.error.includes('api failed: 429') ||
+                        result.error.includes('Execution context was destroyed') ||
+                        result.error.includes('Target page, context or browser has been closed')
+                    );
+                    if (!retryable || attempt === 5) break;
+                    await new Promise(resolve => setTimeout(resolve, 2000 * (attempt + 1)));
+                }
 
                 if (result.error) {
                     sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: result.error });
