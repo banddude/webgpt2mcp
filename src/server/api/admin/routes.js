@@ -1805,7 +1805,10 @@ export function createAdminRouter(context) {
                 return;
             }
 
-            // DELETE /admin/chatgpt/projects - delete one exact project
+            // DELETE /admin/chatgpt/projects - delete one exact project.
+            // Verified live: deleting a project also deletes every
+            // conversation inside it; this route is destructive beyond the
+            // project itself and callers must surface that.
             if (method === 'DELETE' && pathname === '/chatgpt/projects') {
                 const body = await readBody(req);
                 const projectId = parseExactProjectRef(

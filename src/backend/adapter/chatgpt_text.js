@@ -1652,6 +1652,9 @@ export async function renameChatGptProject(page, projectId, name) {
  * Delete one exact ChatGPT project. Verified live: the projects path itself
  * has no DELETE (405); deletion goes through the gizmo path
  * DELETE /backend-api/gizmos/<id>, which answers {"deleted": true}.
+ * DESTRUCTIVE BEYOND THE PROJECT: a conversation moved into a test project
+ * returned 404 after the project was deleted, so every conversation inside
+ * the project is deleted with it. Callers must surface this.
  */
 export async function deleteChatGptProject(page, projectId) {
     const result = await chatgptCloudRequest(page, {

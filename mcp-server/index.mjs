@@ -512,7 +512,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: 'project_delete',
-            description: 'Delete one exact ChatGPT project. Requires an exact project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL and explicit confirm=true. Only use after the user explicitly approved deletion. The removal is read back from the projects list to confirm.',
+            description: 'Delete one exact ChatGPT project. DESTRUCTIVE BEYOND THE PROJECT: every conversation inside the project is deleted with it (verified live - a conversation moved into a test project returned 404 after the project was deleted). Requires an exact project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL and explicit confirm=true. Only use after the user explicitly approved deleting the project AND its conversations. The removal is read back from the projects list to confirm.',
             inputSchema: {
                 type: 'object',
                 properties: {
@@ -867,7 +867,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (result?.success !== true) throw new Error(result?.error || 'ChatGPT project deletion failed.');
 
             return {
-                content: [{ type: 'text', text: `Deleted ChatGPT project ${projectId}.${result.verified === false ? ' Warning: the project may still appear in the projects list; re-check with projects_list.' : ''}` }],
+                content: [{ type: 'text', text: `Deleted ChatGPT project ${projectId}. All conversations that were inside it have been deleted with it.${result.verified === false ? ' Warning: the project may still appear in the projects list; re-check with projects_list.' : ''}` }],
                 _meta: { project_id: projectId, verified: result.verified !== false },
             };
         }
