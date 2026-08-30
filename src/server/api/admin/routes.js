@@ -1682,7 +1682,8 @@ export function createAdminRouter(context) {
             // GET /admin/chatgpt/projects - list ChatGPT projects
             if (method === 'GET' && pathname === '/chatgpt/projects') {
                 const url = new URL(req.url, `http://${req.headers.host}`);
-                const limit = Math.max(1, Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 100));
+                // Verified live: the upstream gizmo endpoints reject limit > 50.
+                const limit = Math.max(1, Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 50));
                 const page = await getManagementPage();
                 if (!page) {
                     sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
@@ -1712,7 +1713,8 @@ export function createAdminRouter(context) {
                     return;
                 }
                 const url = new URL(req.url, `http://${req.headers.host}`);
-                const limit = Math.max(1, Math.min(parseInt(url.searchParams.get('limit') || '28', 10) || 28, 100));
+                // Verified live: the upstream gizmo endpoints reject limit > 50.
+                const limit = Math.max(1, Math.min(parseInt(url.searchParams.get('limit') || '28', 10) || 28, 50));
                 const page = await getManagementPage();
                 if (!page) {
                     sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });

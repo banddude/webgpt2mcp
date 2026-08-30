@@ -458,7 +458,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             inputSchema: {
                 type: 'object',
                 properties: {
-                    limit: { type: 'number', minimum: 1, maximum: 100, default: 50, description: 'Maximum number of projects to return.' },
+                    limit: { type: 'number', minimum: 1, maximum: 50, default: 50, description: 'Maximum number of projects to return (ChatGPT caps this at 50).' },
                 },
             },
         },
@@ -469,7 +469,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 type: 'object',
                 properties: {
                     project: { type: 'string', description: 'Exact ChatGPT project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL.' },
-                    limit: { type: 'number', minimum: 1, maximum: 100, default: 28, description: 'Maximum number of conversations to return.' },
+                    limit: { type: 'number', minimum: 1, maximum: 50, default: 28, description: 'Maximum number of conversations to return (ChatGPT caps this at 50).' },
                 },
                 required: ['project'],
             },
@@ -714,7 +714,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         if (name === 'projects_list') {
-            const limit = Math.max(1, Math.min(Number(args.limit || 50), 100));
+            const limit = Math.max(1, Math.min(Number(args.limit || 50), 50));
             const data = await adminJson(`/admin/chatgpt/projects?limit=${limit}`);
             const projects = Array.isArray(data.projects) ? data.projects : [];
             if (!projects.length) {
@@ -731,7 +731,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (name === 'project_conversations') {
             const projectId = parseProjectRef(args.project);
             if (!projectId) return projectRefError();
-            const limit = Math.max(1, Math.min(Number(args.limit || 28), 100));
+            const limit = Math.max(1, Math.min(Number(args.limit || 28), 50));
             const data = await adminJson(`/admin/chatgpt/projects/${encodeURIComponent(projectId)}/conversations?limit=${limit}`);
             const conversations = Array.isArray(data.conversations) ? data.conversations : [];
             if (!conversations.length) {

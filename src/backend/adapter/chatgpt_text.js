@@ -1500,8 +1500,9 @@ export async function moveChatGptConversationToProject(page, conversationId, pro
  */
 export async function listChatGptProjects(page, { limit = 50 } = {}) {
     const result = await chatgptCloudRequest(page, {
+        // Verified live: the sidebar endpoint rejects limit > 50 with HTTP 422.
         path: '/gizmos/snorlax/sidebar',
-        query: { owned_only: 'true', conversations_per_gizmo: '0', limit: String(Math.min(limit, 100)) }
+        query: { owned_only: 'true', conversations_per_gizmo: '0', limit: String(Math.min(limit, 50)) }
     });
     if (!result?.ok) {
         return { success: false, error: cloudRequestError(result) };
@@ -1526,8 +1527,9 @@ export async function listChatGptProjects(page, { limit = 50 } = {}) {
  */
 export async function listChatGptProjectConversations(page, projectId, { limit = 28 } = {}) {
     const result = await chatgptCloudRequest(page, {
+        // Verified live: this endpoint rejects limit > 50 with HTTP 422.
         path: `/gizmos/${projectId}/conversations`,
-        query: { cursor: '0', limit: String(Math.min(limit, 100)) }
+        query: { cursor: '0', limit: String(Math.min(limit, 50)) }
     });
     if (!result?.ok) {
         return { success: false, projectId, error: cloudRequestError(result) };
