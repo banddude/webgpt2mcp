@@ -58,6 +58,9 @@ import {
     setChatGptConversationArchived,
     listChatGptProjects,
     listChatGptProjectConversations,
+    createChatGptProject,
+    renameChatGptProject,
+    deleteChatGptProject,
     moveChatGptConversationToProject,
     chatgptCloudRequest
 } from '../../../backend/adapter/chatgpt_text.js';
@@ -1732,6 +1735,101 @@ export function createAdminRouter(context) {
                         ...conversation,
                         url: `https://chatgpt.com/c/${conversation.id}`
                     }))
+                });
+                return;
+            }
+
+            // POST /admin/chatgpt/projects - create a new ChatGPT project by name
+            if (method === 'POST' && pathname === '/chatgpt/projects') {
+                const body = await readBody(req);
+                const name = typeof body.name === 'string' ? body.name.trim() : '';
+                const instructions = typeof body.instructions === 'string' ? body.instructions : '';
+                if (!name) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'name is required' });
+                    return;
+                }
+                const page = await getManagementPage();
+                if (!page) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                    return;
+                }
+                const result = await createChatGptProject(page, name, { instructions });
+                if (!result.success) {
+                    sendJson(res, 502, { success: false, error: result.error });
+                    return;
+                }
+                logger.info('Admin', `Created ChatGPT project "${name}": ${result.project.id}`);
+                sendJson(res, 200, {
+                    success: true,
+                    project: {
+                        ...result.project,
+                        url: `https://chatgpt.com/g/${result.project.id}`
+                    },
+                    verified: result.verified !== false
+                });
+                return;
+            }
+
+            // POST /admin/chatgpt/projects/rename - rename one exact project.
+            // The patch must resend the project's emoji/theme/instructions, so
+            // they are read from the sidebar and preserved by the adapter.
+            if (method === 'POST' && pathname === '/chatgpt/projects/rename') {
+                const body = await readBody(req);
+                const projectId = parseExactProjectRef(typeof body.project === 'string' ? body.project.trim() : '');
+                const name = typeof body.name === 'string' ? body.name.trim() : '';
+                if (!projectId) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'project must be an exact ChatGPT project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL' });
+                    return;
+                }
+                if (!name) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'name is required' });
+                    return;
+                }
+                const page = await getManagementPage();
+                if (!page) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                    return;
+                }
+                const result = await renameChatGptProject(page, projectId, name);
+                if (!result.success) {
+                    sendJson(res, 502, { success: false, project_id: projectId, error: result.error });
+                    return;
+                }
+                logger.info('Admin', `Renamed exact ChatGPT project: ${projectId} -> "${name}"`);
+                sendJson(res, 200, {
+                    success: true,
+                    project_id: projectId,
+                    project: result.project ? { ...result.project, url: `https://chatgpt.com/g/${projectId}` } : null,
+                    verified: result.verified !== false
+                });
+                return;
+            }
+
+            // DELETE /admin/chatgpt/projects - delete one exact project
+            if (method === 'DELETE' && pathname === '/chatgpt/projects') {
+                const body = await readBody(req);
+                const projectId = parseExactProjectRef(
+                    typeof (body.project || body.project_id) === 'string' ? (body.project || body.project_id).trim() : ''
+                );
+                if (!projectId) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'project must be an exact ChatGPT project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL' });
+                    return;
+                }
+                const page = await getManagementPage();
+                if (!page) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                    return;
+                }
+                const result = await deleteChatGptProject(page, projectId);
+                if (!result.success) {
+                    sendJson(res, 502, { success: false, project_id: projectId, error: result.error });
+                    return;
+                }
+                logger.info('Admin', `Deleted exact ChatGPT project: ${projectId}`);
+                sendJson(res, 200, {
+                    success: true,
+                    project_id: projectId,
+                    verified: result.verified !== false
                 });
                 return;
             }

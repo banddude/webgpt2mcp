@@ -486,6 +486,42 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 required: ['conversation', 'project'],
             },
         },
+        {
+            name: 'project_create',
+            description: 'Create a new ChatGPT project with the given name. Optional project instructions (the project-level custom instructions ChatGPT applies to conversations inside it) default to empty. Returns the new exact project ID and URL, confirmed against the projects list.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    name: { type: 'string', description: 'Name for the new project.' },
+                    instructions: { type: 'string', description: 'Optional project instructions applied to conversations inside the project. Defaults to empty.' },
+                },
+                required: ['name'],
+            },
+        },
+        {
+            name: 'project_rename',
+            description: 'Rename one exact ChatGPT project. Requires an exact project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL; never matches by title. The project\'s emoji, theme, and instructions are preserved. The new name is read back to confirm.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    project: { type: 'string', description: 'Exact ChatGPT project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL.' },
+                    name: { type: 'string', description: 'New name for the project.' },
+                },
+                required: ['project', 'name'],
+            },
+        },
+        {
+            name: 'project_delete',
+            description: 'Delete one exact ChatGPT project. Requires an exact project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL and explicit confirm=true. Only use after the user explicitly approved deletion. The removal is read back from the projects list to confirm.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    project: { type: 'string', description: 'Exact ChatGPT project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL.' },
+                    confirm: { type: 'boolean', description: 'Must be true to confirm the destructive deletion.' },
+                },
+                required: ['project', 'confirm'],
+            },
+        },
     ],
 }));
 
@@ -777,6 +813,62 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     project_url: result.moved_to || null,
                     verified: result.verified !== false,
                 },
+            };
+        }
+
+        if (name === 'project_create') {
+            const projectName = typeof args.name === 'string' ? args.name.trim() : '';
+            if (!projectName) return { content: [{ type: 'text', text: 'Error: name is required.' }], isError: true };
+            const instructions = typeof args.instructions === 'string' ? args.instructions : '';
+
+            const result = await adminJson('/admin/chatgpt/projects', {
+                method: 'POST',
+                body: JSON.stringify({ name: projectName, instructions }),
+            });
+            if (result?.success !== true) throw new Error(result?.error || 'ChatGPT project creation failed.');
+
+            const project = result.project || {};
+            return {
+                content: [{ type: 'text', text: `Created ChatGPT project "${project.title || projectName}".${result.verified === false ? ' Warning: the new project could not be verified against the projects list.' : ''}\n\n[project: ${project.url || `https://chatgpt.com/g/${project.id}`}]` }],
+                _meta: { project_id: project.id || null, project_url: project.url || null, title: project.title || null, verified: result.verified !== false },
+            };
+        }
+
+        if (name === 'project_rename') {
+            const projectId = parseProjectRef(args.project);
+            if (!projectId) return projectRefError();
+            const projectName = typeof args.name === 'string' ? args.name.trim() : '';
+            if (!projectName) return { content: [{ type: 'text', text: 'Error: name is required.' }], isError: true };
+
+            const result = await adminJson('/admin/chatgpt/projects/rename', {
+                method: 'POST',
+                body: JSON.stringify({ project: projectId, name: projectName }),
+            });
+            if (result?.success !== true) throw new Error(result?.error || 'ChatGPT project rename failed.');
+
+            const project = result.project || {};
+            return {
+                content: [{ type: 'text', text: `Renamed ChatGPT project to "${project.title || projectName}".${result.verified === false ? ' Warning: the new name could not be verified against the projects list.' : ''}\n\n[project: ${project.url || `https://chatgpt.com/g/${projectId}`}]` }],
+                _meta: { project_id: projectId, project_url: project.url || null, title: project.title || null, verified: result.verified !== false },
+            };
+        }
+
+        if (name === 'project_delete') {
+            const projectId = parseProjectRef(args.project);
+            if (!projectId) return projectRefError();
+            if (args.confirm !== true) {
+                return { content: [{ type: 'text', text: 'Error: project_delete requires confirm=true after explicit user approval.' }], isError: true };
+            }
+
+            const result = await adminJson('/admin/chatgpt/projects', {
+                method: 'DELETE',
+                body: JSON.stringify({ project: projectId }),
+            });
+            if (result?.success !== true) throw new Error(result?.error || 'ChatGPT project deletion failed.');
+
+            return {
+                content: [{ type: 'text', text: `Deleted ChatGPT project ${projectId}.${result.verified === false ? ' Warning: the project may still appear in the projects list; re-check with projects_list.' : ''}` }],
+                _meta: { project_id: projectId, verified: result.verified !== false },
             };
         }
 

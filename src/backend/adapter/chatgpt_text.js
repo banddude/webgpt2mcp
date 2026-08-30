@@ -1547,6 +1547,131 @@ export async function listChatGptProjectConversations(page, projectId, { limit =
     return { success: true, conversations };
 }
 
+// Map one upstream snorlax gizmo to the shared project summary shape used by
+// every project route and tool.
+function gizmoToProject(gizmo) {
+    return {
+        id: gizmo.id,
+        title: gizmo.display?.name || gizmo.display?.description || 'Untitled',
+        instructions: gizmo.instructions ?? '',
+        emoji: gizmo.display?.emoji ?? null,
+        theme: gizmo.display?.theme ?? null,
+        create_time: gizmo.created_at || null,
+        update_time: gizmo.updated_at || null,
+        last_interacted_at: gizmo.last_interacted_at || null
+    };
+}
+
+// Read one project's current state from the sidebar list. The projects API has
+// no GET on the detail path (verified live: 405), so the sidebar is the only
+// read surface for a project's emoji/theme/instructions.
+async function readProjectFromSidebar(page, projectId) {
+    const result = await chatgptCloudRequest(page, {
+        // Verified live: the sidebar endpoint rejects limit > 50 with HTTP 422.
+        path: '/gizmos/snorlax/sidebar',
+        query: { owned_only: 'true', conversations_per_gizmo: '0', limit: '50' }
+    });
+    if (!result?.ok) {
+        return { success: false, error: cloudRequestError(result) };
+    }
+    const gizmo = (result.data?.items || [])
+        .map(item => item?.gizmo?.gizmo)
+        .find(gizmo => gizmo?.id === projectId);
+    if (!gizmo) return { success: true, project: null };
+    return { success: true, project: gizmoToProject(gizmo) };
+}
+
+/**
+ * Create a new ChatGPT project. Verified live: POST /backend-api/projects with
+ * exactly {"name", "instructions"}; both fields are required (an empty
+ * instructions string is accepted) and extra body fields are rejected with
+ * HTTP 422. The response carries the new gizmo under resource.gizmo.
+ */
+export async function createChatGptProject(page, name, { instructions = '' } = {}) {
+    const wanted = String(name || '').slice(0, 200);
+    const result = await chatgptCloudRequest(page, {
+        method: 'POST',
+        path: '/projects',
+        body: { name: wanted, instructions: String(instructions || '') }
+    });
+    if (!result?.ok) {
+        return { success: false, error: cloudRequestError(result) };
+    }
+    const gizmo = result.data?.resource?.gizmo || result.data?.gizmo || null;
+    if (!gizmo?.id) {
+        return { success: false, error: 'project creation response contained no project id' };
+    }
+    const readBack = await readProjectFromSidebar(page, gizmo.id);
+    return {
+        success: true,
+        project: gizmoToProject(gizmo),
+        verified: readBack.success && readBack.project !== null
+    };
+}
+
+/**
+ * Rename one exact ChatGPT project, preserving its emoji, theme, and
+ * instructions. Verified live: PATCH /backend-api/projects/<id> requires the
+ * full {"name", "emoji", "theme", "instructions"} set — missing keys are 422,
+ * extra keys are rejected, and theme must be a #rgb/#rrggbb string or null —
+ * and there is no GET on the project detail path, so the current values are
+ * read from the sidebar list first and sent back unchanged.
+ */
+export async function renameChatGptProject(page, projectId, name) {
+    const wanted = String(name || '').slice(0, 200);
+    const current = await readProjectFromSidebar(page, projectId);
+    if (!current.success) {
+        return { success: false, projectId, error: current.error };
+    }
+    if (!current.project) {
+        return { success: false, projectId, error: 'project not found in the ChatGPT sidebar list' };
+    }
+    const result = await chatgptCloudRequest(page, {
+        method: 'PATCH',
+        path: `/projects/${projectId}`,
+        body: {
+            name: wanted,
+            emoji: current.project.emoji,
+            theme: current.project.theme,
+            instructions: current.project.instructions
+        }
+    });
+    if (!result?.ok) {
+        return { success: false, projectId, error: cloudRequestError(result) };
+    }
+    const readBack = await readProjectFromSidebar(page, projectId);
+    return {
+        success: true,
+        projectId,
+        project: readBack.project,
+        verified: readBack.success && readBack.project !== null && readBack.project.title === wanted
+    };
+}
+
+/**
+ * Delete one exact ChatGPT project. Verified live: the projects path itself
+ * has no DELETE (405); deletion goes through the gizmo path
+ * DELETE /backend-api/gizmos/<id>, which answers {"deleted": true}.
+ */
+export async function deleteChatGptProject(page, projectId) {
+    const result = await chatgptCloudRequest(page, {
+        method: 'DELETE',
+        path: `/gizmos/${projectId}`
+    });
+    if (!result?.ok) {
+        return { success: false, projectId, error: cloudRequestError(result) };
+    }
+    if (result.data?.deleted !== true) {
+        return { success: false, projectId, error: 'deletion was not confirmed by the upstream response' };
+    }
+    const readBack = await readProjectFromSidebar(page, projectId);
+    return {
+        success: true,
+        projectId,
+        verified: readBack.success && readBack.project === null
+    };
+}
+
 /**
  * Delete one exact conversation from ChatGPT cloud storage.
  * DELETE /backend-api/conversation/<id>
