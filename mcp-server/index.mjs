@@ -115,6 +115,40 @@ async function dispatchExactConversation({ conversation_url, prompt, agent, proj
     }
 }
 
+async function dispatchNewConversation({ prompt, model = 'gpt-instant', agent, project, spawner, task, timeout = 120000 }) {
+    if (!prompt) throw new Error('prompt is required');
+    const body = { prompt, model };
+    if (typeof agent === 'string' && agent.trim()) body.agent = agent.trim();
+    if (typeof project === 'string' && project.trim()) body.project = project.trim();
+    if (typeof spawner === 'string' && spawner.trim()) body.spawner = spawner.trim();
+    if (typeof task === 'string' && task.trim()) body.task = task.trim();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+        const response = await fetch(`${API_URL}/admin/chatgpt/dispatch`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${API_KEY}`,
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.success || !data?.submitted || !data?.detached) {
+            const rawReason = data?.error || `HTTP ${response.status}`;
+            const reason = typeof rawReason === 'string' ? rawReason : (rawReason?.message || JSON.stringify(rawReason));
+            const error = new Error(reason);
+            error.status = response.status;
+            error.data = data;
+            throw error;
+        }
+        return data;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function callChatGPT({ model = 'gpt-instant', messages, conversation_url, agent, project, timeout = 300000 }) {
     const body = { model, messages };
     if (conversation_url) body.conversation_url = conversation_url;
@@ -385,6 +419,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     project: { type: 'string', description: 'Optional exact project ID or project URL; use none to leave the conversation unmapped.' },
                 },
                 required: ['conversation', 'message'],
+            },
+        },
+        {
+            name: 'dispatch',
+            description: 'Create a new ChatGPT conversation, submit its first prompt, and return as soon as the user turn is confirmed. ChatGPT continues server-side after the browser handoff; use conversation_read with the returned exact conversation ID or URL to check completion. This tool does not hold a completion stream or browser lane.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    prompt: { type: 'string', description: 'First prompt for the new ChatGPT worker conversation.' },
+                    model: {
+                        type: 'string',
+                        enum: ['gpt-instant', 'gpt-thinking', 'gpt-pro'],
+                        default: 'gpt-instant',
+                        description: 'ChatGPT model to use for the dispatched worker.',
+                    },
+                    agent: { type: 'string', description: 'Optional project-routing agent key, such as dev or aiva.' },
+                    project: { type: 'string', description: 'Optional exact project ID or project URL; use none to leave the conversation unmapped.' },
+                    spawner: { type: 'string', description: 'Optional worker-registry spawner attribution.' },
+                    task: { type: 'string', description: 'Optional worker-registry task description.' },
+                },
+                required: ['prompt'],
             },
         },
         {
@@ -667,9 +722,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 _meta: {
                     conversation_id: ref.id,
                     conversation_url: ref.url,
+                    detached: dispatched.detached !== false,
+                    completion_polling: dispatched.completion_polling !== false,
                     active_before: !!dispatched.active_before,
                     exact_user_turn_confirmed: !!dispatched.exact_user_turn_confirmed,
                     response_started: dispatched.response_started ?? null,
+                },
+            };
+        }
+
+        if (name === 'dispatch') {
+            const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+            if (!prompt) return { content: [{ type: 'text', text: 'Error: prompt is required.' }], isError: true };
+            const allowedModels = new Set(['gpt-instant', 'gpt-thinking', 'gpt-pro']);
+            const model = allowedModels.has(args.model) ? args.model : 'gpt-instant';
+            const dispatched = await dispatchNewConversation({
+                prompt,
+                model,
+                agent: typeof args.agent === 'string' ? args.agent.trim() : undefined,
+                project: typeof args.project === 'string' ? args.project.trim() : undefined,
+                spawner: typeof args.spawner === 'string' ? args.spawner.trim() : undefined,
+                task: typeof args.task === 'string' ? args.task.trim() : undefined,
+            });
+            const conversationUrl = dispatched.conversation_url || '';
+            if (conversationUrl) {
+                await recordSession({
+                    conversation_url: conversationUrl,
+                    model,
+                    prompt,
+                    response_content: '',
+                    topic: '',
+                });
+            }
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Submitted the ChatGPT worker prompt. ChatGPT continues server-side; use conversation_read to check it.\n\n[conversation: ${conversationUrl}]`,
+                }],
+                _meta: {
+                    conversation_id: dispatched.conversation_id,
+                    conversation_url: conversationUrl,
+                    detached: true,
+                    completion_polling: true,
+                    stream_status: dispatched.stream_status_after || null,
                 },
             };
         }

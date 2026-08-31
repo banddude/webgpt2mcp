@@ -134,6 +134,48 @@ class ChatGptCliTests(unittest.TestCase):
         self.assertEqual(args.model, "gpt-thinking")
         self.assertEqual(args.message, ["Reply", "DONE"])
 
+    def test_dispatch_submits_to_admin_handoff_without_streaming_the_answer(self):
+        seen = {}
+
+        class FakeClient:
+            def request(self, method, path, *, query=None, body=None):
+                seen.update(method=method, path=path, body=body)
+                return {
+                    "success": True,
+                    "submitted": True,
+                    "detached": True,
+                    "conversation_url": "https://chatgpt.com/c/12345678-1234-1234-1234-1234567890ab",
+                }
+
+            def request_stream(self, *args, **kwargs):
+                raise AssertionError("dispatch must not consume a completion stream")
+
+        args = cli._parse_args(
+            [
+                "--json",
+                "dispatch",
+                "--spawner",
+                "aiva",
+                "--task",
+                "detach smoke",
+                "--model",
+                "gpt-thinking",
+                "Reply",
+                "later",
+            ]
+        )
+        result = cli._cmd_dispatch(FakeClient(), args)
+
+        self.assertEqual(seen["method"], "POST")
+        self.assertEqual(seen["path"], "/admin/chatgpt/dispatch")
+        self.assertEqual(seen["body"], {
+            "model": "gpt-thinking",
+            "prompt": "Reply later",
+            "spawner": "aiva",
+            "task": "detach smoke",
+        })
+        self.assertTrue(result["detached"])
+
     def test_bare_workers_lists_open_and_all_shows_closed(self):
         self.assertIsNone(cli._parse_args(["workers"]).workers_command)
         self.assertEqual(cli._parse_args(["workers", "all"]).workers_command, "all")

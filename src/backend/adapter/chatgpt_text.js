@@ -405,6 +405,11 @@ async function selectModel(page, codeName, meta = {}) {
     }
 }
 
+// Admin submit-and-detach dispatch uses the same selector implementation as
+// the normal adapter, but deliberately does not call the completion-aware
+// generate() path.
+export { selectModel as selectChatGptModel };
+
 /**
  * Stream no-progress watchdog.
  *

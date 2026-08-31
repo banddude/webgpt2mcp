@@ -460,6 +460,7 @@ def _worker_states(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "spawner": entry.get("spawner") or "unknown",
                 "task": entry.get("task") or "",
                 "model": entry.get("model") or "",
+                "prompt": entry.get("prompt") or "",
                 "status": entry.get("status") or "open",
                 "ts": entry.get("ts") or "",
                 "note": entry.get("note") or "",
@@ -467,7 +468,7 @@ def _worker_states(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         # Close lines only carry status/ts/note, so the original spawn
         # attribution (spawner, task, model, url) must survive them.
-        for key in ("status", "ts", "note", "spawner", "task", "model", "url"):
+        for key in ("status", "ts", "note", "spawner", "task", "model", "prompt", "url"):
             if entry.get(key):
                 state[key] = entry[key]
     return list(states.values())
@@ -665,25 +666,23 @@ def _cmd_dispatch(client: ApiClient, args: argparse.Namespace) -> Any:
     message = _message(args.message, "message")
     body: dict[str, Any] = {
         "model": args.model,
-        "messages": [{"role": "user", "content": message}],
-        "stream": True,
+        "prompt": message,
     }
     if args.spawner:
         body["spawner"] = args.spawner
     if args.task:
         body["task"] = " ".join(args.task)
-    # Streamed submits are accepted even when the bridge queue is full. The
-    # bridge registers the spawned chat as an open worker automatically.
-    data = client.request_stream("POST", "/v1/chat/completions", body=body)
+    # Dispatch confirms the exact user turn, then releases the browser lane.
+    # ChatGPT continues the response server-side and the registry poller closes
+    # the worker after a later conversation read reports completion.
+    data = client.request("POST", "/admin/chatgpt/dispatch", body=body)
     if args.json_output:
         _print_json(data)
         return data
-    content = (((data.get("choices") or [{}])[0] or {}).get("message") or {}).get("content")
-    print(content or "No response")
     conversation_url = data.get("conversation_url")
     if conversation_url:
         print(f"\nWorker chat: {conversation_url}")
-        print("Recorded as an open worker; close it with `chatgpt workers close`.")
+        print("Submitted; ChatGPT continues server-side and the worker will close after completion.")
     return data
 
 

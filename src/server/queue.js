@@ -216,6 +216,7 @@ export function createQueueManager(queueConfig, callbacks) {
                     spawner: task.spawner,
                     task: task.workerTask,
                     model: modelName || modelId,
+                    prompt,
                 });
             }
 
