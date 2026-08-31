@@ -55,6 +55,75 @@ class ChatGptCliTests(unittest.TestCase):
         self.assertEqual(args.projects_command, "create")
         self.assertEqual(args.name, ["A test project"])
 
+    def test_search_uses_server_side_search_endpoint(self):
+        seen = {}
+
+        class FakeClient:
+            def request(self, method, path, *, query=None, body=None):
+                seen["method"] = method
+                seen["path"] = path
+                seen["query"] = query
+                return {"items": [{"id": "12345678-1234-1234-1234-1234567890ab", "title": "Match"}] * 3}
+
+        args = cli._parse_args(["conversations", "search", "needle", "--limit", "2"])
+        data = cli._cmd_conversations_search(FakeClient(), args)
+        self.assertEqual(seen["path"], "/admin/chatgpt/search")
+        self.assertEqual(seen["query"], {"q": "needle"})
+        self.assertEqual(len(data["items"]), 3)
+
+    def test_status_line_is_omitted_when_items_carry_no_stream_status(self):
+        lines = cli._conversation_lines(
+            [{"id": "12345678-1234-1234-1234-1234567890ab", "title": "T"}], empty=""
+        )
+        self.assertFalse(any("Status:" in line for line in lines))
+        listed = cli._conversation_lines(
+            [
+                {
+                    "id": "12345678-1234-1234-1234-1234567890ab",
+                    "title": "T",
+                    "stream_status": None,
+                }
+            ],
+            empty="",
+        )
+        self.assertTrue(any("Status: UNKNOWN" in line for line in listed))
+
+    def test_stream_request_accumulates_sse_and_extracts_conversation_url(self):
+        import io
+
+        events = [
+            b'data: {"id":"c1","model":"gpt-instant","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}\n\n',
+            b":keepalive\n\n",
+            b'data: {"id":"c1","model":"gpt-instant","conversation_url":"https://chatgpt.com/c/abc","choices":[{"index":0,"delta":{"content":"full text"},"finish_reason":"stop"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+
+        class FakeResponse:
+            def __enter__(self):
+                return io.BytesIO(b"".join(events))
+
+            def __exit__(self, *exc_info):
+                return False
+
+        original_urlopen = cli.urlopen
+        cli.urlopen = lambda request, timeout: FakeResponse()
+        try:
+            data = cli.ApiClient.__new__(cli.ApiClient)
+            data.base_url = "http://127.0.0.1:1"
+            data.auth = "unused"
+            data.timeout = 5
+            result = data.request_stream(
+                "POST",
+                "/v1/chat/completions",
+                body={"model": "gpt-instant", "messages": [], "stream": True},
+            )
+        finally:
+            cli.urlopen = original_urlopen
+
+        self.assertEqual(result["choices"][0]["message"]["content"], "full text")
+        self.assertEqual(result["conversation_url"], "https://chatgpt.com/c/abc")
+        self.assertEqual(result["model"], "gpt-instant")
+
 
 if __name__ == "__main__":
     unittest.main()
