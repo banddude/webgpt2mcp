@@ -67,6 +67,13 @@ def _config_path() -> Path:
     return Path(configured).expanduser() if configured else _service_root() / "data" / "config.yaml"
 
 
+def _worker_registry_path() -> Path:
+    configured = os.environ.get("CHATGPT_WORKER_REGISTRY")
+    if configured:
+        return Path(configured).expanduser()
+    return _service_root() / "data" / "worker-registry.jsonl"
+
+
 def _strip_yaml_comment(value: str) -> str:
     quote_char: str | None = None
     escaped = False
@@ -416,6 +423,146 @@ def _readable_conversations(data: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _read_worker_lines(path: Path) -> list[dict[str, Any]]:
+    """Read the append-only worker journal; malformed lines are skipped."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise ChatGPTError(f"cannot read worker registry {path}: {exc}") from exc
+    entries: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict) and entry.get("conversation_id"):
+            entries.append(entry)
+    return entries
+
+
+def _worker_states(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse journal lines to one state per conversation; latest line wins."""
+    states: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        identifier = str(entry.get("conversation_id", "")).lower()
+        if not identifier:
+            continue
+        state = states.get(identifier)
+        if state is None:
+            states[identifier] = {
+                "conversation_id": identifier,
+                "url": entry.get("url") or f"https://chatgpt.com/c/{identifier}",
+                "spawner": entry.get("spawner") or "unknown",
+                "task": entry.get("task") or "",
+                "model": entry.get("model") or "",
+                "status": entry.get("status") or "open",
+                "ts": entry.get("ts") or "",
+                "note": entry.get("note") or "",
+            }
+            continue
+        # Close lines only carry status/ts/note, so the original spawn
+        # attribution (spawner, task, model, url) must survive them.
+        for key in ("status", "ts", "note", "spawner", "task", "model", "url"):
+            if entry.get(key):
+                state[key] = entry[key]
+    return list(states.values())
+
+
+def _worker_age(value: str) -> str:
+    """Humanized age of a journal timestamp, e.g. '45s', '12m', '3h', '2d'."""
+    try:
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return "unknown age"
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    seconds = max(0, int((datetime.now(timezone.utc) - moment).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def _select_workers(states: list[dict[str, Any]], *, show_closed: bool) -> list[dict[str, Any]]:
+    selected = [state for state in states if show_closed or state["status"] == "open"]
+    selected.sort(key=lambda state: state["ts"] or "", reverse=True)
+    return selected
+
+
+def _worker_lines(workers: list[dict[str, Any]]) -> list[str]:
+    if not workers:
+        return ["No workers to show."]
+    lines: list[str] = []
+    for index, worker in enumerate(workers, start=1):
+        lines.append(
+            f"{index}. [{worker['status']}] {worker['spawner']} | age {_worker_age(worker['ts'])}"
+            f" | {_display_time(worker['ts'])}"
+        )
+        if worker.get("task"):
+            lines.append(f"   Task: {worker['task']}")
+        if worker.get("model"):
+            lines.append(f"   Model: {worker['model']}")
+        lines.append(f"   ID: {worker['conversation_id']}")
+        lines.append(f"   URL: {worker['url']}")
+        if worker.get("note"):
+            lines.append(f"   Note: {worker['note']}")
+        lines.append("")
+    return lines[:-1]
+
+
+def _cmd_workers_list(args: argparse.Namespace) -> list[dict[str, Any]]:
+    show_closed = args.workers_command == "all"
+    workers = _select_workers(_worker_states(_read_worker_lines(_worker_registry_path())), show_closed=show_closed)
+    if args.json_output:
+        _print_json(workers)
+    elif workers:
+        print("\n".join(_worker_lines(workers)))
+    elif show_closed:
+        print("The worker registry is empty.")
+    else:
+        print("No open workers in the registry.")
+    return workers
+
+
+def _cmd_workers_close(args: argparse.Namespace) -> dict[str, Any]:
+    identifier, url = _require_conversation(args.conversation)
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "conversation_id": identifier,
+        "status": "closed",
+        "note": args.note.strip(),
+    }
+    path = _worker_registry_path()
+    known = any(
+        str(item.get("conversation_id", "")).lower() == identifier
+        for item in _read_worker_lines(path)
+    )
+    # Append-only journal: history is never rewritten; the latest line wins.
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        raise ChatGPTError(f"cannot append to worker registry {path}: {exc}") from exc
+    if args.json_output:
+        _print_json({"url": url, **entry})
+    else:
+        suffix = f" Note: {entry['note']}" if entry["note"] else ""
+        print(f"Closed worker {identifier}.{suffix}")
+        print(f"URL: {url}")
+        if not known:
+            print("Warning: that conversation was not in the registry; the close was recorded anyway.")
+    return entry
+
+
 def _cmd_conversations_list(client: ApiClient, args: argparse.Namespace) -> Any:
     data = client.request(
         "GET",
@@ -511,6 +658,32 @@ def _cmd_new(client: ApiClient, args: argparse.Namespace) -> Any:
         conversation_url = data.get("conversation_url")
         if conversation_url:
             print(f"\nConversation: {conversation_url}")
+    return data
+
+
+def _cmd_dispatch(client: ApiClient, args: argparse.Namespace) -> Any:
+    message = _message(args.message, "message")
+    body: dict[str, Any] = {
+        "model": args.model,
+        "messages": [{"role": "user", "content": message}],
+        "stream": True,
+    }
+    if args.spawner:
+        body["spawner"] = args.spawner
+    if args.task:
+        body["task"] = " ".join(args.task)
+    # Streamed submits are accepted even when the bridge queue is full. The
+    # bridge registers the spawned chat as an open worker automatically.
+    data = client.request_stream("POST", "/v1/chat/completions", body=body)
+    if args.json_output:
+        _print_json(data)
+        return data
+    content = (((data.get("choices") or [{}])[0] or {}).get("message") or {}).get("content")
+    print(content or "No response")
+    conversation_url = data.get("conversation_url")
+    if conversation_url:
+        print(f"\nWorker chat: {conversation_url}")
+        print("Recorded as an open worker; close it with `chatgpt workers close`.")
     return data
 
 
@@ -643,6 +816,16 @@ def _build_parser() -> argparse.ArgumentParser:
     new = commands.add_parser("new", help="create a new conversation")
     new.add_argument("message", nargs="+", help="first message")
 
+    dispatch = commands.add_parser("dispatch", help="spawn a worker chat and register it")
+    dispatch.add_argument("message", nargs="+", help="first message (the task prompt)")
+    dispatch.add_argument("--spawner", default=None, help="name recorded for whoever spawned the worker")
+    dispatch.add_argument("--task", nargs="+", default=None, help="short task description for the registry")
+    dispatch.add_argument(
+        "--model",
+        default="gpt-instant",
+        help="bridge model for the worker chat (gpt-instant, gpt-thinking, gpt-pro)",
+    )
+
     rename = commands.add_parser("rename", help="rename one exact conversation")
     rename.add_argument("conversation", help="exact conversation ID or exact ChatGPT URL")
     rename.add_argument("title", nargs="+", help="new title")
@@ -665,6 +848,13 @@ def _build_parser() -> argparse.ArgumentParser:
     move = commands.add_parser("move", help="move one exact conversation")
     move.add_argument("conversation", help="exact conversation ID or exact ChatGPT URL")
     move.add_argument("project", help="exact project ID or the literal none")
+
+    workers = commands.add_parser("workers", help="show or close dispatched worker chats")
+    worker_commands = workers.add_subparsers(dest="workers_command")
+    worker_commands.add_parser("all", help="list every worker in the registry, open or closed")
+    workers_close = worker_commands.add_parser("close", help="append a close line for one worker chat")
+    workers_close.add_argument("conversation", help="exact conversation ID or exact ChatGPT URL")
+    workers_close.add_argument("--note", default="", help="optional closing note")
     return parser
 
 
@@ -692,6 +882,12 @@ def _dispatch(client: ApiClient, args: argparse.Namespace) -> Any:
         return _cmd_send(client, args)
     if args.command == "new":
         return _cmd_new(client, args)
+    if args.command == "dispatch":
+        return _cmd_dispatch(client, args)
+    if args.command == "workers":
+        if args.workers_command == "close":
+            return _cmd_workers_close(args)
+        return _cmd_workers_list(args)
     if args.command == "rename":
         return _cmd_rename(client, args)
     if args.command == "archive":

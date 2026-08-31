@@ -6,6 +6,7 @@
 import { sendJson, sendApiError } from '../../respond.js';
 import { ERROR_CODES } from '../../errors.js';
 import { logger } from '../../../utils/logger.js';
+import { recordWorkerSpawn } from '../worker-registry.js';
 import yaml from 'yaml';
 import {
     getSystemStatus,
@@ -1424,6 +1425,20 @@ export function createAdminRouter(context) {
                     project: requestProjectHint(body, req),
                     source: 'admin-dispatch'
                 });
+
+                // Worker registry: dispatches that declare worker attribution
+                // (spawner/task) mark the conversation open in the append-only
+                // journal. Plain sends without attribution stay out of it, and
+                // a failed registry write never fails the dispatch.
+                const spawnerHint = firstText(body.spawner, body.metadata?.spawner);
+                const taskHint = firstText(body.task, body.metadata?.task, body.metadata?.task_description);
+                if (spawnerHint || taskHint) {
+                    recordWorkerSpawn({
+                        conversationId: convId,
+                        spawner: spawnerHint || requestAgentHint(body, req),
+                        task: taskHint
+                    });
+                }
 
                 logger.info('Admin', `Dispatched prompt to exact ChatGPT conversation (${mode}): ${convId}`);
                 sendJson(res, 200, {

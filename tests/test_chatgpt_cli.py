@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -123,6 +124,98 @@ class ChatGptCliTests(unittest.TestCase):
         self.assertEqual(result["choices"][0]["message"]["content"], "full text")
         self.assertEqual(result["conversation_url"], "https://chatgpt.com/c/abc")
         self.assertEqual(result["model"], "gpt-instant")
+
+    def test_dispatch_command_passes_spawner_task_and_model(self):
+        args = cli._parse_args(
+            ["dispatch", "--spawner", "aiva", "--task", "registry smoke test", "--model", "gpt-thinking", "Reply", "DONE"]
+        )
+        self.assertEqual(args.spawner, "aiva")
+        self.assertEqual(args.task, ["registry smoke test"])
+        self.assertEqual(args.model, "gpt-thinking")
+        self.assertEqual(args.message, ["Reply", "DONE"])
+
+    def test_bare_workers_lists_open_and_all_shows_closed(self):
+        self.assertIsNone(cli._parse_args(["workers"]).workers_command)
+        self.assertEqual(cli._parse_args(["workers", "all"]).workers_command, "all")
+        close_args = cli._parse_args(
+            ["workers", "close", "12345678-1234-1234-1234-1234567890ab", "--note", "smoke"]
+        )
+        self.assertEqual(close_args.workers_command, "close")
+        self.assertEqual(close_args.note, "smoke")
+
+    def test_worker_states_latest_line_wins_and_spawn_fields_survive_close(self):
+        identifier = "12345678-1234-1234-1234-1234567890ab"
+        spawn = {
+            "ts": "2026-08-30T21:00:00.000Z",
+            "conversation_id": identifier,
+            "url": f"https://chatgpt.com/c/{identifier}",
+            "spawner": "aiva",
+            "task": "registry smoke test",
+            "model": "gpt-thinking",
+            "status": "open",
+        }
+        close = {"ts": "2026-08-30T21:05:00.000Z", "conversation_id": identifier, "status": "closed", "note": "smoke"}
+
+        state = cli._worker_states([spawn, close])[0]
+        self.assertEqual(state["status"], "closed")
+        self.assertEqual(state["note"], "smoke")
+        self.assertEqual(state["ts"], "2026-08-30T21:05:00.000Z")
+        # The spawn attribution survives the close line.
+        self.assertEqual(state["spawner"], "aiva")
+        self.assertEqual(state["task"], "registry smoke test")
+
+        reopened = cli._worker_states([spawn, close, {"ts": "2026-08-30T21:06:00.000Z", "conversation_id": identifier, "status": "open"}])
+        self.assertEqual(reopened[0]["status"], "open")
+
+        unknown_spawner = cli._worker_states([{"ts": "2026-08-30T21:00:00.000Z", "conversation_id": identifier, "status": "open"}])[0]
+        self.assertEqual(unknown_spawner["spawner"], "unknown")
+        self.assertEqual(unknown_spawner["url"], f"https://chatgpt.com/c/{identifier}")
+
+    def test_worker_journal_reader_skips_malformed_lines(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "worker-registry.jsonl"
+            path.write_text('not json\n\n{"conversation_id": "abc"}\n', encoding="utf-8")
+            entries = cli._read_worker_lines(path)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["conversation_id"], "abc")
+
+    def test_select_workers_filters_open_and_sorts_newest_first(self):
+        old_open = {"conversation_id": "a", "status": "open", "ts": "2026-08-30T20:00:00Z"}
+        closed = {"conversation_id": "b", "status": "closed", "ts": "2026-08-30T21:00:00Z"}
+        new_open = {"conversation_id": "c", "status": "open", "ts": "2026-08-30T21:30:00Z"}
+        open_only = cli._select_workers([old_open, closed, new_open], show_closed=False)
+        self.assertEqual([worker["conversation_id"] for worker in open_only], ["c", "a"])
+        everything = cli._select_workers([old_open, closed, new_open], show_closed=True)
+        self.assertEqual([worker["conversation_id"] for worker in everything], ["c", "b", "a"])
+
+    def test_workers_close_appends_without_rewriting_history(self):
+        identifier = "12345678-1234-1234-1234-1234567890ab"
+        spawn_line = json.dumps(
+            {
+                "ts": "2026-08-30T21:00:00.000Z",
+                "conversation_id": identifier,
+                "url": f"https://chatgpt.com/c/{identifier}",
+                "spawner": "aiva",
+                "status": "open",
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "worker-registry.jsonl"
+            path.write_text(spawn_line + "\n", encoding="utf-8")
+            original_path = cli._worker_registry_path
+            cli._worker_registry_path = lambda: path
+            try:
+                args = cli._parse_args(["workers", "close", identifier, "--note", "smoke"])
+                cli._cmd_workers_close(args)
+                lines = path.read_text(encoding="utf-8").splitlines()
+            finally:
+                cli._worker_registry_path = original_path
+        self.assertEqual(lines[0], spawn_line)
+        self.assertEqual(len(lines), 2)
+        closing = json.loads(lines[1])
+        self.assertEqual(closing["conversation_id"], identifier)
+        self.assertEqual(closing["status"], "closed")
+        self.assertEqual(closing["note"], "smoke")
 
 
 if __name__ == "__main__":

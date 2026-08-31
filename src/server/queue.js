@@ -16,6 +16,7 @@ import {
 import { ERROR_CODES } from './errors.js';
 import { incrementSuccess, incrementFailed } from '../utils/stats.js';
 import { createRecord, updateRecord, processResponseMedia } from '../utils/history.js';
+import { recordWorkerSpawn, conversationIdFromUrl } from './api/worker-registry.js';
 
 /**
  * @typedef {object} TaskContext
@@ -29,6 +30,8 @@ import { createRecord, updateRecord, processResponseMedia } from '../utils/histo
  * @property {boolean} isStreaming - 是否流式请求
  * @property {string|null} agent - Optional project-routing agent hint
  * @property {string|null} project - Optional project-routing hint
+ * @property {string|null} spawner - Optional worker-registry spawner attribution
+ * @property {string|null} workerTask - Optional worker-registry task description
  */
 
 /**
@@ -202,6 +205,19 @@ export function createQueueManager(queueConfig, callbacks) {
 
             // 提取会话 URL（如果有）
             const resultConvUrl = result.conversationUrl || null;
+
+            // Worker registry: a task submitted without a conversation URL just
+            // created a new chatgpt.com conversation — a spawned worker chat.
+            // Log it automatically no matter who dispatched it; a failed write
+            // must never fail the task (recordWorkerSpawn swallows errors).
+            if (!conversationUrl && resultConvUrl) {
+                recordWorkerSpawn({
+                    conversationId: conversationIdFromUrl(resultConvUrl),
+                    spawner: task.spawner,
+                    task: task.workerTask,
+                    model: modelName || modelId,
+                });
+            }
 
             logger.info('服务器', '结果已准备就绪', { id });
             await incrementSuccess();

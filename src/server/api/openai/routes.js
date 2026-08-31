@@ -160,6 +160,12 @@ export function createOpenAIRouter(context) {
                 null;
             const agent = requestAgentHint(data, req);
             const project = requestProjectHint(data, req);
+            // Worker-registry attribution: who spawned this chat and why. The
+            // agent hint doubles as the spawner when none is given, and the
+            // prompt prefix stands in for an absent task description.
+            const spawner = firstText(data.spawner, data.metadata?.spawner, agent);
+            const workerTask = firstText(data.task, data.metadata?.task, data.metadata?.task_description)
+                || prompt.replace(/\s+/g, ' ').slice(0, 200);
 
             logger.info('服务器', `[队列] 请求入队: ${prompt.slice(0, 100)}...`, { id: requestId, images: imagePaths.length });
 
@@ -176,7 +182,9 @@ export function createOpenAIRouter(context) {
                 reasoning,
                 conversationUrl,
                 agent,
-                project
+                project,
+                spawner,
+                workerTask
             });
 
         } catch (err) {
