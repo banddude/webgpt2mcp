@@ -77,6 +77,7 @@ import {
     isChatGptSendControlVisibilityRace,
     waitForChatInput,
     readChatInputText,
+    readCurrentChatGptDomTranscript,
     dismissStaleChatGptAuthDialog,
     CHATGPT_SEND_BUTTON_SELECTOR,
     CHATGPT_STOP_BUTTON_SELECTOR
@@ -213,6 +214,8 @@ async function deleteCloudConversations(records, queueManager) {
 export function createAdminRouter(context) {
     const { config, queueManager, tempDir, getSafeMode } = context;
     const chatGptSession = createChatGptSessionManager({ queueManager });
+    const recentDispatchDomReadUntil = new Map();
+    const recentDispatchDomReadTtlMs = 3 * 60 * 1000;
 
     // Dispatches are short browser handoffs, not generation lanes. Serialize
     // only the physical page interaction so simultaneous callers do not type
@@ -1674,6 +1677,7 @@ export function createAdminRouter(context) {
                             }
                             convId = sent.conversation_id;
                             conversationUrl = sent.conversation_url;
+                            recentDispatchDomReadUntil.set(convId, Date.now() + recentDispatchDomReadTtlMs);
                         } else {
                             const targetUrl = normalizeChatUrl(conversationUrl);
                             if (normalizeChatUrl(page.url()) !== targetUrl) {
@@ -2004,6 +2008,17 @@ export function createAdminRouter(context) {
                 if (!page) {
                     sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
                     return;
+                }
+
+                const domReadUntil = recentDispatchDomReadUntil.get(convId) || 0;
+                if (domReadUntil > Date.now()) {
+                    const domResult = await readCurrentChatGptDomTranscript(page, convId);
+                    if (domResult?.messages?.length) {
+                        sendJson(res, 200, domResult);
+                        return;
+                    }
+                } else if (domReadUntil) {
+                    recentDispatchDomReadUntil.delete(convId);
                 }
 
                 let result = null;
