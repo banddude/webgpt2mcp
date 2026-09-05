@@ -1408,9 +1408,24 @@ export async function chatgptCloudRequest(page, { method = 'GET', path, query = 
     const result = await page.evaluate(async ({ method, path, query, body, retries }) => {
         const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
         try {
+            let accessToken = null;
+            let sessionKeys = [];
+            try {
+                const sessionRes = await fetch('/api/auth/session', {
+                    credentials: 'include',
+                    cache: 'no-store',
+                    headers: { 'Cache-Control': 'no-cache' },
+                });
+                if (sessionRes.ok) {
+                    const session = await sessionRes.json();
+                    sessionKeys = Object.keys(session || {});
+                    accessToken = session?.accessToken || null;
+                }
+            } catch { }
+
             const search = query ? new URLSearchParams(query).toString() : '';
             const url = `https://chatgpt.com/backend-api/${String(path).replace(/^\//, '')}${search ? `?${search}` : ''}`;
-            const headers = {};
+            const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
             const hasBody = body !== null && body !== undefined;
             if (hasBody) headers['Content-Type'] = 'application/json';
 
@@ -1426,16 +1441,23 @@ export async function chatgptCloudRequest(page, { method = 'GET', path, query = 
                 lastHttp = res.status;
                 lastBodyText = await res.text();
                 if (res.ok) {
+                    const authMode = accessToken ? 'bearer-and-cookies' : 'cookies';
                     try {
-                        return { ok: true, http: res.status, data: JSON.parse(lastBodyText) };
+                        return { ok: true, http: res.status, data: JSON.parse(lastBodyText), authMode, sessionKeys };
                     } catch {
-                        return { ok: true, http: res.status, data: null, raw: lastBodyText.slice(0, 2000) };
+                        return { ok: true, http: res.status, data: null, raw: lastBodyText.slice(0, 2000), authMode, sessionKeys };
                     }
                 }
                 if (res.status !== 429) break;
                 await sleep(600 * (attempt + 1));
             }
-            return { ok: false, http: lastHttp, body: String(lastBodyText || '').slice(0, 2000) };
+            return {
+                ok: false,
+                http: lastHttp,
+                body: String(lastBodyText || '').slice(0, 2000),
+                authMode: accessToken ? 'bearer-and-cookies' : 'cookies',
+                sessionKeys,
+            };
         } catch (e) {
             return { ok: false, error: e.message };
         }

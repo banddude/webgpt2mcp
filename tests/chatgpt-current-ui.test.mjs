@@ -35,13 +35,20 @@ test('composer compatibility includes the current ChatGPT textarea and semantic 
     assert.ok(seen.includes('#mobile-composer-prompt'));
 });
 
-test('cloud management requests use browser cookies without requiring a bearer token', async () => {
-    let observed = null;
+test('cloud management requests use bearer plus cookies when accessToken is available', async () => {
+    const requests = [];
     const originalFetch = globalThis.fetch;
     const page = {
         async evaluate(fn, args) {
             globalThis.fetch = async (url, options = {}) => {
-                observed = { url, options };
+                requests.push({ url, options });
+                if (String(url).includes('/api/auth/session')) {
+                    return {
+                        ok: true,
+                        status: 200,
+                        async json() { return { accessToken: 'token-for-test', user: { id: 'u' } }; },
+                    };
+                }
                 return {
                     ok: true,
                     status: 200,
@@ -58,9 +65,48 @@ test('cloud management requests use browser cookies without requiring a bearer t
 
     const result = await chatgptCloudRequest(page, { path: 'conversations', query: { limit: '1' } });
     assert.equal(result.ok, true);
-    assert.match(observed.url, /backend-api\/conversations/);
-    assert.equal(observed.options.credentials, 'include');
-    assert.equal(observed.options.headers.Authorization, undefined);
+    assert.equal(result.authMode, 'bearer-and-cookies');
+    const backend = requests.find(request => String(request.url).includes('/backend-api/conversations'));
+    assert.ok(backend);
+    assert.equal(backend.options.credentials, 'include');
+    assert.equal(backend.options.headers.Authorization, 'Bearer token-for-test');
+});
+
+test('cloud management requests fall back to cookies when auth session has no accessToken', async () => {
+    const requests = [];
+    const originalFetch = globalThis.fetch;
+    const page = {
+        async evaluate(fn, args) {
+            globalThis.fetch = async (url, options = {}) => {
+                requests.push({ url, options });
+                if (String(url).includes('/api/auth/session')) {
+                    return {
+                        ok: true,
+                        status: 200,
+                        async json() { return { WARNING_BANNER: 'warning' }; },
+                    };
+                }
+                return {
+                    ok: true,
+                    status: 200,
+                    async text() { return JSON.stringify({ items: [] }); },
+                };
+            };
+            try {
+                return await fn(args);
+            } finally {
+                globalThis.fetch = originalFetch;
+            }
+        },
+    };
+
+    const result = await chatgptCloudRequest(page, { path: 'conversations', query: { limit: '1' } });
+    assert.equal(result.ok, true);
+    assert.equal(result.authMode, 'cookies');
+    const backend = requests.find(request => String(request.url).includes('/backend-api/conversations'));
+    assert.ok(backend);
+    assert.equal(backend.options.credentials, 'include');
+    assert.equal(backend.options.headers.Authorization, undefined);
 });
 
 
