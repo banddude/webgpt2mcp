@@ -6,6 +6,7 @@ import {
     CHATGPT_SEND_BUTTON_SELECTORS,
     findChatInput,
     chatgptCloudRequest,
+    deleteChatGptConversation,
     dismissStaleChatGptAuthDialog,
 } from '../src/backend/adapter/chatgpt_text.js';
 
@@ -107,6 +108,47 @@ test('cloud management requests fall back to cookies when auth session has no ac
     assert.ok(backend);
     assert.equal(backend.options.credentials, 'include');
     assert.equal(backend.options.headers.Authorization, undefined);
+});
+
+
+test('conversation delete uses current soft-delete PATCH contract', async () => {
+    const requests = [];
+    const originalFetch = globalThis.fetch;
+    const page = {
+        async evaluate(fn, args) {
+            globalThis.fetch = async (url, options = {}) => {
+                requests.push({ url: String(url), options });
+                if (String(url).includes('/api/auth/session')) {
+                    return {
+                        ok: true,
+                        status: 200,
+                        async json() { return { accessToken: 'delete-token' }; },
+                    };
+                }
+                return {
+                    ok: true,
+                    status: 200,
+                    async text() { return JSON.stringify({ success: true }); },
+                };
+            };
+            try {
+                return await fn(args);
+            } finally {
+                globalThis.fetch = originalFetch;
+            }
+        },
+    };
+
+    const result = await deleteChatGptConversation(
+        page,
+        'https://chatgpt.com/c/12345678-1234-1234-1234-1234567890ab',
+    );
+    assert.equal(result.success, true);
+    const mutation = requests.find(request => request.url.includes('/backend-api/conversation/12345678-1234-1234-1234-1234567890ab'));
+    assert.ok(mutation);
+    assert.equal(mutation.options.method, 'PATCH');
+    assert.deepEqual(JSON.parse(mutation.options.body), { is_visible: false });
+    assert.equal(mutation.options.headers.Authorization, 'Bearer delete-token');
 });
 
 

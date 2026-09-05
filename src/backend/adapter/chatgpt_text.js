@@ -1991,7 +1991,8 @@ export async function deleteChatGptProject(page, projectId) {
 
 /**
  * Delete one exact conversation from ChatGPT cloud storage.
- * DELETE /backend-api/conversation/<id>
+ * Current ChatGPT soft-delete contract: PATCH /backend-api/conversation/<id>
+ * with { is_visible: false }. The deleted conversation then reads as 404.
  */
 export async function deleteChatGptConversation(page, conversationUrl, _options = {}) {
     const match = String(conversationUrl || '').match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
@@ -2004,8 +2005,9 @@ export async function deleteChatGptConversation(page, conversationUrl, _options 
     }
     const conversationId = match[1];
     const result = await chatgptCloudRequest(page, {
-        method: 'DELETE',
-        path: `/conversation/${conversationId}`
+        method: 'PATCH',
+        path: `/conversation/${conversationId}`,
+        body: { is_visible: false }
     });
     if (!result?.ok) {
         return {
