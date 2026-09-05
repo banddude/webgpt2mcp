@@ -70,6 +70,8 @@ import {
     chatgptCloudRequest,
     isTransientChatGptBrowserError,
     chatGptReadRetryDelayMs,
+    parseChatGptConversationReference,
+    resolveChatGptConversationUrl,
     selectChatGptModel,
     findChatInput,
     focusChatGptInput,
@@ -802,6 +804,14 @@ export function createAdminRouter(context) {
                 return raw.replace(/\/$/, '');
             };
 
+            // Conversation ID from any page or conversation URL form (/c/<id>
+            // or project-scoped /g/<project>/c/<id>). Null when the URL shows
+            // no single conversation.
+            const conversationIdFromPageUrl = value => {
+                const match = String(value || '').match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+                return match ? match[1].toLowerCase() : null;
+            };
+
             const projectIdPattern = /^g-p-[0-9a-z]+$/i;
             const configuredProjectIds = () => {
                 const routing = config?.projects && typeof config.projects === 'object'
@@ -828,17 +838,49 @@ export function createAdminRouter(context) {
                 ];
             };
 
+            // Cloud resolution of where a conversation actually lives, cached
+            // briefly because one dispatch navigates more than once. When the
+            // resolution itself fails, return null so navigation falls back to
+            // the legacy candidate list instead of guessing.
+            const conversationUrlResolutions = new Map();
+            const conversationUrlResolutionTtlMs = 60 * 1000;
+            const resolveConversationTargetUrl = async (page, conversationUrl) => {
+                const reference = parseChatGptConversationReference(conversationUrl);
+                if (!reference) return null;
+                const cached = conversationUrlResolutions.get(reference.id);
+                if (cached && cached.expires > Date.now()) return cached.url;
+                const resolved = await resolveChatGptConversationUrl(page, reference.url).catch(() => null);
+                if (!resolved?.ok || typeof resolved.url !== 'string') return null;
+                conversationUrlResolutions.set(reference.id, { url: resolved.url, expires: Date.now() + conversationUrlResolutionTtlMs });
+                return resolved.url;
+            };
+
             // Use the same navigation and composer-wait helpers as the normal ChatGPT
             // adapter. Steering should not maintain a second browser-navigation stack.
             const navigateExactChat = async (page, conversationUrl) => {
                 const targetUrl = normalizeChatUrl(conversationUrl);
-                const candidates = navigationCandidates(conversationUrl);
+                // A conversation filed in a project is served under
+                // /g/<projectId>/c/<id> and chatgpt.com does not reliably
+                // redirect the public /c/<id> URL there (issue #18), so ask the
+                // cloud API where this conversation actually lives and try the
+                // real URL first.
+                const resolvedUrl = await resolveConversationTargetUrl(page, conversationUrl);
+                const candidates = resolvedUrl
+                    ? [resolvedUrl, ...navigationCandidates(conversationUrl).filter(candidate => normalizeChatUrl(candidate) !== normalizeChatUrl(resolvedUrl))]
+                    : navigationCandidates(conversationUrl);
+                const targetConversationId = conversationIdFromPageUrl(targetUrl);
                 let lastError = null;
 
                 for (let attempt = 1; attempt <= 2; attempt += 1) {
                     for (const candidate of candidates) {
                         try {
-                            if (normalizeChatUrl(page.url()) !== targetUrl ||
+                            // Every candidate is one URL form of the SAME
+                            // conversation, so compare by conversation ID: a
+                            // page already showing the target chat under its
+                            // project-scoped URL needs no navigation at all.
+                            const pageOnTarget = Boolean(targetConversationId) &&
+                                conversationIdFromPageUrl(page.url()) === targetConversationId;
+                            if (!pageOnTarget ||
                                 (candidate !== conversationUrl && page.url() !== candidate)) {
                                 await gotoWithCheck(page, candidate, { timeout: 60000 });
                             }
@@ -1245,11 +1287,6 @@ export function createAdminRouter(context) {
                 return { idle: status.processing === 0, status };
             };
 
-            const conversationIdFromPageUrl = value => {
-                const match = String(value || '').match(/\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-                return match ? match[1].toLowerCase() : null;
-            };
-
             const navigateNewChat = async page => {
                 const homeUrl = 'https://chatgpt.com/';
                 const currentUrl = page.url();
@@ -1386,11 +1423,9 @@ export function createAdminRouter(context) {
             if (method === 'POST' && pathname === '/chatgpt/stop') {
                 const body = await readBody(req);
                 const conversationUrl = body.conversation_url || body.conversationUrl;
-                const convMatch = typeof conversationUrl === 'string'
-                    ? conversationUrl.match(/^https:\/\/chatgpt\.com\/c\/([0-9a-f-]+)\/?$/i)
-                    : null;
-                if (!convMatch) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation_url must be an exact ChatGPT conversation URL' });
+                const convRef = parseChatGptConversationReference(conversationUrl);
+                if (!convRef) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation_url must be an exact ChatGPT conversation URL (https://chatgpt.com/c/... or project-scoped https://chatgpt.com/g/g-p-.../c/...)' });
                     return;
                 }
 
@@ -1435,7 +1470,7 @@ export function createAdminRouter(context) {
                         return;
                     }
 
-                    const convId = convMatch[1];
+                    const convId = convRef.id;
                     const attached = await attachOraclePageToActiveStream(page, conversationUrl, convId);
                     if (attached.error) {
                         sendJson(res, 409, { success: false, error: attached.error, stream_status_before: attached.state?.status || null });
@@ -1489,11 +1524,9 @@ export function createAdminRouter(context) {
                 const body = await readBody(req);
                 const conversationUrl = body.conversation_url || body.conversationUrl;
                 const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
-                const convMatch = typeof conversationUrl === 'string'
-                    ? conversationUrl.match(/^https:\/\/chatgpt\.com\/c\/([0-9a-f-]+)\/?$/i)
-                    : null;
-                if (!convMatch || !prompt) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation_url and prompt are required' });
+                const convRef = parseChatGptConversationReference(conversationUrl);
+                if (!convRef || !prompt) {
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'prompt and an exact conversation_url (https://chatgpt.com/c/... or project-scoped https://chatgpt.com/g/g-p-.../c/...) are required' });
                     return;
                 }
 
@@ -1540,7 +1573,7 @@ export function createAdminRouter(context) {
                     return;
                 }
 
-                const convId = convMatch[1];
+                const convId = convRef.id;
                 const attached = await attachOraclePageToActiveStream(page, conversationUrl, convId);
                 if (attached.error) {
                     sendJson(res, 409, { success: false, active: true, error: attached.error, stream_status: attached.state?.status || null });
@@ -1614,13 +1647,11 @@ export function createAdminRouter(context) {
                 const body = await readBody(req);
                 const requestedConversationUrl = body.conversation_url || body.conversationUrl;
                 const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
-                const convMatch = typeof requestedConversationUrl === 'string'
-                    ? requestedConversationUrl.match(/^https:\/\/chatgpt\.com\/c\/([0-9a-f-]+)\/?$/i)
-                    : null;
-                if ((requestedConversationUrl && !convMatch) || !prompt) {
+                const convRef = parseChatGptConversationReference(requestedConversationUrl);
+                if ((requestedConversationUrl && !convRef) || !prompt) {
                     sendApiError(res, {
                         code: ERROR_CODES.INVALID_REQUEST_BODY,
-                        message: 'prompt and, when continuing a chat, an exact conversation_url are required'
+                        message: 'prompt and, when continuing a chat, an exact conversation_url (https://chatgpt.com/c/... or project-scoped https://chatgpt.com/g/g-p-.../c/...) are required'
                     });
                     return;
                 }
@@ -1639,9 +1670,9 @@ export function createAdminRouter(context) {
                         const taskHint = firstText(body.task, body.metadata?.task, body.metadata?.task_description);
                         const agentHint = requestAgentHint(body, req);
                         const projectHint = requestProjectHint(body, req);
-                        const isNewConversation = !convMatch;
-                        let conversationUrl = requestedConversationUrl || null;
-                        let convId = convMatch?.[1]?.toLowerCase() || null;
+                        const isNewConversation = !convRef;
+                        let conversationUrl = convRef?.url || requestedConversationUrl || null;
+                        let convId = convRef?.id || null;
                         let attached = { state: null, stopVisible: false };
                         let wasActive = false;
                         let mode = isNewConversation ? 'create' : 'dispatch';
@@ -1698,7 +1729,7 @@ export function createAdminRouter(context) {
 
                             const nav = await navigateExactChat(page, conversationUrl);
                             if (!nav.ok) {
-                                logger.warn('Admin', `Exact ChatGPT dispatch composer unavailable: ${convMatch[1]} (${nav.lastError?.message || nav.error || 'unknown'})`);
+                                logger.warn('Admin', `Exact ChatGPT dispatch composer unavailable: ${convId} (${nav.lastError?.message || nav.error || 'unknown'})`);
                                 sendJson(res, 503, {
                                     success: false,
                                     submitted: false,
@@ -2170,24 +2201,19 @@ export function createAdminRouter(context) {
                 return await selectChatGptControlPage(poolContext);
             };
 
-            const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
             // Verified live: ChatGPT web projects are "snorlax" gizmos with g-p-*
             // ids, surfaced as https://chatgpt.com/g/<g-p-id>[-slug] URLs.
             const PROJECT_ID_RE = /^g-p-[0-9a-z]+$/i;
             const PROJECT_URL_RE = /^https:\/\/chatgpt\.com\/g\/(g-p-[0-9a-z]+)/i;
 
-            // Accept an exact conversation UUID or an exact /c/ URL only. Titles
-            // and fuzzy references are rejected: every mutating operation in this
+            // Accept an exact conversation UUID, an exact /c/ URL, or the
+            // project-scoped /g/<g-p-id>[-slug]/c/<id> URL form. Titles and
+            // fuzzy references are rejected: every mutating operation in this
             // family must target exactly one known conversation.
             const parseExactConversationRef = (value) => {
-                const raw = typeof value === 'string' ? value.trim() : '';
-                if (!raw) return null;
-                if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw)) {
-                    return { id: raw.toLowerCase(), url: `https://chatgpt.com/c/${raw.toLowerCase()}` };
-                }
-                const match = raw.match(CONVERSATION_URL_RE);
-                if (!match) return null;
-                return { id: match[1].toLowerCase(), url: `https://chatgpt.com/c/${match[1].toLowerCase()}` };
+                const reference = parseChatGPTConversationReference(value);
+                if (!reference) return null;
+                return { id: reference.id, url: reference.url };
             };
 
             const parseExactProjectRef = (value) => {
@@ -2205,7 +2231,7 @@ export function createAdminRouter(context) {
                 const ref = parseExactConversationRef(body.conversation_url || body.conversationUrl || body.conversation);
                 const title = typeof body.title === 'string' ? body.title.trim() : '';
                 if (!ref) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation must be an exact ChatGPT conversation ID or exact https://chatgpt.com/c/... URL; titles are not accepted' });
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation must be an exact ChatGPT conversation ID, an exact https://chatgpt.com/c/... URL, or an exact project-scoped https://chatgpt.com/g/g-p-.../c/... URL; titles are not accepted' });
                     return;
                 }
                 if (!title) {
@@ -2241,7 +2267,7 @@ export function createAdminRouter(context) {
                 const archived = body.archived === true || body.archive === true;
                 const unarchive = body.archived === false || body.unarchive === true;
                 if (!ref) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation must be an exact ChatGPT conversation ID or exact https://chatgpt.com/c/... URL; titles are not accepted' });
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation must be an exact ChatGPT conversation ID, an exact https://chatgpt.com/c/... URL, or an exact project-scoped https://chatgpt.com/g/g-p-.../c/... URL; titles are not accepted' });
                     return;
                 }
                 if (!archived && !unarchive) {
@@ -2440,7 +2466,7 @@ export function createAdminRouter(context) {
                 const body = await readBody(req);
                 const ref = parseExactConversationRef(body.conversation_url || body.conversationUrl || body.conversation);
                 if (!ref) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation must be an exact ChatGPT conversation ID or exact https://chatgpt.com/c/... URL; titles are not accepted' });
+                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'conversation must be an exact ChatGPT conversation ID, an exact https://chatgpt.com/c/... URL, or an exact project-scoped https://chatgpt.com/g/g-p-.../c/... URL; titles are not accepted' });
                     return;
                 }
                 let projectId = null;

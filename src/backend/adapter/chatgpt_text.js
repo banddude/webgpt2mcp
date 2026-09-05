@@ -229,13 +229,21 @@ export async function readChatInputText(locator) {
     }).catch(() => '');
 }
 
+// Conversations filed in a ChatGPT project are served under
+// /g/<g-p-id>[-slug]/c/<conversationId>. Canonicalize every accepted form to
+// the public /c/<id> URL: the conversation ID is what identifies the chat, and
+// navigation resolves the real project-scoped URL separately through the
+// cloud API (issue #18).
 function normalizeConversationUrl(url) {
     if (!url || typeof url !== 'string') return null;
     try {
         const parsed = new URL(url);
         if (parsed.hostname !== 'chatgpt.com') return null;
-        if (!parsed.pathname.startsWith('/c/')) return null;
-        return parsed.toString();
+        const plain = parsed.pathname.match(/^\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+        if (plain) return `https://chatgpt.com/c/${plain[1].toLowerCase()}`;
+        const projectScoped = parsed.pathname.match(/^\/g\/(g-p-[0-9a-z]+(?:-[0-9a-z-]+)?)\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i);
+        if (projectScoped) return `https://chatgpt.com/c/${projectScoped[2].toLowerCase()}`;
+        return null;
     } catch {
         return null;
     }
@@ -707,23 +715,32 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
         logger.info('适配器', conversationUrl ? '继续已有会话...' : '开启新会话...', meta);
 
-        // 快速复用：如果页面已在目标 URL 且输入框可见，跳过导航（省 ~18s）
-        const currentUrl = page.url();
-        const currentInput = await findChatInput(page);
-        const inputVisible = Boolean(currentInput);
-        const canSkipNav = inputVisible && (
-            // 新对话：页面在首页
-            (!conversationUrl && (currentUrl === 'https://chatgpt.com/' || currentUrl === 'https://chatgpt.com')) ||
-            // 继续会话：页面已在目标会话
-            (conversationUrl && currentUrl === conversationUrl)
-        );
-
-        if (canSkipNav) {
-            logger.info('适配器', conversationUrl
-                ? `页面已在目标会话，跳过导航 (${conversationUrl})`
-                : '页面已就绪，跳过导航 (快速复用)', meta);
+        if (conversationUrl) {
+            // Resolve the conversation's real URL first (a chat filed in a
+            // project is served under /g/<project>/c/<id>, and the public
+            // /c/<id> URL does not reliably reach it), then PROVE the target
+            // conversation is the one on screen before anything is typed. A
+            // navigation mismatch fails loudly and sends nothing: typing into
+            // an unverified composer silently creates a brand-new chat
+            // (issue #18).
+            const attached = await ensurePageOnExactConversation(page, conversationUrl);
+            if (!attached.ok) {
+                return {
+                    error: attached.error === 'conversation_navigation_mismatch'
+                        ? `conversation_navigation_mismatch: browser is on ${attached.actualUrl}`
+                        : `conversation attach failed: ${attached.error}`,
+                    actual_url: attached.actualUrl || page.url(),
+                };
+            }
         } else {
-            await gotoWithCheck(page, targetUrl);
+            // 快速复用：如果页面已在首页且输入框可见，跳过导航（省 ~18s）
+            const currentUrl = page.url();
+            const inputVisible = Boolean(await findChatInput(page));
+            if (inputVisible && (currentUrl === 'https://chatgpt.com/' || currentUrl === 'https://chatgpt.com')) {
+                logger.info('适配器', '页面已就绪，跳过导航 (快速复用)', meta);
+            } else {
+                await gotoWithCheck(page, targetUrl);
+            }
         }
 
         // 1. 等待输入框加载
@@ -1598,6 +1615,136 @@ function cloudRequestError(result) {
     if (result?.error) return result.error;
     if (result?.http) return `HTTP ${result.http}: ${result.body || 'no response body'}`;
     return 'unknown backend-api error';
+}
+
+const CHATGPT_CONVERSATION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Project-scoped conversation URL: https://chatgpt.com/g/<g-p-id>[-slug]/c/<conversationId>
+const CHATGPT_PROJECT_CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/g\/(g-p-[0-9a-z]+(?:-[0-9a-z-]+)?)\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
+const CHATGPT_PLAIN_CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
+
+/**
+ * Parse one exact conversation reference: a bare UUID, a public /c/<id> URL,
+ * or a project-scoped /g/<g-p-id>[-slug]/c/<id> URL. Returns the conversation
+ * ID, the canonical public URL, and the project segment when the reference
+ * was project-scoped. Titles and fuzzy names are rejected.
+ */
+export function parseChatGptConversationReference(value) {
+    const raw = typeof value === 'string' ? value.trim() : '';
+    if (!raw) return null;
+    if (CHATGPT_CONVERSATION_UUID_RE.test(raw)) {
+        return { id: raw.toLowerCase(), url: `https://chatgpt.com/c/${raw.toLowerCase()}`, projectId: null };
+    }
+    let match = raw.match(CHATGPT_PLAIN_CONVERSATION_URL_RE);
+    if (match) {
+        return { id: match[1].toLowerCase(), url: `https://chatgpt.com/c/${match[1].toLowerCase()}`, projectId: null };
+    }
+    match = raw.match(CHATGPT_PROJECT_CONVERSATION_URL_RE);
+    if (match) {
+        return { id: match[2].toLowerCase(), url: `https://chatgpt.com/c/${match[2].toLowerCase()}`, projectId: match[1].toLowerCase() };
+    }
+    return null;
+}
+
+/**
+ * Extract the conversation ID from a live browser page URL. Understands both
+ * the public /c/<id> form and the project-scoped /g/<project>/c/<id> form.
+ * Returns null when the page is not showing one exact conversation (a project
+ * landing page, the home screen, search, ...).
+ */
+export function chatGptConversationIdFromPageUrl(value) {
+    const match = String(value || '').match(CHATGPT_CONVERSATION_ID_RE);
+    return match ? match[1].toLowerCase() : null;
+}
+
+/**
+ * Resolve where one exact conversation actually lives (issue #18). A
+ * conversation filed in a ChatGPT project is served under
+ * /g/<projectId>/c/<id>, and chatgpt.com does not reliably redirect the public
+ * /c/<id> URL there: it can land on the project landing page instead, whose
+ * composer then silently creates a brand-new chat. Reads the conversation's
+ * cloud metadata (GET /backend-api/conversation/<id>) and returns its real
+ * URL: project-scoped when the conversation has a gizmo_id, public otherwise.
+ * A resolution failure is reported, never guessed around.
+ */
+export async function resolveChatGptConversationUrl(page, conversationReference) {
+    const reference = parseChatGptConversationReference(conversationReference);
+    if (!reference) {
+        return { ok: false, error: 'conversation_reference_invalid' };
+    }
+    const result = await chatgptCloudRequest(page, {
+        path: `/conversation/${reference.id}`,
+        retries: 1,
+    });
+    if (!result?.ok) {
+        return { ok: false, conversationId: reference.id, error: cloudRequestError(result), http: result?.http || null };
+    }
+    const gizmoId = typeof result.data?.gizmo_id === 'string' ? result.data.gizmo_id.trim() : '';
+    if (gizmoId) {
+        return {
+            ok: true,
+            conversationId: reference.id,
+            projectId: gizmoId.toLowerCase(),
+            url: `https://chatgpt.com/g/${gizmoId}/c/${reference.id}`,
+        };
+    }
+    return {
+        ok: true,
+        conversationId: reference.id,
+        projectId: null,
+        url: `https://chatgpt.com/c/${reference.id}`,
+    };
+}
+
+/**
+ * Put the page on one exact conversation and prove the target chat is the one
+ * on screen. Resolves the conversation's real URL first (project chats never
+ * reliably answer the public /c/<id> URL), skips navigation when the page
+ * already shows the target conversation ID, and hard-verifies the page URL
+ * after the composer is ready. NEVER falls back to an unverified composer:
+ * when the page cannot be positively attached to the target conversation this
+ * fails loudly so the caller sends nothing at all. Typing a steering message
+ * into whatever composer is open silently spawns a new chat (issue #18).
+ */
+export async function ensurePageOnExactConversation(page, conversationReference, { timeout = 60000, resolve = null } = {}) {
+    const reference = parseChatGptConversationReference(conversationReference);
+    if (!reference) {
+        return { ok: false, error: 'conversation_reference_invalid', actualUrl: page?.url?.() || null };
+    }
+
+    // Resolve the real URL; on failure fall back to the canonical public URL.
+    let targetUrl = reference.url;
+    let resolution = null;
+    const resolver = resolve || resolveChatGptConversationUrl;
+    try {
+        resolution = await resolver(page, reference.url);
+    } catch (error) {
+        resolution = { ok: false, error: error?.message || String(error) };
+    }
+    if (resolution?.ok && typeof resolution.url === 'string') {
+        targetUrl = resolution.url;
+    }
+
+    const alreadyThere = chatGptConversationIdFromPageUrl(page.url()) === reference.id;
+    if (!alreadyThere) {
+        await gotoWithCheck(page, targetUrl, { timeout });
+    }
+    await dismissStaleChatGptAuthDialog(page);
+    await waitForChatInput(page, { click: false, timeout });
+
+    const pageConversationId = chatGptConversationIdFromPageUrl(page.url());
+    if (pageConversationId !== reference.id) {
+        logger.warn('适配器', `拒绝在未验证的 composer 中输入：目标会话 ${reference.id}，浏览器实际位于 ${page.url()}`);
+        return {
+            ok: false,
+            error: 'conversation_navigation_mismatch',
+            conversationId: reference.id,
+            resolvedUrl: targetUrl,
+            actualUrl: page.url(),
+            resolutionError: resolution?.ok ? null : (resolution?.error || 'unavailable'),
+        };
+    }
+
+    return { ok: true, conversationId: reference.id, url: page.url(), resolvedUrl: targetUrl, projectId: resolution?.projectId || null };
 }
 
 /**

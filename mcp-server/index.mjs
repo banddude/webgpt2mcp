@@ -10,6 +10,12 @@ import path from 'path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+    parseConversationRef,
+    exactRefError,
+    parseProjectRef,
+    projectRefError,
+} from './conversation-refs.mjs';
 
 const API_URL = process.env.CHATGPT_API_URL || 'http://127.0.0.1:3000';
 const API_KEY = process.env.CHATGPT_API_KEY;
@@ -199,54 +205,9 @@ const server = new Server(
     { capabilities: { tools: {} } },
 );
 
-const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
-
-function parseConversationRef(value) {
-    const raw = typeof value === 'string' ? value.trim() : '';
-    if (!raw) return null;
-    if (CONVERSATION_ID_RE.test(raw)) {
-        return { id: raw.toLowerCase(), url: `https://chatgpt.com/c/${raw.toLowerCase()}` };
-    }
-    const match = raw.match(CONVERSATION_URL_RE);
-    if (!match) return null;
-    const id = match[1].toLowerCase();
-    return { id, url: `https://chatgpt.com/c/${id}` };
-}
-
-function exactRefError() {
-    return {
-        content: [{
-            type: 'text',
-            text: 'Error: conversation must be an exact ChatGPT conversation ID or an exact https://chatgpt.com/c/... URL. Titles, topics, and fuzzy names are not accepted for this operation.',
-        }],
-        isError: true,
-    };
-}
-
-// Verified live: ChatGPT web projects are "snorlax" gizmos with g-p-* ids,
-// surfaced as https://chatgpt.com/g/<g-p-id>[-slug] URLs.
-const PROJECT_ID_RE = /^g-p-[0-9a-z]+$/i;
-const PROJECT_URL_RE = /^https:\/\/chatgpt\.com\/g\/(g-p-[0-9a-z]+)/i;
-
-function parseProjectRef(value) {
-    const raw = typeof value === 'string' ? value.trim() : '';
-    if (!raw) return null;
-    if (PROJECT_ID_RE.test(raw)) return raw;
-    const match = raw.match(PROJECT_URL_RE);
-    if (match) return match[1];
-    return null;
-}
-
-function projectRefError() {
-    return {
-        content: [{
-            type: 'text',
-            text: 'Error: project must be an exact ChatGPT project ID (g-p-...) or an exact https://chatgpt.com/g/g-p-... URL. Project names are not accepted for this operation.',
-        }],
-        isError: true,
-    };
-}
+// Exact conversation/project reference parsing (including the project-scoped
+// /g/g-p-.../c/... conversation URL form) lives in a pure module shared with
+// the test suite.
 
 async function persistChatGptSession() {
     const response = await fetch(`${API_URL}/admin/chatgpt/session/persist`, {
@@ -421,7 +382,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             inputSchema: {
                 type: 'object',
                 properties: {
-                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID, exact https://chatgpt.com/c/... URL, or exact project-scoped https://chatgpt.com/g/g-p-.../c/... URL.' },
                 },
                 required: ['conversation'],
             },
@@ -444,7 +405,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             inputSchema: {
                 type: 'object',
                 properties: {
-                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID, exact https://chatgpt.com/c/... URL, or exact project-scoped https://chatgpt.com/g/g-p-.../c/... URL.' },
                     message: { type: 'string', description: 'Message to send to the exact conversation.' },
                     agent: { type: 'string', description: 'Optional project-routing agent key, such as dev or aiva.' },
                     project: { type: 'string', description: 'Optional exact project ID or project URL; use none to leave the conversation unmapped.' },
@@ -498,7 +459,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             inputSchema: {
                 type: 'object',
                 properties: {
-                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID, exact https://chatgpt.com/c/... URL, or exact project-scoped https://chatgpt.com/g/g-p-.../c/... URL.' },
                 },
                 required: ['conversation'],
             },
@@ -509,7 +470,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             inputSchema: {
                 type: 'object',
                 properties: {
-                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID, exact https://chatgpt.com/c/... URL, or exact project-scoped https://chatgpt.com/g/g-p-.../c/... URL.' },
                     confirm: { type: 'boolean', description: 'Must be true to confirm the destructive deletion.' },
                 },
                 required: ['conversation', 'confirm'],
@@ -521,7 +482,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             inputSchema: {
                 type: 'object',
                 properties: {
-                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID, exact https://chatgpt.com/c/... URL, or exact project-scoped https://chatgpt.com/g/g-p-.../c/... URL.' },
                     title: { type: 'string', description: 'New title for the conversation.' },
                 },
                 required: ['conversation', 'title'],
@@ -533,7 +494,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             inputSchema: {
                 type: 'object',
                 properties: {
-                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID, exact https://chatgpt.com/c/... URL, or exact project-scoped https://chatgpt.com/g/g-p-.../c/... URL.' },
                 },
                 required: ['conversation'],
             },
@@ -544,7 +505,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             inputSchema: {
                 type: 'object',
                 properties: {
-                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID, exact https://chatgpt.com/c/... URL, or exact project-scoped https://chatgpt.com/g/g-p-.../c/... URL.' },
                 },
                 required: ['conversation'],
             },
@@ -577,7 +538,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             inputSchema: {
                 type: 'object',
                 properties: {
-                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID or exact https://chatgpt.com/c/... URL.' },
+                    conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID, exact https://chatgpt.com/c/... URL, or exact project-scoped https://chatgpt.com/g/g-p-.../c/... URL.' },
                     project: { type: 'string', description: 'Exact project ID (g-p-...) or exact https://chatgpt.com/g/g-p-... URL to move into, or the literal string "none" to move the conversation out of any project.' },
                 },
                 required: ['conversation', 'project'],
