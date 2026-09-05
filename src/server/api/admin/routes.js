@@ -863,23 +863,14 @@ export function createAdminRouter(context) {
             // Read stream state with the same bearer-authenticated path the cloud conversation
             // listing uses. Cookie-only stream_status calls can return 429 and must never be
             // interpreted as "idle".
-            const readChatGptStreamState = async (page, convId) => page.evaluate(async (id) => {
-                try {
-                    let lastHttp = null;
-                    for (let attempt = 0; attempt < 3; attempt += 1) {
-                        const r = await fetch(`/backend-api/conversation/${id}/stream_status`, {
-                            credentials: 'include',
-                        });
-                        if (r.ok) return await r.json();
-                        lastHttp = r.status;
-                        if (r.status !== 429) break;
-                        await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
-                    }
-                    return { http: lastHttp };
-                } catch (e) {
-                    return { error: e.message };
-                }
-            }, convId);
+            const readChatGptStreamState = async (page, convId) => {
+                const result = await chatgptCloudRequest(page, {
+                    path: `/conversation/${convId}/stream_status`,
+                    retries: 2,
+                });
+                if (result?.ok) return result.data || {};
+                return { http: result?.http || null, error: result?.error || null };
+            };
 
             // A cloud conversation may be streaming while this Oracle browser tab is stale and
             // shows a normal Send button. In that state clicking Send merely appends a turn to
@@ -1035,37 +1026,28 @@ export function createAdminRouter(context) {
                 return { element, active };
             };
 
-            const readLatestCloudUserTurn = async (page, convId, retries = 3) => page.evaluate(async ({ id, retries }) => {
-                const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-                try {
-                    let lastHttp = null;
-                    for (let attempt = 0; attempt < retries; attempt += 1) {
-                        const res = await fetch(`/backend-api/conversation/${id}`, { credentials: 'include' });
-                        lastHttp = res.status;
-                        if (res.ok) {
-                            const data = await res.json();
-                            let latest = null;
-                            for (const node of Object.values(data.mapping || {})) {
-                                const msg = node?.message;
-                                if (!msg || msg.author?.role !== 'user' || !msg.content) continue;
-                                const type = msg.content.content_type;
-                                if (type !== 'text' && type !== 'multimodal_text') continue;
-                                const parts = Array.isArray(msg.content.parts) ? msg.content.parts : [];
-                                const text = parts.map(part => typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : '')).join('');
-                                if (!text.trim()) continue;
-                                const item = { id: msg.id || null, text, create_time: msg.create_time || 0 };
-                                if (!latest || item.create_time >= latest.create_time) latest = item;
-                            }
-                            return { latest, http: res.status };
-                        }
-                        if (res.status !== 429) break;
-                        await sleep(600 * (attempt + 1));
-                    }
-                    return { latest: null, http: lastHttp };
-                } catch (e) {
-                    return { latest: null, error: e.message };
+            const readLatestCloudUserTurn = async (page, convId, retries = 3) => {
+                const result = await chatgptCloudRequest(page, {
+                    path: `/conversation/${convId}`,
+                    retries: Math.max(0, retries - 1),
+                });
+                if (!result?.ok || !result.data) {
+                    return { latest: null, http: result?.http || null, error: result?.error || null };
                 }
-            }, { id: convId, retries });
+                let latest = null;
+                for (const node of Object.values(result.data.mapping || {})) {
+                    const msg = node?.message;
+                    if (!msg || msg.author?.role !== 'user' || !msg.content) continue;
+                    const type = msg.content.content_type;
+                    if (type !== 'text' && type !== 'multimodal_text') continue;
+                    const parts = Array.isArray(msg.content.parts) ? msg.content.parts : [];
+                    const text = parts.map(part => typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : '')).join('');
+                    if (!text.trim()) continue;
+                    const item = { id: msg.id || null, text, create_time: msg.create_time || 0 };
+                    if (!latest || item.create_time >= latest.create_time) latest = item;
+                }
+                return { latest, http: result.http, auth_mode: result.authMode || null };
+            };
 
             const waitForExactUserTurn = async (page, conversationUrl, prompt, countBefore, convId, cloudUserBefore, timeoutMs = 30000) => {
                 const userMessages = page.locator('[data-message-author-role="user"]');
@@ -1848,9 +1830,17 @@ export function createAdminRouter(context) {
 
                 const result = await page.evaluate(async ({ offset: o, limit: l, includeStatus, includeLastMessage }) => {
                     try {
+                        let headers = {};
+                        try {
+                            const sessionRes = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' });
+                            if (sessionRes.ok) {
+                                const session = await sessionRes.json();
+                                if (session?.accessToken) headers = { Authorization: `Bearer ${session.accessToken}` };
+                            }
+                        } catch { }
                         let res = null;
                         for (let attempt = 0; attempt < 4; attempt += 1) {
-                            res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { credentials: 'include' });
+                            res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { credentials: 'include', headers });
                             if (res.ok || res.status !== 429) break;
                             await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
                         }
@@ -1885,14 +1875,14 @@ export function createAdminRouter(context) {
                         await Promise.all(items.map(async item => {
                             if (includeStatus) {
                                 try {
-                                    const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${item.id}/stream_status`, { credentials: 'include' });
+                                    const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${item.id}/stream_status`, { credentials: 'include', headers });
                                     if (sr.ok) item.stream_status = (await sr.json())?.status || null;
                                     else item.stream_status = `HTTP_${sr.status}`;
                                 } catch { item.stream_status = null; }
                             }
                             if (includeLastMessage) {
                                 try {
-                                    const cr = await fetch(`https://chatgpt.com/backend-api/conversation/${item.id}`, { credentials: 'include' });
+                                    const cr = await fetch(`https://chatgpt.com/backend-api/conversation/${item.id}`, { credentials: 'include', headers });
                                     if (!cr.ok) return;
                                     const conv = await cr.json();
                                     const visible = Object.values(conv.mapping || {}).map(n => visibleMessage(n?.message)).filter(Boolean);
@@ -1941,13 +1931,21 @@ export function createAdminRouter(context) {
 
                 const result = await page.evaluate(async ({ query: q, cursor: c }) => {
                     try {
+                        let headers = {};
+                        try {
+                            const sessionRes = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' });
+                            if (sessionRes.ok) {
+                                const session = await sessionRes.json();
+                                if (session?.accessToken) headers = { Authorization: `Bearer ${session.accessToken}` };
+                            }
+                        } catch { }
                         const searchUrl = new URL('https://chatgpt.com/backend-api/conversations/search');
                         searchUrl.searchParams.set('query', q);
                         if (c) searchUrl.searchParams.set('cursor', c);
 
                         let res = null;
                         for (let attempt = 0; attempt < 4; attempt += 1) {
-                            res = await fetch(searchUrl.toString(), { credentials: 'include' });
+                            res = await fetch(searchUrl.toString(), { credentials: 'include', headers });
                             if (res.ok || res.status !== 429) break;
                             await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
                         }
@@ -2002,8 +2000,17 @@ export function createAdminRouter(context) {
                     try {
                         result = await attemptPage.evaluate(async (id) => {
                     try {
+                        let headers = {};
+                        try {
+                            const sessionRes = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' });
+                            if (sessionRes.ok) {
+                                const session = await sessionRes.json();
+                                if (session?.accessToken) headers = { Authorization: `Bearer ${session.accessToken}` };
+                            }
+                        } catch { }
                         const res = await fetch(`https://chatgpt.com/backend-api/conversation/${id}`, {
-                            credentials: 'include'
+                            credentials: 'include',
+                            headers,
                         });
                         if (!res.ok) return { error: `api failed: ${res.status}` };
                         const data = await res.json();
@@ -2039,7 +2046,7 @@ export function createAdminRouter(context) {
 
                         let stream_status = null;
                         try {
-                            const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${id}/stream_status`, { credentials: 'include' });
+                            const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${id}/stream_status`, { credentials: 'include', headers });
                             stream_status = sr.ok ? ((await sr.json())?.status || null) : `HTTP_${sr.status}`;
                         } catch { }
 
@@ -2731,7 +2738,15 @@ export function createAdminRouter(context) {
                                 if (page) {
                                     const fullResult = await page.evaluate(async (convId) => {
                                         try {
-                                            const r = await fetch(`https://chatgpt.com/backend-api/conversation/${convId}`, { credentials: 'include' });
+                                            let headers = {};
+                                            try {
+                                                const sessionRes = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' });
+                                                if (sessionRes.ok) {
+                                                    const session = await sessionRes.json();
+                                                    if (session?.accessToken) headers = { Authorization: `Bearer ${session.accessToken}` };
+                                                }
+                                            } catch { }
+                                            const r = await fetch(`https://chatgpt.com/backend-api/conversation/${convId}`, { credentials: 'include', headers });
                                             if (!r.ok) return null;
                                             const d = await r.json();
                                             const msgs = [];
