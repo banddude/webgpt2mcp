@@ -9,7 +9,8 @@
 		"start": "node supervisor.js",
 		"genkey": "node scripts/genkey.js",
 		"init": "node scripts/init.js",
-		"postinstall": "node scripts/postinstall.js"
+		"postinstall": "node scripts/postinstall.js",
+		"test": "node --test tests/*.test.mjs"
 	},
 	"imports": {
 		"#config": "./src/config/index.js",

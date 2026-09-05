@@ -12,6 +12,7 @@ This repository packages `maoulee/webgpt2mcp` with additional production hardeni
 - Streamable HTTP MCP gateway.
 - systemd templates with correct dependency/restart chaining.
 - Playwright storage-state import helper for moving an already-authenticated ChatGPT session to this browser profile.
+- Session health/recovery: explicit persisted storage-state backup, cookie restore, token-age status, once-per-outage AIVA alerting, and a one-command login handoff.
 
 ## Security model
 
@@ -56,6 +57,8 @@ Then:
 
 ## MCP tools
 
+- `status`: report logged-in/logged-out state plus access-token age/expiry metadata without exposing the token.
+- `login`: open the bridge browser directly on ChatGPT login; optionally wait up to 300 seconds for authentication.
 - `conversations_list`: list recent chats with exact IDs/URLs and status.
 - `conversation_read`: read one exact chat and include its current status.
 - `conversations_search`: search recent titles and return exact IDs/URLs; discovery only.
@@ -84,6 +87,10 @@ install -m 0755 scripts/chatgpt-web-cli ~/bin/chatgpt-web
 Examples:
 
 ```bash
+# Check or restore the browser session
+chatgpt-web status
+chatgpt-web login --wait-seconds 300
+
 # Discover chats
 chatgpt-web conversations-list --limit 10
 chatgpt-web conversations-search --query 'CI Dispatcher'
@@ -102,3 +109,12 @@ chatgpt-web create --message 'Start a new task.' --model gpt-instant
 ```
 
 The wrapper does not add routing behavior. It simply executes the generated CLI. The MCP itself enforces exact identifiers for specific-chat operations and fails closed on ambiguous targets.
+
+
+## ChatGPT session recovery
+
+Successful ChatGPT bridge calls persist a private Playwright storage-state backup under the ignored runtime `data/` directory. On later checks, the bridge first asks ChatGPT for a fresh `/api/auth/session` token; if the current browser context is missing it, the bridge restores only ChatGPT/OpenAI cookies from that private backup and retries. The access token itself is never written to logs, MCP responses, or repository files.
+
+If ChatGPT has genuinely logged the browser out, the bridge records the outage and calls `notify aiva` once for that outage. Repeated tool calls return a clear `CHATGPT_LOGIN_REQUIRED` error without spamming AIVA. A successful authentication clears the latch so a future distinct logout can alert once again.
+
+Use `chatgpt-web login --wait-seconds 300` to navigate the existing bridge browser directly to the login page and wait for sign-in. After Mike signs in once, `chatgpt-web status` should report `logged-in`, and the refreshed storage state is persisted for later browser restarts.
