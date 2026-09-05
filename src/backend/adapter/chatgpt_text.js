@@ -16,6 +16,13 @@ import {
     gotoWithCheck
 } from '../utils/index.js';
 import { logger } from '../../utils/logger.js';
+// Circular by design: the exact-send gate helpers import URL parsers back from
+// this module. Both sides only use hoisted function declarations, so the ESM
+// cycle resolves cleanly.
+import {
+    verifyChatGptComposerTarget,
+    waitForVerifiedComposerTarget,
+} from './chatgpt-exact-send.js';
 
 // --- 配置常量 ---
 const TARGET_URL = 'https://chatgpt.com/'; // 基础URL
@@ -723,12 +730,16 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             // navigation mismatch fails loudly and sends nothing: typing into
             // an unverified composer silently creates a brand-new chat
             // (issue #18).
-            const attached = await ensurePageOnExactConversation(page, conversationUrl);
+            const attached = await ensurePageOnExactConversation(page, conversationUrl, {
+                gateTimeoutMs: Number.isFinite(Number(meta?.gateTimeoutMs)) ? meta.gateTimeoutMs : undefined,
+            });
             if (!attached.ok) {
                 return {
                     error: attached.error === 'conversation_navigation_mismatch'
                         ? `conversation_navigation_mismatch: browser is on ${attached.actualUrl}`
-                        : `conversation attach failed: ${attached.error}`,
+                        : attached.error === 'conversation_url_resolution_failed'
+                            ? `conversation_url_resolution_failed: ${attached.resolutionError || 'cloud resolver unavailable'} (no URL was guessed; nothing was typed)`
+                            : `conversation attach failed: ${attached.error}`,
                     actual_url: attached.actualUrl || page.url(),
                 };
             }
@@ -1697,22 +1708,30 @@ export async function resolveChatGptConversationUrl(page, conversationReference)
 
 /**
  * Put the page on one exact conversation and prove the target chat is the one
- * on screen. Resolves the conversation's real URL first (project chats never
- * reliably answer the public /c/<id> URL), skips navigation when the page
- * already shows the target conversation ID, and hard-verifies the page URL
- * after the composer is ready. NEVER falls back to an unverified composer:
- * when the page cannot be positively attached to the target conversation this
- * fails loudly so the caller sends nothing at all. Typing a steering message
- * into whatever composer is open silently spawns a new chat (issue #18).
+ * on screen. Skips navigation when the page already PASSES the composer
+ * target gate (conversation id in the URL AND a rendered message thread —
+ * issue #18 round 2: a URL match alone can be a fresh new-chat composer).
+ * Otherwise resolves the conversation's real URL first (project chats never
+ * reliably answer the public /c/<id> URL); when the resolver fails this fails
+ * loudly with 'conversation_url_resolution_failed' — a guessed /c/<id> URL
+ * lands on the project landing page, whose composer silently creates a
+ * brand-new chat. NEVER falls back to an unverified composer: when the page
+ * cannot be positively attached to the target conversation this fails loudly
+ * so the caller sends nothing at all.
  */
-export async function ensurePageOnExactConversation(page, conversationReference, { timeout = 60000, resolve = null } = {}) {
+export async function ensurePageOnExactConversation(page, conversationReference, { timeout = 60000, resolve = null, verify = null, gateTimeoutMs = 5000 } = {}) {
     const reference = parseChatGptConversationReference(conversationReference);
     if (!reference) {
         return { ok: false, error: 'conversation_reference_invalid', actualUrl: page?.url?.() || null };
     }
+    const verifyTarget = verify || verifyChatGptComposerTarget;
 
-    // Resolve the real URL; on failure fall back to the canonical public URL.
-    let targetUrl = reference.url;
+    // Already provably on the target conversation: no resolver, no navigation.
+    const current = await verifyTarget(page, reference.id);
+    if (current.ok) {
+        return { ok: true, conversationId: reference.id, url: current.url, resolvedUrl: current.url, projectId: null, verifiedBy: 'already_on_target' };
+    }
+
     let resolution = null;
     const resolver = resolve || resolveChatGptConversationUrl;
     try {
@@ -1720,27 +1739,35 @@ export async function ensurePageOnExactConversation(page, conversationReference,
     } catch (error) {
         resolution = { ok: false, error: error?.message || String(error) };
     }
-    if (resolution?.ok && typeof resolution.url === 'string') {
-        targetUrl = resolution.url;
+    if (!resolution?.ok || typeof resolution.url !== 'string') {
+        const resolutionError = resolution?.error || 'resolver_failed';
+        logger.warn('适配器', `会话 URL 解析失败，拒绝猜测导航：目标会话 ${reference.id}，错误 ${resolutionError}，页面停留在 ${page.url()}`);
+        return {
+            ok: false,
+            error: 'conversation_url_resolution_failed',
+            conversationId: reference.id,
+            resolutionError,
+            resolutionHttp: resolution?.http || null,
+            actualUrl: page.url(),
+        };
     }
+    const targetUrl = resolution.url;
 
-    const alreadyThere = chatGptConversationIdFromPageUrl(page.url()) === reference.id;
-    if (!alreadyThere) {
-        await gotoWithCheck(page, targetUrl, { timeout });
-    }
+    await gotoWithCheck(page, targetUrl, { timeout });
     await dismissStaleChatGptAuthDialog(page);
     await waitForChatInput(page, { click: false, timeout });
 
-    const pageConversationId = chatGptConversationIdFromPageUrl(page.url());
-    if (pageConversationId !== reference.id) {
-        logger.warn('适配器', `拒绝在未验证的 composer 中输入：目标会话 ${reference.id}，浏览器实际位于 ${page.url()}`);
+    const gate = await waitForVerifiedComposerTarget(page, reference.id, { timeoutMs: gateTimeoutMs });
+    if (!gate.ok) {
+        logger.warn('适配器', `拒绝在未验证的 composer 中输入：目标会话 ${reference.id}（${gate.reason}），浏览器实际位于 ${page.url()}`);
         return {
             ok: false,
-            error: 'conversation_navigation_mismatch',
+            error: gate.reason === 'url_conversation_mismatch' || gate.reason === 'target_conversation_id_missing'
+                ? 'conversation_navigation_mismatch'
+                : 'conversation_thread_not_visible',
             conversationId: reference.id,
             resolvedUrl: targetUrl,
             actualUrl: page.url(),
-            resolutionError: resolution?.ok ? null : (resolution?.error || 'unavailable'),
         };
     }
 

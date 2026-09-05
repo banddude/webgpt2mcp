@@ -84,6 +84,11 @@ import {
     CHATGPT_SEND_BUTTON_SELECTOR,
     CHATGPT_STOP_BUTTON_SELECTOR
 } from '../../../backend/adapter/chatgpt_text.js';
+import {
+    navigateExactChatVerified,
+    readStrayConversationAfterSubmit,
+    waitForVerifiedComposerTarget,
+} from '../../../backend/adapter/chatgpt-exact-send.js';
 import { getBackend } from '../../../backend/index.js';
 import { gotoWithCheck, waitForInput } from '../../../backend/utils/page.js';
 import { safeClick, humanType } from '../../../backend/engine/utils.js';
@@ -812,103 +817,67 @@ export function createAdminRouter(context) {
                 return match ? match[1].toLowerCase() : null;
             };
 
-            const projectIdPattern = /^g-p-[0-9a-z]+$/i;
-            const configuredProjectIds = () => {
-                const routing = config?.projects && typeof config.projects === 'object'
-                    ? config.projects
-                    : {};
-                const byAgent = routing.byAgent || routing.by_agent || {};
-                return [...new Set([
-                    routing.default,
-                    routing.defaultProject,
-                    ...Object.values(byAgent)
-                ].filter(value => typeof value === 'string' && projectIdPattern.test(value.trim()))
-                    .map(value => value.trim().toLowerCase()))];
-            };
-
-            const navigationCandidates = (conversationUrl) => {
-                const normalized = normalizeChatUrl(conversationUrl);
-                const match = normalized.match(/^https:\/\/chatgpt\.com\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
-                if (!match) return [conversationUrl];
-                const conversationId = match[1].toLowerCase();
-                return [
-                    conversationUrl,
-                    ...configuredProjectIds().map(projectId =>
-                        `https://chatgpt.com/g/${projectId}/c/${conversationId}`)
-                ];
-            };
+            // The legacy URL-guessing candidate list (/c/<id> plus configured
+            // project ids) was removed for issue #18 round 2: when the cloud
+            // resolver cannot say where a conversation lives, guessing a URL
+            // landed the browser on a project landing page whose composer
+            // silently created a brand-new chat. Resolution now either
+            // succeeds or navigation refuses.
 
             // Cloud resolution of where a conversation actually lives, cached
-            // briefly because one dispatch navigates more than once. When the
-            // resolution itself fails, return null so navigation falls back to
-            // the legacy candidate list instead of guessing.
+            // briefly because one dispatch navigates more than once. A
+            // resolution failure is RETURNED as a failure: navigation never
+            // guesses a URL to type into (issue #18 round 2 — a guessed /c/<id>
+            // for a project conversation lands on the project landing page,
+            // whose composer silently creates a brand-new chat).
             const conversationUrlResolutions = new Map();
             const conversationUrlResolutionTtlMs = 60 * 1000;
             const resolveConversationTargetUrl = async (page, conversationUrl) => {
                 const reference = parseChatGptConversationReference(conversationUrl);
-                if (!reference) return null;
+                if (!reference) return { ok: false, error: 'conversation_reference_invalid' };
                 const cached = conversationUrlResolutions.get(reference.id);
-                if (cached && cached.expires > Date.now()) return cached.url;
-                const resolved = await resolveChatGptConversationUrl(page, reference.url).catch(() => null);
-                if (!resolved?.ok || typeof resolved.url !== 'string') return null;
+                if (cached && cached.expires > Date.now()) return { ok: true, url: cached.url, cached: true };
+                const resolved = await resolveChatGptConversationUrl(page, reference.url)
+                    .catch(error => ({ ok: false, error: error?.message || String(error) }));
+                if (!resolved?.ok || typeof resolved.url !== 'string') {
+                    logger.info('Admin', `Conversation URL resolution failed for ${reference.id}: ${resolved?.error || 'unknown'}${resolved?.http ? ` (HTTP ${resolved.http})` : ''}`);
+                    return { ok: false, error: resolved?.error || 'resolver_failed', http: resolved?.http || null };
+                }
                 conversationUrlResolutions.set(reference.id, { url: resolved.url, expires: Date.now() + conversationUrlResolutionTtlMs });
-                return resolved.url;
+                return { ok: true, url: resolved.url };
             };
 
             // Use the same navigation and composer-wait helpers as the normal ChatGPT
             // adapter. Steering should not maintain a second browser-navigation stack.
+            // The policy itself lives in chatgpt-exact-send.js and is unit-tested
+            // there: an already-verified page needs no navigation; a resolver
+            // failure is a loud refusal with no URL guessing; success requires
+            // the target conversation id in the URL AND a rendered message
+            // thread (a fresh composer under the target URL is NOT the target).
             const navigateExactChat = async (page, conversationUrl) => {
-                const targetUrl = normalizeChatUrl(conversationUrl);
-                // A conversation filed in a project is served under
-                // /g/<projectId>/c/<id> and chatgpt.com does not reliably
-                // redirect the public /c/<id> URL there (issue #18), so ask the
-                // cloud API where this conversation actually lives and try the
-                // real URL first.
-                const resolvedUrl = await resolveConversationTargetUrl(page, conversationUrl);
-                const candidates = resolvedUrl
-                    ? [resolvedUrl, ...navigationCandidates(conversationUrl).filter(candidate => normalizeChatUrl(candidate) !== normalizeChatUrl(resolvedUrl))]
-                    : navigationCandidates(conversationUrl);
-                const targetConversationId = conversationIdFromPageUrl(targetUrl);
-                let lastError = null;
-
-                for (let attempt = 1; attempt <= 2; attempt += 1) {
-                    for (const candidate of candidates) {
-                        try {
-                            // Every candidate is one URL form of the SAME
-                            // conversation, so compare by conversation ID: a
-                            // page already showing the target chat under its
-                            // project-scoped URL needs no navigation at all.
-                            const pageOnTarget = Boolean(targetConversationId) &&
-                                conversationIdFromPageUrl(page.url()) === targetConversationId;
-                            if (!pageOnTarget ||
-                                (candidate !== conversationUrl && page.url() !== candidate)) {
-                                await gotoWithCheck(page, candidate, { timeout: 60000 });
-                            }
-                            await dismissStaleChatGptAuthDialog(page);
-                            await waitForChatInput(page, { click: false, timeout: 60000 });
-                            if (normalizeChatUrl(page.url()) === targetUrl) {
-                                return { ok: true, ready: true, actualUrl: page.url() };
-                            }
-                            lastError = new Error(`conversation_navigation_mismatch:${page.url()}`);
-                        } catch (err) {
-                            lastError = err;
-                        }
-                    }
-
-                    if (attempt < 2) {
-                        await page.waitForTimeout(1250).catch(() => {});
-                    }
+                const nav = await navigateExactChatVerified(page, conversationUrl, {
+                    resolve: resolveConversationTargetUrl,
+                    goto: (p, url) => gotoWithCheck(p, url, { timeout: 60000 }),
+                    dismissDialog: dismissStaleChatGptAuthDialog,
+                    waitForComposer: p => waitForChatInput(p, { click: false, timeout: 60000 }),
+                    logger: {
+                        info: message => logger.info('Admin', `Exact chat navigation: ${message}`),
+                        warn: message => logger.warn('Admin', `Exact chat navigation: ${message}`),
+                    },
+                });
+                if (!nav.ok && nav.error === 'conversation_navigation_mismatch') {
+                    nav.ready = Boolean(await findChatInput(page).catch(() => null));
                 }
-
-                const ready = Boolean(await findChatInput(page));
-                return {
-                    ok: false,
-                    ready,
-                    lastError,
-                    error: normalizeChatUrl(page.url()) === targetUrl ? 'composer_unavailable' : 'conversation_navigation_mismatch',
-                    actualUrl: page.url(),
-                };
+                return nav;
             };
+
+            // Map a navigateExactChat failure onto the API error codes,
+            // surfacing resolver failures distinctly from mismatches.
+            const navigateExactChatError = nav => (
+                nav.error === 'conversation_url_resolution_failed' || nav.error === 'conversation_reference_invalid'
+                    ? nav.error
+                    : (nav.ready === false ? 'composer_unavailable' : 'conversation_navigation_mismatch')
+            );
 
             // Read stream state with the same bearer-authenticated path the cloud conversation
             // listing uses. Cookie-only stream_status calls can return 429 and must never be
@@ -1203,8 +1172,10 @@ export function createAdminRouter(context) {
                 if (!nav.ok) {
                     return {
                         ok: false,
-                        error: nav.ready === false ? 'composer_unavailable' : 'conversation_navigation_mismatch',
+                        error: navigateExactChatError(nav),
                         actual_url: nav.actualUrl || page.url(),
+                        ...(nav.resolutionError ? { resolution_error: nav.resolutionError } : {}),
+                        ...(nav.resolutionHttp ? { resolution_http: nav.resolutionHttp } : {}),
                     };
                 }
 
@@ -1217,6 +1188,23 @@ export function createAdminRouter(context) {
                 // pre-Stop ElementHandle.
                 const composer = await focusChatGptInput(page, { timeout: 15000 });
 
+                // PRE-TYPE GATE (issue #18 round 2), immediately before any
+                // keystroke: prove the focused composer belongs to the target
+                // conversation. The URL alone is not proof — the live UI
+                // hydrated a fresh new-chat composer under the target URL while
+                // the resolver was 429ing, and the submit created a stray chat.
+                const preType = await waitForVerifiedComposerTarget(page, convId, { timeoutMs: 5000 });
+                logger.info('Admin', `Pre-type gate for ${convId}: ok=${preType.ok}${preType.reason ? ` reason=${preType.reason}` : ''} url=${preType.url} conversationId=${preType.conversationId} threadMessages=${preType.threadMessages}`);
+                if (!preType.ok) {
+                    logger.warn('Admin', `Refusing to type into composer for ${convId}: pre-type gate failed (${preType.reason}); page is at ${page.url()}`);
+                    return {
+                        ok: false,
+                        error: 'pretype_composer_verification_failed',
+                        reason: preType.reason,
+                        actual_url: page.url(),
+                    };
+                }
+
                 // Ensure a short steering prompt does not append to any text ChatGPT preserved
                 // across the Stop rerender. humanType itself performs this clear for long text;
                 // do it explicitly here so short and long prompts have the same semantics.
@@ -1227,6 +1215,7 @@ export function createAdminRouter(context) {
                 await page.keyboard.press('Backspace');
                 await page.waitForTimeout(100);
                 await humanType(page, composer, prompt);
+                logger.info('Admin', `Typed exact turn for ${convId} (composer verified at ${preType.url}); submitting`);
 
                 const freshComposer = await waitForChatInput(page, { click: false, timeout: 60000 });
                 const composerText = (await readChatInputText(freshComposer)).trim();
@@ -1244,9 +1233,26 @@ export function createAdminRouter(context) {
                 if (!submission.ok) {
                     return { ok: false, error: submission.error || 'send_button_unavailable' };
                 }
+                logger.info('Admin', `Submitted exact turn for ${convId}; url after submit: ${page.url()}`);
 
                 const accepted = await waitForExactUserTurn(page, conversationUrl, prompt, userCountBefore, convId, cloudUserBefore);
                 if (!accepted.accepted) {
+                    if (accepted.error === 'conversation_navigation_mismatch') {
+                        // The submit left the target conversation: ChatGPT
+                        // created a chat of its own (issue #18 round 2). The
+                        // turn WAS submitted, so report submitted: true with
+                        // the actual URL and the stray conversation id instead
+                        // of a bare mismatch that hides the stray chat.
+                        const stray = await readStrayConversationAfterSubmit(page, convId, { settleMs: 6000 });
+                        logger.warn('Admin', `Exact turn for ${convId} landed OUTSIDE the target conversation: url=${stray.url} stray=${stray.isStray} strayConversationId=${stray.conversationId || 'none'}`);
+                        return {
+                            ok: false,
+                            submitted: true,
+                            error: 'conversation_navigation_mismatch',
+                            actual_url: stray.url,
+                            ...(stray.conversationId && stray.conversationId !== convId ? { stray_conversation_id: stray.conversationId } : {}),
+                        };
+                    }
                     return { ok: false, error: accepted.error || 'exact_user_turn_not_confirmed', last_user_text: accepted.lastText, actual_url: accepted.actual_url || page.url() };
                 }
 
@@ -1463,7 +1469,9 @@ export function createAdminRouter(context) {
                     if (!nav.ok) {
                         sendJson(res, 503, {
                             success: false,
-                            error: nav.ready === false ? 'composer_unavailable' : 'conversation_navigation_mismatch',
+                            error: navigateExactChatError(nav),
+                            ...(nav.resolutionError ? { resolution_error: nav.resolutionError } : {}),
+                            ...(nav.resolutionHttp ? { resolution_http: nav.resolutionHttp } : {}),
                             actual_url: nav.actualUrl || page.url(),
                             conversation_url: conversationUrl,
                         });
@@ -1567,7 +1575,9 @@ export function createAdminRouter(context) {
                     sendJson(res, 503, {
                         success: false,
                         active: false,
-                        error: nav.ready === false ? 'composer_unavailable' : 'conversation_navigation_mismatch',
+                        error: navigateExactChatError(nav),
+                        ...(nav.resolutionError ? { resolution_error: nav.resolutionError } : {}),
+                        ...(nav.resolutionHttp ? { resolution_http: nav.resolutionHttp } : {}),
                         actual_url: nav.actualUrl || page.url(),
                     });
                     return;
@@ -1734,7 +1744,9 @@ export function createAdminRouter(context) {
                                     success: false,
                                     submitted: false,
                                     detached: false,
-                                    error: nav.ready === false ? 'composer_unavailable' : 'conversation_navigation_mismatch',
+                                    error: navigateExactChatError(nav),
+                            ...(nav.resolutionError ? { resolution_error: nav.resolutionError } : {}),
+                            ...(nav.resolutionHttp ? { resolution_http: nav.resolutionHttp } : {}),
                                     actual_url: nav.actualUrl || page.url(),
                                     conversation_url: conversationUrl,
                                 });
@@ -2211,7 +2223,7 @@ export function createAdminRouter(context) {
             // fuzzy references are rejected: every mutating operation in this
             // family must target exactly one known conversation.
             const parseExactConversationRef = (value) => {
-                const reference = parseChatGPTConversationReference(value);
+                const reference = parseChatGptConversationReference(value);
                 if (!reference) return null;
                 return { id: reference.id, url: reference.url };
             };
