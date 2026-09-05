@@ -171,6 +171,54 @@ export async function focusChatGptInput(page, options = {}) {
     throw lastError || new Error('ChatGPT composer could not be focused');
 }
 
+export async function readCurrentChatGptDomTranscript(page, conversationId) {
+    const id = String(conversationId || '').toLowerCase();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) return null;
+    const currentMatch = String(page?.url?.() || '').match(/\/c\/([0-9a-f-]{36})/i);
+    if (!currentMatch || currentMatch[1].toLowerCase() !== id) return null;
+
+    return page.evaluate((targetId) => {
+        const isVisible = element => {
+            if (!(element instanceof Element)) return false;
+            const style = window.getComputedStyle(element);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        };
+        const messages = [];
+        const nodes = document.querySelectorAll('[data-message-author-role="user"], [data-message-author-role="assistant"]');
+        for (const node of nodes) {
+            if (!isVisible(node)) continue;
+            const role = node.getAttribute('data-message-author-role');
+            const text = String(node.innerText || node.textContent || '').trim();
+            if (!text) continue;
+            messages.push({
+                id: node.getAttribute('data-message-id') || null,
+                role,
+                text,
+                model: null,
+                create_time: null,
+            });
+        }
+        const stopCandidates = document.querySelectorAll('[data-testid="stop-button"], button[aria-label^="Stop"]');
+        const streaming = Array.from(stopCandidates).some(isVisible);
+        const hasAssistant = messages.some(message => message.role === 'assistant');
+        const rawTitle = String(document.title || '').trim();
+        const title = rawTitle.replace(/\s*[|\-]\s*ChatGPT\s*$/i, '').trim() || null;
+        return {
+            id: targetId,
+            title,
+            create_time: null,
+            update_time: null,
+            is_archived: false,
+            project_id: null,
+            stream_status: streaming ? 'IS_STREAMING' : (hasAssistant ? 'COMPLETE' : null),
+            messages,
+            read_source: 'recent-dispatch-dom',
+        };
+    }, id).catch(() => null);
+}
+
 export async function readChatInputText(locator) {
     if (!locator) return '';
     return locator.evaluate((element) => {

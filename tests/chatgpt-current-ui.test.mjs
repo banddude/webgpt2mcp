@@ -6,6 +6,7 @@ import {
     CHATGPT_SEND_BUTTON_SELECTORS,
     findChatInput,
     focusChatGptInput,
+    readCurrentChatGptDomTranscript,
     findChatGptSendButton,
     isChatGptSendControlVisibilityRace,
     chatgptCloudRequest,
@@ -71,6 +72,26 @@ test('composer focus reacquires after a rerender instead of pinning an ElementHa
     const focused = await focusChatGptInput(page, { timeout: 1000 });
     assert.equal(focused, fresh);
     assert.equal(waits, 1);
+});
+
+test('recent-dispatch DOM transcript is gated to the exact current conversation', async () => {
+    let evaluations = 0;
+    const payload = {
+        id: '12345678-1234-1234-1234-1234567890ab',
+        messages: [{ role: 'user', text: 'hello' }],
+        read_source: 'recent-dispatch-dom',
+    };
+    const page = {
+        url() { return 'https://chatgpt.com/c/12345678-1234-1234-1234-1234567890ab'; },
+        async evaluate(_fn, id) { evaluations += 1; assert.equal(id, payload.id); return payload; },
+    };
+    const matched = await readCurrentChatGptDomTranscript(page, payload.id);
+    assert.deepEqual(matched, payload);
+    assert.equal(evaluations, 1);
+
+    const wrong = await readCurrentChatGptDomTranscript(page, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+    assert.equal(wrong, null);
+    assert.equal(evaluations, 1);
 });
 
 test('send control selection skips hidden duplicate buttons', async () => {
