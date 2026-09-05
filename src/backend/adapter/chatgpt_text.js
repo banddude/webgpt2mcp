@@ -57,6 +57,20 @@ export async function findChatInput(page) {
     return null;
 }
 
+export async function findChatGptSendButton(page, { requireEnabled = true } = {}) {
+    for (const selector of CHATGPT_SEND_BUTTON_SELECTORS) {
+        const matches = page.locator(selector);
+        const count = await matches.count().catch(() => 0);
+        for (let index = 0; index < count; index += 1) {
+            const candidate = matches.nth(index);
+            if (!await candidate.isVisible().catch(() => false)) continue;
+            if (requireEnabled && !await candidate.isEnabled().catch(() => false)) continue;
+            return candidate;
+        }
+    }
+    return null;
+}
+
 export async function dismissStaleChatGptAuthDialog(page) {
     const dialog = page.locator('#mobile-auth-dialog').first();
     const present = await dialog.isVisible().catch(() => false);
@@ -789,10 +803,8 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
             const stopButton = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first();
             const stopVisible = await stopButton.isVisible().catch(() => false);
             if (stopVisible) {
-                const sendButton = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first();
-                const sendVisible = await sendButton.isVisible().catch(() => false);
-                const sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
-                if (sendEnabled) {
+                const sendButton = await findChatGptSendButton(page);
+                if (sendButton) {
                     activeSteerMode = 'native';
                     logger.info('适配器', '检测到正在生成的会话；使用 ChatGPT 原生中途 steer 提交新指令', meta);
                 } else {
@@ -1016,10 +1028,8 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         logger.debug('适配器', activeSteerMode ? `发送 steer 提示词 (${activeSteerMode})...` : '发送提示词...', meta);
         const startTimeSend = Date.now();
         if (activeSteerMode === 'native') {
-            const steerSendButton = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first();
-            const canClickSteer = await steerSendButton.isVisible().catch(() => false) &&
-                await steerSendButton.isEnabled().catch(() => false);
-            if (canClickSteer) {
+            const steerSendButton = await findChatGptSendButton(page);
+            if (steerSendButton) {
                 await safeClick(page, steerSendButton, { bias: 'button' });
             } else {
                 // The control can rerender between typing and submission. Fall back to

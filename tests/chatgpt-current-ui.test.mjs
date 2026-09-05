@@ -5,6 +5,7 @@ import {
     CHATGPT_INPUT_SELECTORS,
     CHATGPT_SEND_BUTTON_SELECTORS,
     findChatInput,
+    findChatGptSendButton,
     chatgptCloudRequest,
     deleteChatGptConversation,
     dismissStaleChatGptAuthDialog,
@@ -34,6 +35,21 @@ test('composer compatibility includes the current ChatGPT textarea and semantic 
     const found = await findChatInput(page);
     assert.equal(found, current);
     assert.ok(seen.includes('#mobile-composer-prompt'));
+});
+
+test('send control selection skips hidden duplicate buttons', async () => {
+    const hidden = { isVisible: async () => false, isEnabled: async () => true, marker: 'hidden' };
+    const visible = { isVisible: async () => true, isEnabled: async () => true, marker: 'visible' };
+    const page = {
+        locator(selector) {
+            if (selector === '[data-testid="send-button"]') {
+                return { count: async () => 2, nth: index => index === 0 ? hidden : visible };
+            }
+            return { count: async () => 0, nth: () => null };
+        },
+    };
+    const found = await findChatGptSendButton(page);
+    assert.equal(found, visible);
 });
 
 test('cloud management requests use bearer plus cookies when accessToken is available', async () => {
