@@ -27,6 +27,7 @@ export const CHATGPT_INPUT_SELECTORS = [
     '[contenteditable="true"][data-placeholder*="Ask ChatGPT"]',
     '[contenteditable="true"][aria-label*="Ask ChatGPT"]',
     '.ProseMirror[contenteditable="true"]',
+    '.ProseMirror',
     '[contenteditable="true"][role="textbox"]',
     '#mobile-composer-prompt',
     'textarea[aria-label="Chat with ChatGPT"]',
@@ -54,6 +55,42 @@ export async function findChatInput(page) {
         if (await locator.isVisible().catch(() => false)) return locator;
     }
     return null;
+}
+
+export async function dismissStaleChatGptAuthDialog(page) {
+    const dialog = page.locator('#mobile-auth-dialog').first();
+    const present = await dialog.isVisible().catch(() => false);
+    if (!present) return { present: false, dismissed: false, authenticated: null };
+
+    const authenticated = await page.evaluate(async () => {
+        try {
+            const response = await fetch('/backend-api/me', {
+                credentials: 'include',
+                cache: 'no-store',
+            });
+            return response.ok;
+        } catch {
+            return false;
+        }
+    }).catch(() => false);
+
+    if (!authenticated) {
+        return { present: true, dismissed: false, authenticated: false };
+    }
+
+    // The current ChatGPT UI can leave its mobile auth dialog mounted over an
+    // otherwise cookie-authenticated desktop session. Escape follows the dialog's
+    // normal cancel path so React updates its own state instead of us mutating DOM.
+    await page.keyboard.press('Escape').catch(() => {});
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+        if (!await dialog.isVisible().catch(() => false)) {
+            return { present: true, dismissed: true, authenticated: true, method: 'escape' };
+        }
+        await page.waitForTimeout(100);
+    }
+
+    return { present: true, dismissed: false, authenticated: true, method: 'escape' };
 }
 
 export async function waitForChatInput(page, options = {}) {

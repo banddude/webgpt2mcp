@@ -72,6 +72,7 @@ import {
     findChatInput,
     waitForChatInput,
     readChatInputText,
+    dismissStaleChatGptAuthDialog,
     CHATGPT_SEND_BUTTON_SELECTOR,
     CHATGPT_STOP_BUTTON_SELECTOR
 } from '../../../backend/adapter/chatgpt_text.js';
@@ -832,6 +833,7 @@ export function createAdminRouter(context) {
                                 (candidate !== conversationUrl && page.url() !== candidate)) {
                                 await gotoWithCheck(page, candidate, { timeout: 60000 });
                             }
+                            await dismissStaleChatGptAuthDialog(page);
                             await waitForChatInput(page, { click: false, timeout: 60000 });
                             if (normalizeChatUrl(page.url()) === targetUrl) {
                                 return { ok: true, ready: true, actualUrl: page.url() };
@@ -1247,6 +1249,7 @@ export function createAdminRouter(context) {
                 if (conversationIdFromPageUrl(page.url())) {
                     return { ok: false, error: 'new_chat_navigation_mismatch', actualUrl: page.url() };
                 }
+                await dismissStaleChatGptAuthDialog(page);
                 await waitForChatInput(page, { click: false, timeout: 60000 });
                 return { ok: true, actualUrl: page.url() };
             };
