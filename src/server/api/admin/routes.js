@@ -72,6 +72,7 @@ import {
     chatGptReadRetryDelayMs,
     selectChatGptModel,
     findChatInput,
+    focusChatGptInput,
     findChatGptSendButton,
     isChatGptSendControlVisibilityRace,
     waitForChatInput,
@@ -1169,8 +1170,7 @@ export function createAdminRouter(context) {
                 // Reacquire the post-Stop composer and use the exact same click/type machinery
                 // as the normal ChatGPT adapter. Stop can rerender this node, so never reuse a
                 // pre-Stop ElementHandle.
-                const composer = await waitForChatInput(page, { click: false, timeout: 60000 });
-                                await safeClick(page, composer, { bias: 'input', timeout: 15000 });
+                const composer = await focusChatGptInput(page, { timeout: 15000 });
 
                 // Ensure a short steering prompt does not append to any text ChatGPT preserved
                 // across the Stop rerender. humanType itself performs this clear for long text;
@@ -1281,8 +1281,7 @@ export function createAdminRouter(context) {
 
                     const userMessages = page.locator('[data-message-author-role="user"]');
                     const userCountBefore = await userMessages.count().catch(() => 0);
-                    const composer = await waitForChatInput(page, { click: false, timeout: 60000 });
-                                        await safeClick(page, composer, { bias: 'input', timeout: 15000 });
+                    const composer = await focusChatGptInput(page, { timeout: 15000 });
 
                     const modifierKey = process.platform === 'darwin' ? 'Meta' : 'Control';
                     await page.keyboard.down(modifierKey);

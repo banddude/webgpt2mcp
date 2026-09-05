@@ -5,6 +5,7 @@ import {
     CHATGPT_INPUT_SELECTORS,
     CHATGPT_SEND_BUTTON_SELECTORS,
     findChatInput,
+    focusChatGptInput,
     findChatGptSendButton,
     isChatGptSendControlVisibilityRace,
     chatgptCloudRequest,
@@ -38,6 +39,38 @@ test('composer compatibility includes the current ChatGPT textarea and semantic 
     const found = await findChatInput(page);
     assert.equal(found, current);
     assert.ok(seen.includes('#mobile-composer-prompt'));
+});
+
+test('composer focus reacquires after a rerender instead of pinning an ElementHandle', async () => {
+    let generation = 0;
+    let waits = 0;
+    const stale = {
+        async isVisible() { return true; },
+        async focus() {
+            generation = 1;
+            throw new Error('Element is not attached to the DOM');
+        },
+    };
+    const fresh = {
+        async isVisible() { return true; },
+        async focus() {},
+        marker: 'fresh-composer',
+    };
+    const page = {
+        locator(selector) {
+            return {
+                first() {
+                    if (selector === '#prompt-textarea') return generation === 0 ? stale : fresh;
+                    return { isVisible: async () => false };
+                },
+            };
+        },
+        async waitForTimeout() { waits += 1; },
+    };
+
+    const focused = await focusChatGptInput(page, { timeout: 1000 });
+    assert.equal(focused, fresh);
+    assert.equal(waits, 1);
 });
 
 test('send control selection skips hidden duplicate buttons', async () => {
