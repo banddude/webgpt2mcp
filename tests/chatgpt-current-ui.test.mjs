@@ -64,31 +64,26 @@ test('cloud management requests use browser cookies without requiring a bearer t
 });
 
 
-test('authenticated stale mobile auth dialog is dismissed through its normal Escape path', async () => {
+test('authenticated stale mobile auth dialog rehydrates the worker page before typing', async () => {
     let visible = true;
+    let reloadCount = 0;
     let escapeCount = 0;
-    const dialog = {
-        async isVisible() { return visible; },
-    };
+    const dialog = { async isVisible() { return visible; } };
     const page = {
         locator(selector) {
             assert.equal(selector, '#mobile-auth-dialog');
             return { first: () => dialog };
         },
         async evaluate() { return true; },
-        keyboard: {
-            async press(key) {
-                assert.equal(key, 'Escape');
-                escapeCount += 1;
-                visible = false;
-            },
-        },
+        async reload() { reloadCount += 1; visible = false; },
+        keyboard: { async press() { escapeCount += 1; } },
         async waitForTimeout() {},
     };
 
     const result = await dismissStaleChatGptAuthDialog(page);
-    assert.deepEqual(result, { present: true, dismissed: true, authenticated: true, method: 'escape' });
-    assert.equal(escapeCount, 1);
+    assert.deepEqual(result, { present: true, dismissed: true, authenticated: true, method: 'reload' });
+    assert.equal(reloadCount, 1);
+    assert.equal(escapeCount, 0);
 });
 
 test('auth dialog is never dismissed when backend cookie authentication is absent', async () => {

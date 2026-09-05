@@ -78,19 +78,30 @@ export async function dismissStaleChatGptAuthDialog(page) {
         return { present: true, dismissed: false, authenticated: false };
     }
 
-    // The current ChatGPT UI can leave its mobile auth dialog mounted over an
-    // otherwise cookie-authenticated desktop session. Escape follows the dialog's
-    // normal cancel path so React updates its own state instead of us mutating DOM.
+    // The current ChatGPT UI can leave a worker tab's React tree in a logged-out
+    // mobile state even after the shared browser context has valid authenticated
+    // cookies. Reload the same page first so the app rehydrates from those cookies.
+    // This preserves the current conversation URL and does not create a new context.
+    try {
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForTimeout(750);
+    } catch { }
+
+    if (!await dialog.isVisible().catch(() => false)) {
+        return { present: true, dismissed: true, authenticated: true, method: 'reload' };
+    }
+
+    // If ChatGPT kept the stale dialog after rehydration, use its normal cancel path.
     await page.keyboard.press('Escape').catch(() => {});
     const deadline = Date.now() + 3000;
     while (Date.now() < deadline) {
         if (!await dialog.isVisible().catch(() => false)) {
-            return { present: true, dismissed: true, authenticated: true, method: 'escape' };
+            return { present: true, dismissed: true, authenticated: true, method: 'reload+escape' };
         }
         await page.waitForTimeout(100);
     }
 
-    return { present: true, dismissed: false, authenticated: true, method: 'escape' };
+    return { present: true, dismissed: false, authenticated: true, method: 'reload+escape' };
 }
 
 export async function waitForChatInput(page, options = {}) {
