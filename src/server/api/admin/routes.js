@@ -1006,6 +1006,32 @@ export function createAdminRouter(context) {
                 .replace(/\s+/g, ' ')
                 .trim();
 
+            const describeChatInput = async (page, locator) => {
+                const element = await locator.evaluate((el) => ({
+                    tag: el.tagName,
+                    id: el.id || null,
+                    className: typeof el.className === 'string' ? el.className.slice(0, 160) : null,
+                    placeholder: el.getAttribute('placeholder'),
+                    ariaLabel: el.getAttribute('aria-label'),
+                    role: el.getAttribute('role'),
+                    contenteditable: el.getAttribute('contenteditable'),
+                    disabled: !!el.disabled,
+                    readOnly: !!el.readOnly,
+                    valueLength: typeof el.value === 'string' ? el.value.length : null,
+                    textLength: typeof el.innerText === 'string' ? el.innerText.length : null,
+                })).catch(() => null);
+                const active = await page.evaluate(() => {
+                    const el = document.activeElement;
+                    return el ? {
+                        tag: el.tagName,
+                        id: el.id || null,
+                        ariaLabel: el.getAttribute?.('aria-label') || null,
+                        placeholder: el.getAttribute?.('placeholder') || null,
+                    } : null;
+                }).catch(() => null);
+                return { element, active };
+            };
+
             const readLatestCloudUserTurn = async (page, convId, retries = 3) => page.evaluate(async ({ id, retries }) => {
                 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
                 try {
@@ -1146,7 +1172,13 @@ export function createAdminRouter(context) {
                 const freshComposer = await waitForChatInput(page, { click: false, timeout: 60000 });
                 const composerText = (await readChatInputText(freshComposer)).trim();
                 if (normalizeVisibleText(composerText) !== normalizeVisibleText(prompt)) {
-                    return { ok: false, error: 'composer_text_mismatch' };
+                    return {
+                        ok: false,
+                        error: 'composer_text_mismatch',
+                        expected_length: prompt.length,
+                        actual_length: composerText.length,
+                        composer_diagnostic: await describeChatInput(page, freshComposer),
+                    };
                 }
 
                 const sendButton = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first();
@@ -1252,7 +1284,13 @@ export function createAdminRouter(context) {
                     const freshComposer = await waitForChatInput(page, { click: false, timeout: 60000 });
                     const composerText = (await readChatInputText(freshComposer)).trim();
                     if (normalizeVisibleText(composerText) !== normalizeVisibleText(prompt)) {
-                        return { ok: false, error: 'composer_text_mismatch' };
+                        return {
+                        ok: false,
+                        error: 'composer_text_mismatch',
+                        expected_length: prompt.length,
+                        actual_length: composerText.length,
+                        composer_diagnostic: await describeChatInput(page, freshComposer),
+                    };
                     }
 
                     const sendButton = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first();
