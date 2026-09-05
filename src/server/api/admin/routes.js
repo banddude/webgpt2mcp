@@ -56,6 +56,7 @@ import { deleteChatGptConversation } from '../../../backend/adapter/chatgpt_text
 import { getBackend } from '../../../backend/index.js';
 import { gotoWithCheck, waitForInput } from '../../../backend/utils/page.js';
 import { safeClick, humanType } from '../../../backend/engine/utils.js';
+import { createChatGptSessionManager } from '../../chatgptSession.js';
 
 /**
  * 读取请求体
@@ -153,6 +154,7 @@ async function deleteCloudConversations(records, queueManager) {
  */
 export function createAdminRouter(context) {
     const { config, queueManager, tempDir, getSafeMode } = context;
+    const chatGptSession = createChatGptSessionManager({ queueManager });
 
     // ==================== Skill 系统 ====================
 
@@ -214,6 +216,22 @@ export function createAdminRouter(context) {
         const method = req.method;
 
         try {
+            const isChatGptOperation = pathname.startsWith('/chatgpt/')
+                && !['/chatgpt/status', '/chatgpt/login', '/chatgpt/session/persist'].includes(pathname);
+            if (isChatGptOperation) {
+                const sessionStatus = await chatGptSession.inspect();
+                if (!sessionStatus.loggedIn) {
+                    sendJson(res, 401, {
+                        error: {
+                            code: 'CHATGPT_LOGIN_REQUIRED',
+                            message: 'ChatGPT login required. Run the bridge login command once, complete sign-in, then retry.',
+                        },
+                        session: sessionStatus,
+                    });
+                    return;
+                }
+            }
+
             // ==================== 系统管理 ====================
 
             // GET /admin/status - 系统状态
@@ -221,6 +239,30 @@ export function createAdminRouter(context) {
                 const status = getSystemStatus();
                 const safeMode = getSafeMode?.() || { enabled: false, reason: null };
                 sendJson(res, 200, { ...status, safeMode });
+                return;
+            }
+
+            // GET /admin/chatgpt/status - authenticated ChatGPT browser-session status
+            if (method === 'GET' && pathname === '/chatgpt/status') {
+                const status = await chatGptSession.inspect();
+                sendJson(res, 200, status);
+                return;
+            }
+
+            // POST /admin/chatgpt/login - open the existing bridge browser on ChatGPT login
+            if (method === 'POST' && pathname === '/chatgpt/login') {
+                const body = await readBody(req).catch(() => ({}));
+                const waitSeconds = Math.max(0, Math.min(Number(body.wait_seconds || 0), 300));
+                const result = await chatGptSession.openLogin({ waitSeconds });
+                const vnc = await getVncInfo().catch(() => null);
+                sendJson(res, result.opened ? 200 : 503, { ...result, vnc });
+                return;
+            }
+
+            // POST /admin/chatgpt/session/persist - explicit MCP success hook
+            if (method === 'POST' && pathname === '/chatgpt/session/persist') {
+                const persisted = await chatGptSession.persistAfterSuccess();
+                sendJson(res, persisted ? 200 : 503, { persisted });
                 return;
             }
 
