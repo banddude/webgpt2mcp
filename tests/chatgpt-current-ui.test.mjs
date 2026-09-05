@@ -6,9 +6,12 @@ import {
     CHATGPT_SEND_BUTTON_SELECTORS,
     findChatInput,
     chatgptCloudRequest,
+    dismissStaleChatGptAuthDialog,
 } from '../src/backend/adapter/chatgpt_text.js';
 
 test('composer compatibility includes the current ChatGPT textarea and semantic fallbacks', async () => {
+    assert.ok(CHATGPT_INPUT_SELECTORS.includes('.ProseMirror'));
+    assert.ok(CHATGPT_INPUT_SELECTORS.indexOf('.ProseMirror') < CHATGPT_INPUT_SELECTORS.indexOf('#mobile-composer-prompt'));
     assert.ok(CHATGPT_INPUT_SELECTORS.includes('#mobile-composer-prompt'));
     assert.ok(CHATGPT_INPUT_SELECTORS.includes('textarea[aria-label="Chat with ChatGPT"]'));
     assert.ok(CHATGPT_INPUT_SELECTORS.includes('textarea[placeholder*="Ask ChatGPT"]'));
@@ -58,4 +61,46 @@ test('cloud management requests use browser cookies without requiring a bearer t
     assert.match(observed.url, /backend-api\/conversations/);
     assert.equal(observed.options.credentials, 'include');
     assert.equal(observed.options.headers.Authorization, undefined);
+});
+
+
+test('authenticated stale mobile auth dialog is dismissed through its normal Escape path', async () => {
+    let visible = true;
+    let escapeCount = 0;
+    const dialog = {
+        async isVisible() { return visible; },
+    };
+    const page = {
+        locator(selector) {
+            assert.equal(selector, '#mobile-auth-dialog');
+            return { first: () => dialog };
+        },
+        async evaluate() { return true; },
+        keyboard: {
+            async press(key) {
+                assert.equal(key, 'Escape');
+                escapeCount += 1;
+                visible = false;
+            },
+        },
+        async waitForTimeout() {},
+    };
+
+    const result = await dismissStaleChatGptAuthDialog(page);
+    assert.deepEqual(result, { present: true, dismissed: true, authenticated: true, method: 'escape' });
+    assert.equal(escapeCount, 1);
+});
+
+test('auth dialog is never dismissed when backend cookie authentication is absent', async () => {
+    let escapeCount = 0;
+    const page = {
+        locator() { return { first: () => ({ isVisible: async () => true }) }; },
+        async evaluate() { return false; },
+        keyboard: { async press() { escapeCount += 1; } },
+        async waitForTimeout() {},
+    };
+
+    const result = await dismissStaleChatGptAuthDialog(page);
+    assert.deepEqual(result, { present: true, dismissed: false, authenticated: false });
+    assert.equal(escapeCount, 0);
 });
