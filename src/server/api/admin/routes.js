@@ -70,6 +70,7 @@ import {
     chatgptCloudRequest,
     selectChatGptModel,
     findChatInput,
+    findChatGptSendButton,
     waitForChatInput,
     readChatInputText,
     dismissStaleChatGptAuthDialog,
@@ -962,11 +963,11 @@ export function createAdminRouter(context) {
                 let last = null;
                 while (Date.now() < deadline) {
                     const stopButton = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first();
-                    const sendButton = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first();
+                    const sendButton = await findChatGptSendButton(page, { requireEnabled: false });
                     const composer = await waitForChatInput(page, { click: false, timeout: 60000 });
                     const stopVisible = await stopButton.isVisible().catch(() => false);
-                    const sendVisible = await sendButton.isVisible().catch(() => false);
-                    const sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
+                    const sendVisible = Boolean(sendButton);
+                    const sendEnabled = sendButton ? await sendButton.isEnabled().catch(() => false) : false;
                     const composerVisible = await composer.isVisible().catch(() => false);
                     state = await readChatGptStreamState(page, convId);
                     last = { stopVisible, sendVisible, sendEnabled, composerVisible };
@@ -1166,11 +1167,10 @@ export function createAdminRouter(context) {
                     };
                 }
 
-                const sendButton = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first();
-                const sendVisible = await sendButton.isVisible().catch(() => false);
-                const sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
-                if (!sendEnabled) {
-                    return { ok: false, error: 'send_button_unavailable', send_visible: sendVisible };
+                const sendButton = await findChatGptSendButton(page);
+                if (!sendButton) {
+                    const visibleSendButton = await findChatGptSendButton(page, { requireEnabled: false });
+                    return { ok: false, error: 'send_button_unavailable', send_visible: Boolean(visibleSendButton) };
                 }
 
                 await clickVerifiedChatGptControl(page, sendButton);
@@ -1279,11 +1279,10 @@ export function createAdminRouter(context) {
                     };
                     }
 
-                    const sendButton = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first();
-                    const sendVisible = await sendButton.isVisible().catch(() => false);
-                    const sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
-                    if (!sendEnabled) {
-                        return { ok: false, error: 'send_button_unavailable', send_visible: sendVisible };
+                    const sendButton = await findChatGptSendButton(page);
+                    if (!sendButton) {
+                        const visibleSendButton = await findChatGptSendButton(page, { requireEnabled: false });
+                        return { ok: false, error: 'send_button_unavailable', send_visible: Boolean(visibleSendButton) };
                     }
 
                     try {
