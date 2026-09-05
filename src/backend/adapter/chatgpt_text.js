@@ -147,6 +147,30 @@ export async function waitForChatInput(page, options = {}) {
     throw new Error(`ChatGPT composer not found (tried: ${CHATGPT_INPUT_SELECTORS.join(', ')})`);
 }
 
+export async function focusChatGptInput(page, options = {}) {
+    const { timeout = 15000 } = options;
+    const deadline = Date.now() + timeout;
+    let lastError = null;
+
+    while (Date.now() < deadline) {
+        const input = await findChatInput(page);
+        if (input) {
+            try {
+                // Keep focus as a Locator operation. ChatGPT frequently replaces
+                // the composer node during React rerenders; converting the locator
+                // to an ElementHandle makes that normal rerender fatal.
+                await input.focus({ timeout: Math.max(deadline - Date.now(), 500) });
+                if (await input.isVisible().catch(() => false)) return input;
+            } catch (error) {
+                lastError = error;
+            }
+        }
+        await page.waitForTimeout(100).catch(() => {});
+    }
+
+    throw lastError || new Error('ChatGPT composer could not be focused');
+}
+
 export async function readChatInputText(locator) {
     if (!locator) return '';
     return locator.evaluate((element) => {
@@ -799,9 +823,8 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
         // 3. 输入提示词
         logger.info('适配器', '输入提示词...', meta);
-        inputLocator = await waitForChatInput(page, { click: false });
-        await safeClick(page, inputLocator, { bias: 'input' });
-        await humanType(page, inputLocator, prompt);
+        inputLocator = await focusChatGptInput(page);
+        await humanType(page, inputLocator, prompt, { skipFocus: true });
 
         // If the target conversation is already streaming, prefer ChatGPT's native
         // mid-stream steering UI. While thinking, the composer remains editable and
@@ -829,8 +852,8 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                     inputLocator = await waitForChatInput(page, { click: false });
                     const composerText = await readChatInputText(inputLocator);
                     if (!composerText.includes(prompt)) {
-                        await safeClick(page, inputLocator, { bias: 'input' });
-                        await humanType(page, inputLocator, prompt);
+                        inputLocator = await focusChatGptInput(page);
+                        await humanType(page, inputLocator, prompt, { skipFocus: true });
                     }
                 }
             }
