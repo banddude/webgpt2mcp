@@ -22,26 +22,41 @@ const TARGET_URL = 'https://chatgpt.com/'; // 基础URL
 // ChatGPT has changed the composer markup more than once. Keep the stable
 // semantic fallbacks ahead of the generic contenteditable fallback so a stale
 // selector cannot make an otherwise healthy authenticated page unusable.
-const INPUT_SELECTORS = [
+export const CHATGPT_INPUT_SELECTORS = [
     '#prompt-textarea',
     '[contenteditable="true"][data-placeholder*="Ask ChatGPT"]',
     '[contenteditable="true"][aria-label*="Ask ChatGPT"]',
     '.ProseMirror[contenteditable="true"]',
     '[contenteditable="true"][role="textbox"]',
+    '#mobile-composer-prompt',
+    'textarea[aria-label="Chat with ChatGPT"]',
     'textarea[placeholder*="Ask ChatGPT"]',
     '[contenteditable="true"]'
 ];
 const DEBUG_DIR = path.join(process.cwd(), 'data', 'debug-chatgpt');
 
-async function findChatInput(page) {
-    for (const selector of INPUT_SELECTORS) {
+export const CHATGPT_INPUT_SELECTOR = CHATGPT_INPUT_SELECTORS.join(', ');
+export const CHATGPT_SEND_BUTTON_SELECTORS = [
+    '[data-testid="send-button"]',
+    'button[aria-label="Send message"]',
+    'button[aria-label^="Send"]',
+];
+export const CHATGPT_SEND_BUTTON_SELECTOR = CHATGPT_SEND_BUTTON_SELECTORS.join(', ');
+export const CHATGPT_STOP_BUTTON_SELECTORS = [
+    '[data-testid="stop-button"]',
+    'button[aria-label^="Stop"]',
+];
+export const CHATGPT_STOP_BUTTON_SELECTOR = CHATGPT_STOP_BUTTON_SELECTORS.join(', ');
+
+export async function findChatInput(page) {
+    for (const selector of CHATGPT_INPUT_SELECTORS) {
         const locator = page.locator(selector).first();
         if (await locator.isVisible().catch(() => false)) return locator;
     }
     return null;
 }
 
-async function waitForChatInput(page, options = {}) {
+export async function waitForChatInput(page, options = {}) {
     const { timeout = 60000, click = false } = options;
     const deadline = Date.now() + timeout;
 
@@ -57,7 +72,17 @@ async function waitForChatInput(page, options = {}) {
         await page.waitForTimeout(250);
     }
 
-    throw new Error(`ChatGPT composer not found (tried: ${INPUT_SELECTORS.join(', ')})`);
+    throw new Error(`ChatGPT composer not found (tried: ${CHATGPT_INPUT_SELECTORS.join(', ')})`);
+}
+
+export async function readChatInputText(locator) {
+    if (!locator) return '';
+    return locator.evaluate((element) => {
+        if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+            return element.value || '';
+        }
+        return element.innerText || element.textContent || '';
+    }).catch(() => '');
 }
 
 function normalizeConversationUrl(url) {
@@ -713,10 +738,10 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         // preserve the typed steering prompt, then submit it as the next turn.
         let activeSteerMode = null;
         if (conversationUrl) {
-            const stopButton = page.locator('[data-testid=\"stop-button\"]');
+            const stopButton = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first();
             const stopVisible = await stopButton.isVisible().catch(() => false);
             if (stopVisible) {
-                const sendButton = page.locator('[data-testid=\"send-button\"]');
+                const sendButton = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first();
                 const sendVisible = await sendButton.isVisible().catch(() => false);
                 const sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
                 if (sendEnabled) {
@@ -726,13 +751,13 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                     activeSteerMode = 'interrupt';
                     logger.info('适配器', '检测到正在生成的会话；原生 steer 按钮不可用，先 Stop answering 再提交新指令', meta);
                     await safeClick(page, stopButton, { bias: 'button' });
-                    await page.waitForSelector('[data-testid=\"stop-button\"]', { state: 'hidden', timeout: 15000 }).catch(() => { });
+                    await page.waitForSelector(CHATGPT_STOP_BUTTON_SELECTOR, { state: 'hidden', timeout: 15000 }).catch(() => { });
                     await sleep(250, 450);
 
                     // Some ChatGPT rerenders replace the composer when stopping. Make
                     // sure the steering prompt survived before submitting it.
                     inputLocator = await waitForChatInput(page, { click: false });
-                    const composerText = await inputLocator.innerText().catch(() => '');
+                    const composerText = await readChatInputText(inputLocator);
                     if (!composerText.includes(prompt)) {
                         await safeClick(page, inputLocator, { bias: 'input' });
                         await humanType(page, inputLocator, prompt);
@@ -943,7 +968,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         logger.debug('适配器', activeSteerMode ? `发送 steer 提示词 (${activeSteerMode})...` : '发送提示词...', meta);
         const startTimeSend = Date.now();
         if (activeSteerMode === 'native') {
-            const steerSendButton = page.locator('[data-testid=\"send-button\"]');
+            const steerSendButton = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first();
             const canClickSteer = await steerSendButton.isVisible().catch(() => false) &&
                 await steerSendButton.isEnabled().catch(() => false);
             if (canClickSteer) {
@@ -984,7 +1009,7 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                     }
                     return length;
                 }).catch(() => null);
-                const stopVisible = await page.locator('[data-testid="stop-button"]')
+                const stopVisible = await page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first()
                     .isVisible().catch(() => false);
                 return {
                     assistantTextLen: assistantTextLen === null ? -1 : assistantTextLen,
@@ -998,12 +1023,8 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                 if (!convId) return null;
                 return await page.evaluate(async (id) => {
                     try {
-                        const sessionRes = await fetch('/api/auth/session', { credentials: 'include' });
-                        if (!sessionRes.ok) return null;
-                        const accessToken = (await sessionRes.json())?.accessToken;
                         const res = await fetch(`/backend-api/conversation/${id}/stream_status`, {
-                            credentials: 'include',
-                            headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {}
+                            credentials: 'include'
                         });
                         if (!res.ok) return `HTTP_${res.status}`;
                         return (await res.json())?.status || null;
@@ -1070,18 +1091,8 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 
                 logger.info('适配器', `stream_handoff: convId 到达，轮询 API (${convId}, ${Date.now() - t0}ms)`, meta);
                 try {
-                    const accessToken = await page.evaluate(async () => {
-                        try {
-                            const res = await fetch('/api/auth/session');
-                            if (!res.ok) return null;
-                            const data = await res.json();
-                            return data.accessToken || null;
-                        } catch { return null; }
-                    });
-
                     const apiUrl = `https://chatgpt.com/backend-api/conversation/${convId}`;
                     const hdrs = { 'Accept': 'application/json' };
-                    if (accessToken) hdrs['Authorization'] = `Bearer ${accessToken}`;
 
                     // 轮询 API：每 2s 查一次，最多 25s（ChatGPT 思考模型可能需要 10-20s）
                     const apiDeadline = Date.now() + 25000;
@@ -1203,25 +1214,8 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
         if (authoritativeConversationId) {
             logger.info('适配器', `通过 API 验证已完成的最终回复: ${authoritativeConversationId}`, meta);
             try {
-                // 获取 access token（ChatGPT 使用 Auth0，需 Bearer token）
-                const accessToken = await page.evaluate(async () => {
-                    try {
-                        const res = await fetch('/api/auth/session');
-                        if (!res.ok) return null;
-                        const data = await res.json();
-                        return data.accessToken || null;
-                    } catch { return null; }
-                });
-                logger.info('适配器', `access token: ${accessToken ? '已获取' : '未获取'}`, meta);
-
                 const apiUrl = `https://chatgpt.com/backend-api/conversation/${authoritativeConversationId}`;
                 const headers = { 'Accept': 'application/json' };
-                if (accessToken) {
-                    headers['Authorization'] = `Bearer ${accessToken}`;
-                } else {
-                    const cookies = await page.context().cookies(['https://chatgpt.com']);
-                    headers['Cookie'] = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-                }
 
                 const verifyDeadline = Date.now() + 15000;
                 let verifiedFinalText = '';
@@ -1366,15 +1360,9 @@ export async function chatgptCloudRequest(page, { method = 'GET', path, query = 
     const result = await page.evaluate(async ({ method, path, query, body, retries }) => {
         const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
         try {
-            const sessionRes = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
-            if (!sessionRes.ok) return { ok: false, error: `session failed: HTTP ${sessionRes.status}` };
-            const session = await sessionRes.json();
-            const accessToken = session?.accessToken;
-            if (!accessToken) return { ok: false, error: 'no access token in ChatGPT session' };
-
             const search = query ? new URLSearchParams(query).toString() : '';
             const url = `https://chatgpt.com/backend-api/${String(path).replace(/^\//, '')}${search ? `?${search}` : ''}`;
-            const headers = { Authorization: `Bearer ${accessToken}` };
+            const headers = {};
             const hasBody = body !== null && body !== undefined;
             if (hasBody) headers['Content-Type'] = 'application/json';
 
@@ -1868,8 +1856,8 @@ export async function createChatGptProject(page, name, { instructions = '' } = {
 /**
  * Rename one exact ChatGPT project, preserving its emoji, theme, and
  * instructions. Verified live: PATCH /backend-api/projects/<id> requires the
- * full {"name", "emoji", "theme", "instructions"} set — missing keys are 422,
- * extra keys are rejected, and theme must be a #rgb/#rrggbb string or null —
+ * full {"name", "emoji", "theme", "instructions"} set - missing keys are 422,
+ * extra keys are rejected, and theme must be a #rgb/#rrggbb string or null -
  * and there is no GET on the project detail path, so the current values are
  * read from the sidebar list first and sent back unchanged.
  */

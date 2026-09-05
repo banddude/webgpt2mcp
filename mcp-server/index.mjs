@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * webgpt2mcp — ChatGPT Web to MCP Server
+ * webgpt2mcp - ChatGPT Web to MCP Server
  * 将 WebAI2API 的 ChatGPT 网页端能力暴露为 MCP 工具
  * 支持会话管理：自动保存、列表查询、智能继续、Skill 注入
  */
@@ -109,6 +109,7 @@ async function dispatchExactConversation({ conversation_url, prompt, agent, proj
             error.data = data;
             throw error;
         }
+        await persistChatGptSession().catch(() => {});
         return data;
     } finally {
         clearTimeout(timer);
@@ -143,6 +144,7 @@ async function dispatchNewConversation({ prompt, model = 'gpt-instant', agent, p
             error.data = data;
             throw error;
         }
+        await persistChatGptSession().catch(() => {});
         return data;
     } finally {
         clearTimeout(timer);
@@ -168,7 +170,9 @@ async function callChatGPT({ model = 'gpt-instant', messages, conversation_url, 
             body: JSON.stringify(body),
             signal: controller.signal,
         });
-        return await response.json();
+        const data = await response.json();
+        if (response.ok && !data?.error) await persistChatGptSession().catch(() => {});
+        return data;
     } finally {
         clearTimeout(timer);
     }
@@ -244,6 +248,15 @@ function projectRefError() {
     };
 }
 
+async function persistChatGptSession() {
+    const response = await fetch(`${API_URL}/admin/chatgpt/session/persist`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${API_KEY}` },
+    });
+    if (!response.ok) throw new Error(`session persistence failed: HTTP ${response.status}`);
+    return response.json().catch(() => ({}));
+}
+
 async function adminJson(pathname, options = {}) {
     const response = await fetch(`${API_URL}${pathname}`, {
         ...options,
@@ -261,6 +274,9 @@ async function adminJson(pathname, options = {}) {
         error.status = response.status;
         error.data = data;
         throw error;
+    }
+    if (pathname !== '/admin/chatgpt/session/persist') {
+        await persistChatGptSession().catch(() => {});
     }
     return data;
 }
@@ -350,6 +366,21 @@ async function stopExactConversation({ conversation_url, timeout = 120000 }) {
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
+        {
+            name: 'status',
+            description: 'Report whether the ChatGPT web browser session is authenticated. Cookie-authenticated current ChatGPT sessions are valid even when /api/auth/session no longer exposes an access token.',
+            inputSchema: { type: 'object', properties: {} },
+        },
+        {
+            name: 'login',
+            description: 'Open the bridge browser on the ChatGPT login page. Optionally wait for authentication to complete.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    wait_seconds: { type: 'number', minimum: 0, maximum: 300, default: 0, description: 'How long to wait for the browser session to become authenticated after opening login.' },
+                },
+            },
+        },
         {
             // Keep the published connector name working while clients migrate
             // to the explicit create/send surface below.
@@ -595,6 +626,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
 
     try {
+        if (name === 'status') {
+            const status = await adminJson('/admin/chatgpt/status');
+            const lines = [
+                `ChatGPT web session: ${status.loggedIn ? 'logged-in' : status.state || 'logged-out'}`,
+                status.authMode ? `Auth mode: ${status.authMode}` : null,
+                status.tokenAgeSeconds == null ? null : `Token age: ${status.tokenAgeSeconds}s`,
+                status.tokenExpiresInSeconds == null ? null : `Token expires in: ${status.tokenExpiresInSeconds}s`,
+                status.lastAuthenticatedAt ? `Last authenticated: ${status.lastAuthenticatedAt}` : null,
+                status.loginRequired ? 'Login required: yes' : null,
+                status.reason ? `Reason: ${status.reason}` : null,
+            ].filter(Boolean);
+            return { content: [{ type: 'text', text: lines.join('\n') }], _meta: status };
+        }
+
+        if (name === 'login') {
+            const waitSeconds = Math.max(0, Math.min(Number(args.wait_seconds || 0), 300));
+            const result = await adminJson('/admin/chatgpt/login', {
+                method: 'POST',
+                body: JSON.stringify({ wait_seconds: waitSeconds }),
+            });
+            const text = result.authenticated
+                ? 'ChatGPT login is complete; the bridge session is authenticated and persisted.'
+                : 'ChatGPT login page is open in the bridge browser. Complete sign-in once, then call status.';
+            return { content: [{ type: 'text', text }], _meta: result };
+        }
+
         if (name === 'chatgpt') {
             const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
             if (!prompt) return { content: [{ type: 'text', text: 'Error: prompt is required.' }], isError: true };
