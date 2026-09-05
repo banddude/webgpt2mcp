@@ -73,7 +73,12 @@ try {
                 method: 'DELETE',
                 body: JSON.stringify({ conversation_url: conversationUrl }),
             });
-            console.log(JSON.stringify({ cleanup: deleted.success ? 'ok' : 'failed', conversationUrl }, null, 2));
+            const cleanup = deleted.success ? 'ok' : 'failed';
+            console.log(JSON.stringify({ cleanup, conversationUrl }, null, 2));
+            if (!deleted.success) {
+                console.error(`cleanup was not confirmed for ${conversationUrl}: ${JSON.stringify(deleted.cloud || deleted)}`);
+                process.exitCode = process.exitCode || 3;
+            }
         } catch (error) {
             console.error(`cleanup failed for ${conversationUrl}: ${error.message}`);
             process.exitCode = process.exitCode || 3;
