@@ -22,8 +22,11 @@ const PROJECT_CONVERSATION_URL = `https://chatgpt.com/g/${PROJECT_ID}-aiva/c/${C
 // Minimal fake of the Playwright page surface used by the conversation
 // navigation paths. `gotoBehavior` decides where a navigation lands so tests
 // can reproduce ChatGPT redirecting a project conversation to the project
-// landing page instead of the chat itself.
-function createFakePage({ startUrl, cloudConversation = null, gotoBehavior = null } = {}) {
+// landing page instead of the chat itself. `threadMessages` is what the
+// composer-target gate reads: a rendered existing conversation has messages,
+// a project landing page or a brand-new chat has none (or an unreadable DOM,
+// expressed as null).
+function createFakePage({ startUrl, cloudConversation = null, gotoBehavior = null, threadMessages = 2 } = {}) {
     const state = {
         url: startUrl,
         gotoCalls: [],
@@ -42,7 +45,13 @@ function createFakePage({ startUrl, cloudConversation = null, gotoBehavior = nul
                 return firstLocator;
             },
         };
-        return { first: () => firstLocator };
+        return {
+            first: () => firstLocator,
+            count: async () => {
+                if (selector.includes('data-message-author-role')) return threadMessages;
+                return selector === '#prompt-textarea' ? 1 : 0;
+            },
+        };
     };
 
     const page = {
@@ -212,7 +221,7 @@ test('landing on the project page instead of the chat is a loud mismatch, never 
         // on the project landing page, which has its own composer.
         gotoBehavior: () => PROJECT_LANDING_URL,
     });
-    const attached = await ensurePageOnExactConversation(page, `https://chatgpt.com/c/${CONV_ID}`);
+    const attached = await ensurePageOnExactConversation(page, `https://chatgpt.com/c/${CONV_ID}`, { gateTimeoutMs: 100 });
     assert.equal(attached.ok, false);
     assert.equal(attached.error, 'conversation_navigation_mismatch');
     assert.equal(attached.actualUrl, PROJECT_LANDING_URL);
@@ -229,7 +238,7 @@ test('generate() sends nothing when the target conversation cannot be shown on s
         'Say the same color.',
         [],
         null,
-        { conversationUrl: `https://chatgpt.com/c/${CONV_ID}` },
+        { conversationUrl: `https://chatgpt.com/c/${CONV_ID}`, gateTimeoutMs: 100 },
     );
     assert.ok(result.error, 'the generation must fail');
     assert.ok(result.error.includes('conversation_navigation_mismatch'), `unexpected error: ${result.error}`);
