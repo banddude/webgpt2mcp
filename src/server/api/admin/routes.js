@@ -80,6 +80,7 @@ import { getBackend } from '../../../backend/index.js';
 import { gotoWithCheck, waitForInput } from '../../../backend/utils/page.js';
 import { safeClick, humanType } from '../../../backend/engine/utils.js';
 import { createChatGptSessionManager } from '../../chatgptSession.js';
+import { selectChatGptControlPage } from '../../chatgptPageSelector.js';
 
 /**
  * 读取请求体
@@ -160,7 +161,7 @@ async function deleteCloudConversations(records, queueManager) {
         poolContext = await queueManager?.initializePool?.();
     }
 
-    const page = poolContext?.poolManager?.getFirstPage?.();
+    const page = await selectChatGptControlPage(poolContext);
     if (!page) {
         for (const target of targets.values()) {
             summary.failed++;
@@ -1397,7 +1398,7 @@ export function createAdminRouter(context) {
                 try {
                     let poolContext = queueManager?.getPoolContext?.();
                     if (!poolContext) poolContext = await queueManager?.initializePool?.();
-                    const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                    const page = await selectChatGptControlPage(poolContext);
                     if (!page) {
                         sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
                         return;
@@ -1500,7 +1501,7 @@ export function createAdminRouter(context) {
 
                 let poolContext = queueManager?.getPoolContext?.();
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
-                const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                const page = await selectChatGptControlPage(poolContext);
                 if (!page) {
                     sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
                     return;
@@ -1623,7 +1624,7 @@ export function createAdminRouter(context) {
                     await enqueueDispatch(async () => {
                         let poolContext = queueManager?.getPoolContext?.();
                         if (!poolContext) poolContext = await queueManager?.initializePool?.();
-                        const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                        const page = await selectChatGptControlPage(poolContext);
                         if (!page) {
                             sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
                             return;
@@ -1839,7 +1840,7 @@ export function createAdminRouter(context) {
 
                 let poolContext = queueManager?.getPoolContext?.();
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
-                const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                const page = await selectChatGptControlPage(poolContext);
                 if (!page) {
                     sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
                     return;
@@ -1932,7 +1933,7 @@ export function createAdminRouter(context) {
 
                 let poolContext = queueManager?.getPoolContext?.();
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
-                const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                const page = await selectChatGptControlPage(poolContext);
                 if (!page) {
                     sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
                     return;
@@ -1981,7 +1982,7 @@ export function createAdminRouter(context) {
 
                 let poolContext = queueManager?.getPoolContext?.();
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
-                const page = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                const page = await selectChatGptControlPage(poolContext);
                 if (!page) {
                     sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
                     return;
@@ -1993,7 +1994,7 @@ export function createAdminRouter(context) {
                         poolContext = queueManager?.getPoolContext?.();
                         if (!poolContext) poolContext = await queueManager?.initializePool?.();
                     }
-                    const attemptPage = poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                    const attemptPage = await selectChatGptControlPage(poolContext);
                     if (!attemptPage) {
                         result = { error: 'ChatGPT browser page unavailable' };
                         break;
@@ -2109,7 +2110,7 @@ export function createAdminRouter(context) {
             const getManagementPage = async () => {
                 let poolContext = queueManager?.getPoolContext?.();
                 if (!poolContext) poolContext = await queueManager?.initializePool?.();
-                return poolContext?.poolManager?.getFirstPage?.() || poolContext?.getFirstPage?.();
+                return await selectChatGptControlPage(poolContext);
             };
 
             const CONVERSATION_URL_RE = /^https:\/\/chatgpt\.com\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
@@ -2726,7 +2727,7 @@ export function createAdminRouter(context) {
                             const convIdMatch = state.conversationUrl.match(/\/c\/([0-9a-f-]+)/);
                             if (convIdMatch) {
                                 await new Promise(r => setTimeout(r, 30000));
-                                const page = poolCtx?.poolManager?.getFirstPage?.() || poolCtx?.getFirstPage?.();
+                                const page = await selectChatGptControlPage(poolCtx);
                                 if (page) {
                                     const fullResult = await page.evaluate(async (convId) => {
                                         try {
