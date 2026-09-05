@@ -9,6 +9,7 @@ import {
     isChatGptSendControlVisibilityRace,
     chatgptCloudRequest,
     isTransientChatGptBrowserError,
+    chatGptReadRetryDelayMs,
     deleteChatGptConversation,
     dismissStaleChatGptAuthDialog,
 } from '../src/backend/adapter/chatgpt_text.js';
@@ -140,6 +141,13 @@ test('transient ChatGPT browser error classification covers navigation fetch rac
     assert.equal(isTransientChatGptBrowserError('NetworkError when attempting to fetch resource.'), true);
     assert.equal(isTransientChatGptBrowserError('Execution context was destroyed, most likely because of a navigation.'), true);
     assert.equal(isTransientChatGptBrowserError('HTTP 404'), false);
+});
+
+test('conversation read backoff honors Retry-After and expands 429 fallback', () => {
+    assert.equal(chatGptReadRetryDelayMs({ error: 'api failed: 429', retry_after_ms: 12500 }, 0), 12500);
+    assert.equal(chatGptReadRetryDelayMs({ error: 'api failed: 429' }, 0), 3000);
+    assert.equal(chatGptReadRetryDelayMs({ error: 'api failed: 429' }, 2), 12000);
+    assert.equal(chatGptReadRetryDelayMs({ error: 'NetworkError when attempting to fetch resource.' }, 2), 3000);
 });
 
 test('cloud GET retries a transient browser fetch error but mutations are not replayed', async () => {

@@ -61,7 +61,7 @@ try {
             const conv = await api(`/admin/chatgpt/conversation/${id}`);
             replySeen = Array.isArray(conv.messages) && conv.messages.some(message => message.role === 'assistant' && String(message.text || '').includes(marker));
             if (replySeen) break;
-            await new Promise(resolve => setTimeout(resolve, 1500));
+            await new Promise(resolve => setTimeout(resolve, 3000));
         }
     }
     console.log(JSON.stringify({ dispatch: 'ok', conversationUrl, replySeen }, null, 2));

@@ -69,6 +69,7 @@ import {
     routeChatGptConversationToProject,
     chatgptCloudRequest,
     isTransientChatGptBrowserError,
+    chatGptReadRetryDelayMs,
     selectChatGptModel,
     findChatInput,
     findChatGptSendButton,
@@ -2032,7 +2033,21 @@ export function createAdminRouter(context) {
                             credentials: 'include',
                             headers,
                         });
-                        if (!res.ok) return { error: `api failed: ${res.status}` };
+                        if (!res.ok) {
+                            let retryAfterMs = null;
+                            if (res.status === 429) {
+                                const retryAfter = res.headers.get('retry-after');
+                                if (retryAfter) {
+                                    const seconds = Number(retryAfter);
+                                    if (Number.isFinite(seconds)) retryAfterMs = Math.max(0, seconds * 1000);
+                                    else {
+                                        const at = Date.parse(retryAfter);
+                                        if (Number.isFinite(at)) retryAfterMs = Math.max(0, at - Date.now());
+                                    }
+                                }
+                            }
+                            return { error: `api failed: ${res.status}`, retry_after_ms: retryAfterMs };
+                        }
                         const data = await res.json();
 
                         const messages = [];
@@ -2091,7 +2106,8 @@ export function createAdminRouter(context) {
                         isTransientChatGptBrowserError(result.error)
                     );
                     if (!retryable || attempt === 5) break;
-                    await new Promise(resolve => setTimeout(resolve, 2000 * (attempt + 1)));
+                    const delayMs = chatGptReadRetryDelayMs(result, attempt);
+                    await new Promise(resolve => setTimeout(resolve, delayMs));
                 }
 
                 if (result.error) {
