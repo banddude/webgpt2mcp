@@ -2223,7 +2223,7 @@ export function createAdminRouter(context) {
             // fuzzy references are rejected: every mutating operation in this
             // family must target exactly one known conversation.
             const parseExactConversationRef = (value) => {
-                const reference = parseChatGPTConversationReference(value);
+                const reference = parseChatGptConversationReference(value);
                 if (!reference) return null;
                 return { id: reference.id, url: reference.url };
             };
