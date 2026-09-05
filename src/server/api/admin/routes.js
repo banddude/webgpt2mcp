@@ -68,11 +68,17 @@ import {
     moveChatGptConversationToProject,
     routeChatGptConversationToProject,
     chatgptCloudRequest,
-    selectChatGptModel
+    selectChatGptModel,
+    findChatInput,
+    waitForChatInput,
+    readChatInputText,
+    CHATGPT_SEND_BUTTON_SELECTOR,
+    CHATGPT_STOP_BUTTON_SELECTOR
 } from '../../../backend/adapter/chatgpt_text.js';
 import { getBackend } from '../../../backend/index.js';
 import { gotoWithCheck, waitForInput } from '../../../backend/utils/page.js';
 import { safeClick, humanType } from '../../../backend/engine/utils.js';
+import { createChatGptSessionManager } from '../../chatgptSession.js';
 
 /**
  * 读取请求体
@@ -199,6 +205,7 @@ async function deleteCloudConversations(records, queueManager) {
  */
 export function createAdminRouter(context) {
     const { config, queueManager, tempDir, getSafeMode } = context;
+    const chatGptSession = createChatGptSessionManager({ queueManager });
 
     // Dispatches are short browser handoffs, not generation lanes. Serialize
     // only the physical page interaction so simultaneous callers do not type
@@ -343,6 +350,22 @@ export function createAdminRouter(context) {
         const method = req.method;
 
         try {
+            const isChatGptOperation = pathname.startsWith('/chatgpt/')
+                && !['/chatgpt/status', '/chatgpt/login', '/chatgpt/session/persist'].includes(pathname);
+            if (isChatGptOperation) {
+                const sessionStatus = await chatGptSession.inspect();
+                if (!sessionStatus.loggedIn) {
+                    sendJson(res, 401, {
+                        error: {
+                            code: 'CHATGPT_LOGIN_REQUIRED',
+                            message: 'ChatGPT login required. Run the bridge login command once, complete sign-in, then retry.',
+                        },
+                        session: sessionStatus,
+                    });
+                    return;
+                }
+            }
+
             // ==================== 系统管理 ====================
 
             // GET /admin/status - 系统状态
@@ -350,6 +373,30 @@ export function createAdminRouter(context) {
                 const status = getSystemStatus();
                 const safeMode = getSafeMode?.() || { enabled: false, reason: null };
                 sendJson(res, 200, { ...status, safeMode });
+                return;
+            }
+
+            // GET /admin/chatgpt/status - authenticated ChatGPT browser-session status
+            if (method === 'GET' && pathname === '/chatgpt/status') {
+                const status = await chatGptSession.inspect();
+                sendJson(res, 200, status);
+                return;
+            }
+
+            // POST /admin/chatgpt/login - open the existing bridge browser on ChatGPT login
+            if (method === 'POST' && pathname === '/chatgpt/login') {
+                const body = await readBody(req).catch(() => ({}));
+                const waitSeconds = Math.max(0, Math.min(Number(body.wait_seconds || 0), 300));
+                const result = await chatGptSession.openLogin({ waitSeconds });
+                const vnc = await getVncInfo().catch(() => null);
+                sendJson(res, result.opened ? 200 : 503, { ...result, vnc });
+                return;
+            }
+
+            // POST /admin/chatgpt/session/persist - explicit MCP success hook
+            if (method === 'POST' && pathname === '/chatgpt/session/persist') {
+                const persisted = await chatGptSession.persistAfterSuccess();
+                sendJson(res, persisted ? 200 : 503, { persisted });
                 return;
             }
 
@@ -785,7 +832,7 @@ export function createAdminRouter(context) {
                                 (candidate !== conversationUrl && page.url() !== candidate)) {
                                 await gotoWithCheck(page, candidate, { timeout: 60000 });
                             }
-                            await waitForInput(page, '#prompt-textarea', { click: false, timeout: 60000 });
+                            await waitForChatInput(page, { click: false, timeout: 60000 });
                             if (normalizeChatUrl(page.url()) === targetUrl) {
                                 return { ok: true, ready: true, actualUrl: page.url() };
                             }
@@ -800,7 +847,7 @@ export function createAdminRouter(context) {
                     }
                 }
 
-                const ready = await page.locator('#prompt-textarea').isVisible().catch(() => false);
+                const ready = Boolean(await findChatInput(page));
                 return {
                     ok: false,
                     ready,
@@ -815,17 +862,10 @@ export function createAdminRouter(context) {
             // interpreted as "idle".
             const readChatGptStreamState = async (page, convId) => page.evaluate(async (id) => {
                 try {
-                    let accessToken = null;
-                    try {
-                        const sessionRes = await fetch('/api/auth/session', { credentials: 'include' });
-                        if (sessionRes.ok) accessToken = (await sessionRes.json())?.accessToken || null;
-                    } catch { }
-                    const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
                     let lastHttp = null;
                     for (let attempt = 0; attempt < 3; attempt += 1) {
                         const r = await fetch(`/backend-api/conversation/${id}/stream_status`, {
                             credentials: 'include',
-                            headers,
                         });
                         if (r.ok) return await r.json();
                         lastHttp = r.status;
@@ -844,7 +884,7 @@ export function createAdminRouter(context) {
             // real Stop control before calling an active-stream operation successful.
             const attachOraclePageToActiveStream = async (page, conversationUrl, convId) => {
                 let state = await readChatGptStreamState(page, convId);
-                let stopVisible = await page.locator('[data-testid="stop-button"]').isVisible().catch(() => false);
+                let stopVisible = await page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first().isVisible().catch(() => false);
 
                 if (state?.status === 'IS_STREAMING' && !stopVisible) {
                     let navError = null;
@@ -860,12 +900,12 @@ export function createAdminRouter(context) {
                         }
                         navError = nav.lastError || navError;
                     } else {
-                        await page.locator('#prompt-textarea').waitFor({ state: 'visible', timeout: 15000 }).catch(err => { navError = err; });
+                        await waitForChatInput(page, { click: false, timeout: 15000 }).catch(err => { navError = err; });
                     }
 
                     const deadline = Date.now() + 10000;
                     while (Date.now() < deadline) {
-                        stopVisible = await page.locator('[data-testid="stop-button"]').isVisible().catch(() => false);
+                        stopVisible = await page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first().isVisible().catch(() => false);
                         state = await readChatGptStreamState(page, convId);
                         if (stopVisible || state?.status !== 'IS_STREAMING') break;
                         await page.waitForTimeout(250);
@@ -927,9 +967,9 @@ export function createAdminRouter(context) {
                 let stableIdleUiChecks = 0;
                 let last = null;
                 while (Date.now() < deadline) {
-                    const stopButton = page.locator('[data-testid="stop-button"]');
-                    const sendButton = page.locator('[data-testid="send-button"]');
-                    const composer = page.locator('#prompt-textarea');
+                    const stopButton = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first();
+                    const sendButton = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first();
+                    const composer = await waitForChatInput(page, { click: false, timeout: 60000 });
                     const stopVisible = await stopButton.isVisible().catch(() => false);
                     const sendVisible = await sendButton.isVisible().catch(() => false);
                     const sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
@@ -969,12 +1009,9 @@ export function createAdminRouter(context) {
             const readLatestCloudUserTurn = async (page, convId, retries = 3) => page.evaluate(async ({ id, retries }) => {
                 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
                 try {
-                    const sessionRes = await fetch('/api/auth/session', { credentials: 'include' });
-                    const accessToken = sessionRes.ok ? (await sessionRes.json())?.accessToken : null;
-                    const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
                     let lastHttp = null;
                     for (let attempt = 0; attempt < retries; attempt += 1) {
-                        const res = await fetch(`/backend-api/conversation/${id}`, { credentials: 'include', headers });
+                        const res = await fetch(`/backend-api/conversation/${id}`, { credentials: 'include' });
                         lastHttp = res.status;
                         if (res.ok) {
                             const data = await res.json();
@@ -1003,8 +1040,8 @@ export function createAdminRouter(context) {
 
             const waitForExactUserTurn = async (page, conversationUrl, prompt, countBefore, convId, cloudUserBefore, timeoutMs = 30000) => {
                 const userMessages = page.locator('[data-message-author-role="user"]');
-                const composer = page.locator('#prompt-textarea');
-                const stopButton = page.locator('[data-testid="stop-button"]');
+                const composer = await waitForChatInput(page, { click: false, timeout: 60000 });
+                const stopButton = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first();
                 const targetUrl = normalizeChatUrl(conversationUrl);
                 const deadline = Date.now() + timeoutMs;
                 let lastText = '';
@@ -1028,7 +1065,7 @@ export function createAdminRouter(context) {
                     // already verified the exact prompt text in the composer before clicking
                     // Send. If that composer is now empty and a Stop button has appeared, the
                     // exact target chat accepted the turn and began the new response.
-                    const composerText = (await composer.innerText().catch(() => '')).trim();
+                    const composerText = (await readChatInputText(composer)).trim();
                     const stopVisible = await stopButton.isVisible().catch(() => false);
                     if (!normalizeVisibleText(composerText) && stopVisible) {
                         return { accepted: true, count, lastText, confirmed_by: 'ui_new_generation' };
@@ -1051,7 +1088,7 @@ export function createAdminRouter(context) {
 
             const waitForNewAssistantResponse = async (page, convId, assistantCountBefore, timeoutMs = 15000) => {
                 const assistantMessages = page.locator('[data-message-author-role="assistant"]');
-                const stopButton = page.locator('[data-testid="stop-button"]');
+                const stopButton = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first();
                 const deadline = Date.now() + timeoutMs;
                 let state = null;
                 let assistantCount = assistantCountBefore;
@@ -1092,9 +1129,8 @@ export function createAdminRouter(context) {
                 // Reacquire the post-Stop composer and use the exact same click/type machinery
                 // as the normal ChatGPT adapter. Stop can rerender this node, so never reuse a
                 // pre-Stop ElementHandle.
-                const composer = page.locator('#prompt-textarea');
-                await waitForInput(page, composer, { click: false, timeout: 60000 });
-                await safeClick(page, composer, { bias: 'input', timeout: 15000 });
+                const composer = await waitForChatInput(page, { click: false, timeout: 60000 });
+                                await safeClick(page, composer, { bias: 'input', timeout: 15000 });
 
                 // Ensure a short steering prompt does not append to any text ChatGPT preserved
                 // across the Stop rerender. humanType itself performs this clear for long text;
@@ -1105,15 +1141,15 @@ export function createAdminRouter(context) {
                 await page.keyboard.up(modifierKey);
                 await page.keyboard.press('Backspace');
                 await page.waitForTimeout(100);
-                await humanType(page, '#prompt-textarea', prompt);
+                await humanType(page, composer, prompt);
 
-                const freshComposer = page.locator('#prompt-textarea');
-                const composerText = (await freshComposer.innerText().catch(() => '')).trim();
+                const freshComposer = await waitForChatInput(page, { click: false, timeout: 60000 });
+                const composerText = (await readChatInputText(freshComposer)).trim();
                 if (normalizeVisibleText(composerText) !== normalizeVisibleText(prompt)) {
                     return { ok: false, error: 'composer_text_mismatch' };
                 }
 
-                const sendButton = page.locator('[data-testid="send-button"]');
+                const sendButton = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first();
                 const sendVisible = await sendButton.isVisible().catch(() => false);
                 const sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
                 if (!sendEnabled) {
@@ -1179,7 +1215,7 @@ export function createAdminRouter(context) {
                 if (conversationIdFromPageUrl(page.url())) {
                     return { ok: false, error: 'new_chat_navigation_mismatch', actualUrl: page.url() };
                 }
-                await waitForInput(page, '#prompt-textarea', { click: false, timeout: 60000 });
+                await waitForChatInput(page, { click: false, timeout: 60000 });
                 return { ok: true, actualUrl: page.url() };
             };
 
@@ -1202,9 +1238,8 @@ export function createAdminRouter(context) {
 
                     const userMessages = page.locator('[data-message-author-role="user"]');
                     const userCountBefore = await userMessages.count().catch(() => 0);
-                    const composer = page.locator('#prompt-textarea');
-                    await waitForInput(page, composer, { click: false, timeout: 60000 });
-                    await safeClick(page, composer, { bias: 'input', timeout: 15000 });
+                    const composer = await waitForChatInput(page, { click: false, timeout: 60000 });
+                                        await safeClick(page, composer, { bias: 'input', timeout: 15000 });
 
                     const modifierKey = process.platform === 'darwin' ? 'Meta' : 'Control';
                     await page.keyboard.down(modifierKey);
@@ -1212,15 +1247,15 @@ export function createAdminRouter(context) {
                     await page.keyboard.up(modifierKey);
                     await page.keyboard.press('Backspace');
                     await page.waitForTimeout(100);
-                    await humanType(page, '#prompt-textarea', prompt);
+                    await humanType(page, composer, prompt);
 
-                    const freshComposer = page.locator('#prompt-textarea');
-                    const composerText = (await freshComposer.innerText().catch(() => '')).trim();
+                    const freshComposer = await waitForChatInput(page, { click: false, timeout: 60000 });
+                    const composerText = (await readChatInputText(freshComposer)).trim();
                     if (normalizeVisibleText(composerText) !== normalizeVisibleText(prompt)) {
                         return { ok: false, error: 'composer_text_mismatch' };
                     }
 
-                    const sendButton = page.locator('[data-testid="send-button"]');
+                    const sendButton = page.locator(CHATGPT_SEND_BUTTON_SELECTOR).first();
                     const sendVisible = await sendButton.isVisible().catch(() => false);
                     const sendEnabled = sendVisible && await sendButton.isEnabled().catch(() => false);
                     if (!sendEnabled) {
@@ -1264,8 +1299,8 @@ export function createAdminRouter(context) {
                                 }
                             }
 
-                            stopVisible = await page.locator('[data-testid="stop-button"]').isVisible().catch(() => false);
-                            const composerEmpty = !normalizeVisibleText(await composer.innerText().catch(() => ''));
+                            stopVisible = await page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first().isVisible().catch(() => false);
+                            const composerEmpty = !normalizeVisibleText(await readChatInputText(composer));
                             if (capturedConversationId && composerEmpty && stopVisible) {
                                 const streamState = await readChatGptStreamState(page, capturedConversationId).catch(() => null);
                                 return {
@@ -1377,7 +1412,7 @@ export function createAdminRouter(context) {
                         return;
                     }
 
-                    await clickVerifiedChatGptControl(page, page.locator('[data-testid="stop-button"]'));
+                    await clickVerifiedChatGptControl(page, page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first());
                     const stopped = await waitForStoppedStream(page, convId);
                     if (!stopped.stopped) {
                         sendJson(res, 409, {
@@ -1483,7 +1518,7 @@ export function createAdminRouter(context) {
                 // Cross-browser steering is intentionally Stop -> paste -> Send. A normal Send
                 // while a stale page only knows cloud IS_STREAMING can create a transcript turn
                 // without interrupting the generation the user is actually watching.
-                const stopButton = page.locator('[data-testid="stop-button"]');
+                const stopButton = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first();
                 const stopClick = await clickVerifiedChatGptControl(page, stopButton);
                 const stopped = await waitForStoppedStream(page, convId);
                 if (!stopped.stopped) {
@@ -1654,7 +1689,7 @@ export function createAdminRouter(context) {
                                     return;
                                 }
                                 mode = 'interrupt';
-                                await clickVerifiedChatGptControl(page, page.locator('[data-testid="stop-button"]'));
+                                await clickVerifiedChatGptControl(page, page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first());
                                 const stopped = await waitForStoppedStream(page, convId);
                                 if (!stopped.stopped) {
                                     sendJson(res, 409, {
@@ -1771,16 +1806,9 @@ export function createAdminRouter(context) {
 
                 const result = await page.evaluate(async ({ offset: o, limit: l, includeStatus, includeLastMessage }) => {
                     try {
-                        const sessionRes = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
-                        if (!sessionRes.ok) return { error: `session failed: ${sessionRes.status}` };
-                        const session = await sessionRes.json();
-                        const accessToken = session?.accessToken;
-                        if (!accessToken) return { error: `no access token, session keys: ${Object.keys(session || {}).join(',')}` };
-                        const headers = { 'Authorization': `Bearer ${accessToken}` };
-
                         let res = null;
                         for (let attempt = 0; attempt < 4; attempt += 1) {
-                            res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { headers });
+                            res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { credentials: 'include' });
                             if (res.ok || res.status !== 429) break;
                             await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
                         }
@@ -1815,14 +1843,14 @@ export function createAdminRouter(context) {
                         await Promise.all(items.map(async item => {
                             if (includeStatus) {
                                 try {
-                                    const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${item.id}/stream_status`, { headers });
+                                    const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${item.id}/stream_status`, { credentials: 'include' });
                                     if (sr.ok) item.stream_status = (await sr.json())?.status || null;
                                     else item.stream_status = `HTTP_${sr.status}`;
                                 } catch { item.stream_status = null; }
                             }
                             if (includeLastMessage) {
                                 try {
-                                    const cr = await fetch(`https://chatgpt.com/backend-api/conversation/${item.id}`, { headers });
+                                    const cr = await fetch(`https://chatgpt.com/backend-api/conversation/${item.id}`, { credentials: 'include' });
                                     if (!cr.ok) return;
                                     const conv = await cr.json();
                                     const visible = Object.values(conv.mapping || {}).map(n => visibleMessage(n?.message)).filter(Boolean);
@@ -1871,20 +1899,13 @@ export function createAdminRouter(context) {
 
                 const result = await page.evaluate(async ({ query: q, cursor: c }) => {
                     try {
-                        const sessionRes = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
-                        if (!sessionRes.ok) return { error: `session failed: ${sessionRes.status}` };
-                        const session = await sessionRes.json();
-                        const accessToken = session?.accessToken;
-                        if (!accessToken) return { error: `no access token, session keys: ${Object.keys(session || {}).join(',')}` };
-                        const headers = { 'Authorization': `Bearer ${accessToken}` };
-
                         const searchUrl = new URL('https://chatgpt.com/backend-api/conversations/search');
                         searchUrl.searchParams.set('query', q);
                         if (c) searchUrl.searchParams.set('cursor', c);
 
                         let res = null;
                         for (let attempt = 0; attempt < 4; attempt += 1) {
-                            res = await fetch(searchUrl.toString(), { headers });
+                            res = await fetch(searchUrl.toString(), { credentials: 'include' });
                             if (res.ok || res.status !== 429) break;
                             await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
                         }
@@ -1939,14 +1960,8 @@ export function createAdminRouter(context) {
                     try {
                         result = await attemptPage.evaluate(async (id) => {
                     try {
-                        const sessionRes = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
-                        if (!sessionRes.ok) return { error: `session failed: ${sessionRes.status}` };
-                        const session = await sessionRes.json();
-                        const accessToken = session?.accessToken;
-                        if (!accessToken) return { error: `no access token, session keys: ${Object.keys(session || {}).join(',')}` };
-
                         const res = await fetch(`https://chatgpt.com/backend-api/conversation/${id}`, {
-                            headers: { 'Authorization': `Bearer ${accessToken}` }
+                            credentials: 'include'
                         });
                         if (!res.ok) return { error: `api failed: ${res.status}` };
                         const data = await res.json();
@@ -1982,9 +1997,7 @@ export function createAdminRouter(context) {
 
                         let stream_status = null;
                         try {
-                            const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${id}/stream_status`, {
-                                headers: { 'Authorization': `Bearer ${accessToken}` }
-                            });
+                            const sr = await fetch(`https://chatgpt.com/backend-api/conversation/${id}/stream_status`, { credentials: 'include' });
                             stream_status = sr.ok ? ((await sr.json())?.status || null) : `HTTP_${sr.status}`;
                         } catch { }
 
@@ -2676,13 +2689,7 @@ export function createAdminRouter(context) {
                                 if (page) {
                                     const fullResult = await page.evaluate(async (convId) => {
                                         try {
-                                            const s = await fetch('https://chatgpt.com/api/auth/session', { credentials: 'include' });
-                                            const session = await s.json();
-                                            const token = session?.accessToken;
-                                            if (!token) return null;
-                                            const r = await fetch(`https://chatgpt.com/backend-api/conversation/${convId}`, {
-                                                headers: { 'Authorization': `Bearer ${token}` }
-                                            });
+                                            const r = await fetch(`https://chatgpt.com/backend-api/conversation/${convId}`, { credentials: 'include' });
                                             if (!r.ok) return null;
                                             const d = await r.json();
                                             const msgs = [];
