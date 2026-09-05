@@ -1413,66 +1413,92 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
 // session are used, exactly like the conversation listing/reading paths. These
 // calls never navigate the page and never touch the DOM, so they are safe to run
 // while a generation is streaming in the same tab.
+export function isTransientChatGptBrowserError(value) {
+    const message = String(value?.message || value || '');
+    return [
+        'Execution context was destroyed',
+        'NetworkError when attempting to fetch resource',
+        'Failed to fetch',
+        'Load failed',
+    ].some(fragment => message.includes(fragment));
+}
+
 export async function chatgptCloudRequest(page, { method = 'GET', path, query = null, body = null, retries = 2 }) {
     if (!page) throw new Error('ChatGPT browser page unavailable');
-    const result = await page.evaluate(async ({ method, path, query, body, retries }) => {
-        const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const normalizedMethod = String(method || 'GET').toUpperCase();
+    const pageAttempts = normalizedMethod === 'GET' ? 3 : 1;
+    let lastResult = null;
+
+    for (let pageAttempt = 0; pageAttempt < pageAttempts; pageAttempt += 1) {
         try {
-            let accessToken = null;
-            let sessionKeys = [];
-            try {
-                const sessionRes = await fetch('/api/auth/session', {
-                    credentials: 'include',
-                    cache: 'no-store',
-                    headers: { 'Cache-Control': 'no-cache' },
-                });
-                if (sessionRes.ok) {
-                    const session = await sessionRes.json();
-                    sessionKeys = Object.keys(session || {});
-                    accessToken = session?.accessToken || null;
-                }
-            } catch { }
-
-            const search = query ? new URLSearchParams(query).toString() : '';
-            const url = `https://chatgpt.com/backend-api/${String(path).replace(/^\//, '')}${search ? `?${search}` : ''}`;
-            const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
-            const hasBody = body !== null && body !== undefined;
-            if (hasBody) headers['Content-Type'] = 'application/json';
-
-            let lastHttp = null;
-            let lastBodyText = null;
-            for (let attempt = 0; attempt <= retries; attempt += 1) {
-                const res = await fetch(url, {
-                    method,
-                    headers,
-                    credentials: 'include',
-                    body: hasBody ? JSON.stringify(body) : undefined
-                });
-                lastHttp = res.status;
-                lastBodyText = await res.text();
-                if (res.ok) {
-                    const authMode = accessToken ? 'bearer-and-cookies' : 'cookies';
+            lastResult = await page.evaluate(async ({ method, path, query, body, retries }) => {
+                const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+                try {
+                    let accessToken = null;
+                    let sessionKeys = [];
                     try {
-                        return { ok: true, http: res.status, data: JSON.parse(lastBodyText), authMode, sessionKeys };
-                    } catch {
-                        return { ok: true, http: res.status, data: null, raw: lastBodyText.slice(0, 2000), authMode, sessionKeys };
+                        const sessionRes = await fetch('/api/auth/session', {
+                            credentials: 'include',
+                            cache: 'no-store',
+                            headers: { 'Cache-Control': 'no-cache' },
+                        });
+                        if (sessionRes.ok) {
+                            const session = await sessionRes.json();
+                            sessionKeys = Object.keys(session || {});
+                            accessToken = session?.accessToken || null;
+                        }
+                    } catch { }
+
+                    const search = query ? new URLSearchParams(query).toString() : '';
+                    const url = `https://chatgpt.com/backend-api/${String(path).replace(/^\//, '')}${search ? `?${search}` : ''}`;
+                    const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
+                    const hasBody = body !== null && body !== undefined;
+                    if (hasBody) headers['Content-Type'] = 'application/json';
+
+                    let lastHttp = null;
+                    let lastBodyText = null;
+                    for (let attempt = 0; attempt <= retries; attempt += 1) {
+                        const res = await fetch(url, {
+                            method,
+                            headers,
+                            credentials: 'include',
+                            body: hasBody ? JSON.stringify(body) : undefined
+                        });
+                        lastHttp = res.status;
+                        lastBodyText = await res.text();
+                        if (res.ok) {
+                            const authMode = accessToken ? 'bearer-and-cookies' : 'cookies';
+                            try {
+                                return { ok: true, http: res.status, data: JSON.parse(lastBodyText), authMode, sessionKeys };
+                            } catch {
+                                return { ok: true, http: res.status, data: null, raw: lastBodyText.slice(0, 2000), authMode, sessionKeys };
+                            }
+                        }
+                        if (res.status !== 429) break;
+                        await sleep(600 * (attempt + 1));
                     }
+                    return {
+                        ok: false,
+                        http: lastHttp,
+                        body: String(lastBodyText || '').slice(0, 2000),
+                        authMode: accessToken ? 'bearer-and-cookies' : 'cookies',
+                        sessionKeys,
+                    };
+                } catch (e) {
+                    return { ok: false, error: e.message };
                 }
-                if (res.status !== 429) break;
-                await sleep(600 * (attempt + 1));
-            }
-            return {
-                ok: false,
-                http: lastHttp,
-                body: String(lastBodyText || '').slice(0, 2000),
-                authMode: accessToken ? 'bearer-and-cookies' : 'cookies',
-                sessionKeys,
-            };
-        } catch (e) {
-            return { ok: false, error: e.message };
+            }, { method: normalizedMethod, path, query, body, retries });
+        } catch (error) {
+            lastResult = { ok: false, error: error?.message || String(error) };
         }
-    }, { method, path, query, body, retries });
-    return result;
+
+        if (lastResult?.ok || !isTransientChatGptBrowserError(lastResult?.error) || pageAttempt === pageAttempts - 1) {
+            return lastResult;
+        }
+        await page.waitForTimeout(300 * (pageAttempt + 1)).catch(() => {});
+    }
+
+    return lastResult || { ok: false, error: 'ChatGPT backend request failed' };
 }
 
 function cloudRequestError(result) {

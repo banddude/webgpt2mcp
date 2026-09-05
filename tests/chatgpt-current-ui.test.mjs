@@ -7,6 +7,7 @@ import {
     findChatInput,
     findChatGptSendButton,
     chatgptCloudRequest,
+    isTransientChatGptBrowserError,
     deleteChatGptConversation,
     dismissStaleChatGptAuthDialog,
 } from '../src/backend/adapter/chatgpt_text.js';
@@ -126,6 +127,45 @@ test('cloud management requests fall back to cookies when auth session has no ac
     assert.equal(backend.options.headers.Authorization, undefined);
 });
 
+
+test('transient ChatGPT browser error classification covers navigation fetch races', () => {
+    assert.equal(isTransientChatGptBrowserError('NetworkError when attempting to fetch resource.'), true);
+    assert.equal(isTransientChatGptBrowserError('Execution context was destroyed, most likely because of a navigation.'), true);
+    assert.equal(isTransientChatGptBrowserError('HTTP 404'), false);
+});
+
+test('cloud GET retries a transient browser fetch error but mutations are not replayed', async () => {
+    let getEvaluations = 0;
+    let getWaits = 0;
+    const getPage = {
+        async evaluate() {
+            getEvaluations += 1;
+            if (getEvaluations === 1) return { ok: false, error: 'NetworkError when attempting to fetch resource.' };
+            return { ok: true, http: 200, data: { items: [] }, authMode: 'bearer-and-cookies', sessionKeys: ['accessToken'] };
+        },
+        async waitForTimeout() { getWaits += 1; },
+    };
+    const getResult = await chatgptCloudRequest(getPage, { method: 'GET', path: 'conversations' });
+    assert.equal(getResult.ok, true);
+    assert.equal(getEvaluations, 2);
+    assert.equal(getWaits, 1);
+
+    let patchEvaluations = 0;
+    const patchPage = {
+        async evaluate() {
+            patchEvaluations += 1;
+            return { ok: false, error: 'NetworkError when attempting to fetch resource.' };
+        },
+        async waitForTimeout() { throw new Error('PATCH must not retry ambiguous mutations'); },
+    };
+    const patchResult = await chatgptCloudRequest(patchPage, {
+        method: 'PATCH',
+        path: 'conversation/12345678-1234-1234-1234-1234567890ab',
+        body: { is_visible: false },
+    });
+    assert.equal(patchResult.ok, false);
+    assert.equal(patchEvaluations, 1);
+});
 
 test('conversation delete uses current soft-delete PATCH contract', async () => {
     const requests = [];

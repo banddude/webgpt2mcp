@@ -68,6 +68,7 @@ import {
     moveChatGptConversationToProject,
     routeChatGptConversationToProject,
     chatgptCloudRequest,
+    isTransientChatGptBrowserError,
     selectChatGptModel,
     findChatInput,
     findChatGptSendButton,
@@ -2066,8 +2067,8 @@ export function createAdminRouter(context) {
                     }
                     const retryable = result?.error && (
                         result.error.includes('api failed: 429') ||
-                        result.error.includes('Execution context was destroyed') ||
-                        result.error.includes('Target page, context or browser has been closed')
+                        result.error.includes('Target page, context or browser has been closed') ||
+                        isTransientChatGptBrowserError(result.error)
                     );
                     if (!retryable || attempt === 5) break;
                     await new Promise(resolve => setTimeout(resolve, 2000 * (attempt + 1)));
