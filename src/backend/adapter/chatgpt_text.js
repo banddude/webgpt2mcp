@@ -1433,6 +1433,18 @@ export function isTransientChatGptBrowserError(value) {
     ].some(fragment => message.includes(fragment));
 }
 
+export function chatGptReadRetryDelayMs(result, attempt = 0) {
+    const retryAfterMs = Number(result?.retry_after_ms);
+    if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+        return Math.min(60000, Math.max(1000, Math.ceil(retryAfterMs)));
+    }
+    const message = String(result?.error || '');
+    if (message.includes('api failed: 429')) {
+        return Math.min(30000, 3000 * (2 ** Math.max(0, attempt)));
+    }
+    return Math.min(5000, 1000 * (Math.max(0, attempt) + 1));
+}
+
 export async function chatgptCloudRequest(page, { method = 'GET', path, query = null, body = null, retries = 2 }) {
     if (!page) throw new Error('ChatGPT browser page unavailable');
     const normalizedMethod = String(method || 'GET').toUpperCase();
