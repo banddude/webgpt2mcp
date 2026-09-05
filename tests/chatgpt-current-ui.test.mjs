@@ -6,6 +6,7 @@ import {
     CHATGPT_SEND_BUTTON_SELECTORS,
     findChatInput,
     findChatGptSendButton,
+    isChatGptSendControlVisibilityRace,
     chatgptCloudRequest,
     isTransientChatGptBrowserError,
     deleteChatGptConversation,
@@ -51,6 +52,13 @@ test('send control selection skips hidden duplicate buttons', async () => {
     };
     const found = await findChatGptSendButton(page);
     assert.equal(found, visible);
+});
+
+test('send control visibility race only classifies pre-click DOM failures', () => {
+    assert.equal(isChatGptSendControlVisibilityRace('elementHandle.click: Element is not visible'), true);
+    assert.equal(isChatGptSendControlVisibilityRace('Element is not attached to the DOM'), true);
+    assert.equal(isChatGptSendControlVisibilityRace('Timeout 10000ms exceeded while clicking'), false);
+    assert.equal(isChatGptSendControlVisibilityRace('Execution context was destroyed'), false);
 });
 
 test('cloud management requests use bearer plus cookies when accessToken is available', async () => {

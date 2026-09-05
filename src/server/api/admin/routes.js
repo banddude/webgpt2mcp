@@ -72,6 +72,7 @@ import {
     selectChatGptModel,
     findChatInput,
     findChatGptSendButton,
+    isChatGptSendControlVisibilityRace,
     waitForChatInput,
     readChatInputText,
     dismissStaleChatGptAuthDialog,
@@ -957,6 +958,31 @@ export function createAdminRouter(context) {
                 return { forced: false, overlay: null };
             };
 
+            const submitVerifiedChatGptTurn = async (page) => {
+                const sendButton = await findChatGptSendButton(page);
+                if (sendButton) {
+                    try {
+                        const click = await clickVerifiedChatGptControl(page, sendButton);
+                        return { ok: true, method: 'button', click };
+                    } catch (error) {
+                        if (!isChatGptSendControlVisibilityRace(error)) throw error;
+                    }
+                }
+
+                // ChatGPT can rerender the composer between locating its send button and
+                // clicking it. If that pre-click visibility race happens, reacquire and
+                // focus the already-verified composer, then use ChatGPT's normal Enter
+                // submission path. Do not replay ambiguous click failures here.
+                const overlay = await clearConversationRateLimitModal(page);
+                if (overlay.visible) {
+                    return { ok: false, error: 'conversation_rate_limit_modal' };
+                }
+                const composer = await waitForChatInput(page, { click: false, timeout: 15000 });
+                await composer.focus();
+                await page.keyboard.press('Enter');
+                return { ok: true, method: 'keyboard' };
+            };
+
             const waitForStoppedStream = async (page, convId, timeoutMs = 20000) => {
                 const deadline = Date.now() + timeoutMs;
                 let state = null;
@@ -1168,13 +1194,10 @@ export function createAdminRouter(context) {
                     };
                 }
 
-                const sendButton = await findChatGptSendButton(page);
-                if (!sendButton) {
-                    const visibleSendButton = await findChatGptSendButton(page, { requireEnabled: false });
-                    return { ok: false, error: 'send_button_unavailable', send_visible: Boolean(visibleSendButton) };
+                const submission = await submitVerifiedChatGptTurn(page);
+                if (!submission.ok) {
+                    return { ok: false, error: submission.error || 'send_button_unavailable' };
                 }
-
-                await clickVerifiedChatGptControl(page, sendButton);
 
                 const accepted = await waitForExactUserTurn(page, conversationUrl, prompt, userCountBefore, convId, cloudUserBefore);
                 if (!accepted.accepted) {
@@ -1280,14 +1303,11 @@ export function createAdminRouter(context) {
                     };
                     }
 
-                    const sendButton = await findChatGptSendButton(page);
-                    if (!sendButton) {
-                        const visibleSendButton = await findChatGptSendButton(page, { requireEnabled: false });
-                        return { ok: false, error: 'send_button_unavailable', send_visible: Boolean(visibleSendButton) };
-                    }
-
                     try {
-                        await clickVerifiedChatGptControl(page, sendButton);
+                        const submission = await submitVerifiedChatGptTurn(page);
+                        if (!submission.ok) {
+                            return { ok: false, error: submission.error || 'send_button_unavailable' };
+                        }
                         const deadline = Date.now() + 30000;
                         let latestUserText = '';
                         let stopVisible = false;

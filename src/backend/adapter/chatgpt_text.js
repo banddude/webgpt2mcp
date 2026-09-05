@@ -71,6 +71,16 @@ export async function findChatGptSendButton(page, { requireEnabled = true } = {}
     return null;
 }
 
+export function isChatGptSendControlVisibilityRace(value) {
+    const message = String(value?.message || value || '');
+    return [
+        'Element is not visible',
+        'Element is not attached',
+        'not attached to the DOM',
+        'element has been detached',
+    ].some(fragment => message.includes(fragment));
+}
+
 export async function dismissStaleChatGptAuthDialog(page) {
     const dialog = page.locator('#mobile-auth-dialog').first();
     const present = await dialog.isVisible().catch(() => false);
