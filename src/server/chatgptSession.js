@@ -200,6 +200,30 @@ export function createChatGptSessionManager({
             };
         }
 
+        // A rate-limited or erroring auth probe is NOT proof of being logged out.
+        // 2026-09-05: ChatGPT answered 429 to both /api/auth/session and
+        // /backend-api/me while the session was perfectly valid (the browser
+        // showed the account signed in). readBrowserSession only reports ok on
+        // a 2xx, so the 429 read as "logged out" and paged Mike to go log in
+        // for nothing. Worse, a success between two 429s clears
+        // loggedOutAlerted, so alertLoggedOutOnce fired again on the next 429:
+        // the "alert once" guarantee silently became one alert per blip (it
+        // paged five times). Treat transient statuses as unknown, alert on
+        // nothing, and leave the health state exactly as it was.
+        const transientAuthStatus = (status) =>
+            status === 429 || (typeof status === 'number' && status >= 500);
+        if (transientAuthStatus(session.backendMeHttpStatus) || transientAuthStatus(session.sessionHttpStatus)) {
+            return {
+                loggedIn: false,
+                state: 'auth-check-unavailable',
+                restoredCookies,
+                persisted: false,
+                reason: `auth probe unavailable (api/auth/session HTTP ${session.sessionHttpStatus ?? 'n/a'}, backend-api/me HTTP ${session.backendMeHttpStatus ?? 'n/a'}); not treating this as logged out`,
+                loginRequired: false,
+                transient: true,
+            };
+        }
+
         const detail = session.error
             || (session.backendMeHttpStatus ? `backend-api/me HTTP ${session.backendMeHttpStatus}; session keys: ${(session.sessionKeys || []).join(',') || 'none'}`
                 : `session keys: ${(session.sessionKeys || []).join(',') || 'none'}`);
