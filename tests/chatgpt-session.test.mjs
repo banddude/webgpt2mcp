@@ -159,3 +159,61 @@ test('WARNING_BANNER-only auth session remains logged in when backend-api/me pro
     assert.equal(status.loginRequired, undefined);
     assert.equal(alerts.length, 0);
 });
+
+test('a rate-limited auth probe is not reported as logged out and never alerts', async () => {
+    // 2026-09-05: ChatGPT answered 429 to both auth probes while the account was
+    // signed in (the bridge browser visibly showed it). The old code required a
+    // 2xx to call the session ok, so a 429 read as "logged out" and paged Mike to
+    // go log in for nothing.
+    const nowMs = Date.parse('2026-09-05T22:00:00.000Z');
+    const browser = fakeBrowser([
+        { ok: false, accessToken: null, sessionHttpStatus: 429, backendMeHttpStatus: 429, sessionKeys: [] },
+    ]);
+    const dir = await tempDir();
+    const alerts = [];
+    const manager = createChatGptSessionManager({
+        queueManager: browser.queueManager,
+        dataDir: dir,
+        now: () => nowMs,
+        notifier: async (message) => { alerts.push(message); },
+    });
+
+    const status = await manager.inspect();
+    assert.equal(status.state, 'auth-check-unavailable');
+    assert.equal(status.loggedIn, false);
+    assert.equal(status.loginRequired, false, 'a 429 must never ask Mike to log in');
+    assert.equal(status.transient, true);
+    assert.equal(alerts.length, 0, 'a transient auth failure must not page');
+});
+
+test('a 5xx auth probe is also transient, while a real 401 still alerts', async () => {
+    const nowMs = Date.parse('2026-09-05T22:05:00.000Z');
+    const dir = await tempDir();
+
+    const serverError = fakeBrowser([
+        { ok: false, accessToken: null, sessionHttpStatus: 503, backendMeHttpStatus: 503, sessionKeys: [] },
+    ]);
+    const alerts5xx = [];
+    const m1 = createChatGptSessionManager({
+        queueManager: serverError.queueManager, dataDir: dir, now: () => nowMs,
+        notifier: async (m) => { alerts5xx.push(m); },
+    });
+    const s1 = await m1.inspect();
+    assert.equal(s1.state, 'auth-check-unavailable');
+    assert.equal(alerts5xx.length, 0);
+
+    // A genuine unauthenticated answer must still page exactly once.
+    const dir2 = await tempDir();
+    const loggedOut = fakeBrowser([
+        { ok: false, accessToken: null, sessionHttpStatus: 200, backendMeHttpStatus: 401, sessionKeys: [] },
+    ]);
+    const alerts401 = [];
+    const m2 = createChatGptSessionManager({
+        queueManager: loggedOut.queueManager, dataDir: dir2, now: () => nowMs,
+        notifier: async (m) => { alerts401.push(m); },
+    });
+    const s2 = await m2.inspect();
+    assert.equal(s2.state, 'logged-out');
+    assert.equal(s2.loginRequired, true);
+    assert.equal(alerts401.length, 1, 'a real logout must still page');
+});
