@@ -6,10 +6,7 @@
 import { sendJson, sendApiError } from '../../respond.js';
 import { ERROR_CODES } from '../../errors.js';
 import { logger } from '../../../utils/logger.js';
-import {
-    recordWorkerSpawn,
-    startWorkerRegistryPoller
-} from '../worker-registry.js';
+import { recordWorkerSpawn } from '../worker-registry.js';
 import yaml from 'yaml';
 import {
     getSystemStatus,
@@ -275,37 +272,8 @@ export function createAdminRouter(context) {
         void drainDispatchJobs();
     });
 
-    // Registry completion checks use the existing exact conversation endpoint.
-    // The short internal HTTP read is intentionally independent from the
-    // dispatch control lock and never opens a streaming response.
-    startWorkerRegistryPoller({
-        intervalMs: process.env.CHATGPT_WORKER_POLL_INTERVAL_MS || 5000,
-        readConversation: async conversationId => {
-            const port = Number(config?.server?.port) || 3000;
-            const auth = config?.server?.auth;
-            if (!auth) return { error: 'server_auth_unavailable' };
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 10000);
-            try {
-                const response = await fetch(
-                    `http://127.0.0.1:${port}/admin/chatgpt/conversation/${encodeURIComponent(conversationId)}`,
-                    { headers: { Authorization: `Bearer ${auth}` }, signal: controller.signal }
-                );
-                const data = await response.json().catch(() => ({}));
-                if (!response.ok) {
-                    return {
-                        error: data?.error?.message || data?.error || `HTTP_${response.status}`,
-                        stream_status: `HTTP_${response.status}`
-                    };
-                }
-                return data;
-            } catch (error) {
-                return { error: error?.name === 'AbortError' ? 'conversation_read_timeout' : error?.message };
-            } finally {
-                clearTimeout(timeout);
-            }
-        }
-    });
+    // No background completion poller. Nothing in this service re-polls ChatGPT
+    // after a send; callers read a conversation once, on demand (Mike, 2026-09-07).
 
     // ==================== Skill 系统 ====================
 
@@ -1849,7 +1817,7 @@ export function createAdminRouter(context) {
                             success: true,
                             submitted: true,
                             detached: true,
-                            completion_polling: true,
+                            completion_polling: false,
                             browser_lane_released: 'after_submission',
                             active_before: wasActive,
                             mode,

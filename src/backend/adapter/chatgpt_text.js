@@ -1185,19 +1185,9 @@ async function generate(context, prompt, imgPaths, modelId, meta = {}) {
                     wsTextLen: wsCapturedText.length
                 };
             },
-            readCloudStreamStatus: async () => {
-                const convId = page.url().match(/\/c\/([0-9a-f-]{36})/i)?.[1] || capturedConversationId;
-                if (!convId) return null;
-                return await page.evaluate(async (id) => {
-                    try {
-                        const res = await fetch(`/backend-api/conversation/${id}/stream_status`, {
-                            credentials: 'include'
-                        });
-                        if (!res.ok) return `HTTP_${res.status}`;
-                        return (await res.json())?.status || null;
-                    } catch { return null; }
-                }, convId).catch(() => null);
-            },
+            // No cloud polling: the watchdog never calls ChatGPT's stream_status on a
+            // timer. Liveness comes from local page signals only (Mike, 2026-09-07).
+            readCloudStreamStatus: async () => null,
             onFail: (reason, waitedS) => logger.warn('适配器', `Watchdog: ${reason} after ${waitedS}s without model output activity; failing fast instead of holding the browser lane`, meta)
         });
         const watchdogPromise = watchdog.promise;
