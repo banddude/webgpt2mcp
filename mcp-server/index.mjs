@@ -367,7 +367,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: 'conversation_read',
-            description: 'Read one exact ChatGPT conversation and return its metadata, current streaming state, and full visible user/assistant transcript. Requires an exact conversation ID or exact ChatGPT conversation URL. Titles and fuzzy names are rejected.',
+            description: 'Read one exact ChatGPT conversation once and return its metadata, current streaming state, and full visible user/assistant transcript, including assistant image replies as [image] lines with a download URL (also in _meta.images). Requires an exact conversation ID or exact ChatGPT conversation URL. Titles and fuzzy names are rejected.',
             inputSchema: {
                 type: 'object',
                 properties: {
@@ -660,16 +660,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!Array.isArray(data.messages)) throw new Error('Conversation transcript was unavailable.');
 
             const status = data.stream_status || 'UNKNOWN';
-            const header = `${data.title || 'Untitled'}\nID: ${ref.id}\nURL: ${ref.url}\nStatus: ${status}\nMessages: ${data.messages.length}`;
+            const allImages = data.messages.flatMap(m => (Array.isArray(m.images) ? m.images : []).map(im => ({ role: m.role, file_id: im.file_id, download_url: im.download_url || null, asset_pointer: im.asset_pointer || null })));
+            const assistantTurns = data.messages.filter(m => m.role === 'assistant').length;
+            const header = `${data.title || 'Untitled'}\nID: ${ref.id}\nURL: ${ref.url}\nStatus: ${status}\nMessages: ${data.messages.length} (assistant turns: ${assistantTurns}, images: ${allImages.length})`;
             const transcript = data.messages.map((message, index) => {
                 const role = message.role === 'user' ? 'User' : 'Assistant';
                 const time = message.create_time ? new Date(message.create_time * 1000).toISOString() : '';
                 const model = message.model ? ` | model: ${message.model}` : '';
-                return `${index + 1}. ${role}${time ? ` | ${time}` : ''}${model}\n${message.text || ''}`;
+                const images = Array.isArray(message.images) ? message.images : [];
+                const imageLines = images.map(im => `[image] ${im.download_url || im.asset_pointer || im.file_id}${im.width && im.height ? ` (${im.width}x${im.height})` : ''}`);
+                const body = [message.text || '', ...imageLines].filter(Boolean).join('\n');
+                return `${index + 1}. ${role}${time ? ` | ${time}` : ''}${model}\n${body}`;
             }).join('\n\n');
             return {
                 content: [{ type: 'text', text: `${header}\n${'-'.repeat(40)}\n${transcript}` }],
-                _meta: { conversation_id: ref.id, conversation_url: ref.url, stream_status: status },
+                _meta: { conversation_id: ref.id, conversation_url: ref.url, stream_status: status, assistant_turns: assistantTurns, images: allImages },
             };
         }
 
