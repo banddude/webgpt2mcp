@@ -7,6 +7,7 @@ import { sendJson, sendApiError } from '../../respond.js';
 import { ERROR_CODES } from '../../errors.js';
 import { logger } from '../../../utils/logger.js';
 import { recordWorkerSpawn } from '../worker-registry.js';
+import { mapConversationMessages } from './cloud-transcript.js';
 import yaml from 'yaml';
 import {
     getSystemStatus,
@@ -1900,11 +1901,12 @@ export function createAdminRouter(context) {
                             if (role !== 'user' && role !== 'assistant') return null;
                             if (role === 'assistant' && ['analysis', 'thinking'].includes(msg.channel)) return null;
                             const type = msg.content.content_type;
-                            if (type !== 'text' && type !== 'multimodal_text') return null;
+                            if (type !== 'text' && type !== 'multimodal_text' && type !== 'image_asset_pointer') return null;
                             const parts = Array.isArray(msg.content.parts) ? msg.content.parts : [];
                             const text = parts.map(part => typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : '')).join('').trim();
-                            if (!text) return null;
-                            return { role, text, create_time: msg.create_time || null };
+                            const hasImage = type === 'image_asset_pointer' || parts.some(part => part && typeof part === 'object' && part.asset_pointer);
+                            if (!text && !hasImage) return null;
+                            return { role, text: text || '[image]', create_time: msg.create_time || null };
                         };
 
                         await Promise.all(items.map(async item => {
@@ -2044,7 +2046,8 @@ export function createAdminRouter(context) {
                         break;
                     }
                     try {
-                        result = await attemptPage.evaluate(async (id) => {
+                        result = await attemptPage.evaluate(async ({ id, mapperSrc }) => {
+                        const mapConversationMessages = new Function(`return (${mapperSrc})`)();
                     try {
                         let headers = {};
                         try {
@@ -2075,34 +2078,19 @@ export function createAdminRouter(context) {
                         }
                         const data = await res.json();
 
-                        const messages = [];
-                        const nodeMap = data.mapping || {};
-                        for (const node of Object.values(nodeMap)) {
-                            const msg = node.message;
-                            if (!msg || !msg.content) continue;
-                            const role = msg.author?.role;
-                            if (role !== 'user' && role !== 'assistant') continue;
-                            // Return conversational text only. ChatGPT's cloud graph also
-                            // contains internal reasoning/tool-call/code nodes that are not part of
-                            // the visible chat transcript and must not be surfaced as conversation
-                            // history.
-                            if (role === 'assistant' && ['analysis', 'thinking'].includes(msg.channel)) continue;
-                            const contentType = msg.content.content_type;
-                            if (contentType !== 'text' && contentType !== 'multimodal_text') continue;
-                            const parts = Array.isArray(msg.content.parts) ? msg.content.parts : [];
-                            const text = parts
-                                .map(part => typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : ''))
-                                .join('');
-                            if (!text.trim()) continue;
-                            messages.push({
-                                id: msg.id,
-                                role,
-                                text,
-                                model: msg.model || null,
-                                create_time: msg.create_time
-                            });
+                        const messages = mapConversationMessages(data.mapping || {});
+                        // Resolve image parts to downloadable URLs, once, on demand (never a poll).
+                        let imageBudget = 8;
+                        for (const m of messages) {
+                            for (const im of (m.images || [])) {
+                                if (imageBudget <= 0 || !im.file_id) { im.download_url = null; continue; }
+                                imageBudget -= 1;
+                                try {
+                                    const fr = await fetch(`https://chatgpt.com/backend-api/files/download/${im.file_id}`, { credentials: 'include', headers });
+                                    im.download_url = fr.ok ? ((await fr.json())?.download_url || null) : null;
+                                } catch { im.download_url = null; }
+                            }
                         }
-                        messages.sort((a, b) => (a.create_time || 0) - (b.create_time || 0));
 
                         let stream_status = null;
                         try {
@@ -2121,7 +2109,7 @@ export function createAdminRouter(context) {
                             messages,
                         };
                     } catch (e) { return { error: e.message }; }
-                        }, convId);
+                        }, { id: convId, mapperSrc: mapConversationMessages.toString() });
                     } catch (e) {
                         result = { error: e.message };
                     }
