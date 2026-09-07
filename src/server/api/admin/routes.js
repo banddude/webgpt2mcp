@@ -2029,19 +2029,27 @@ export function createAdminRouter(context) {
                             }
                         } catch { }
                         const meta = await fetch(`/backend-api/files/download/${id}`, { credentials: 'include', headers });
-                        if (!meta.ok) return { error: `download lookup failed: ${meta.status}` };
+                        if (!meta.ok) return JSON.stringify({ error: `download lookup failed: ${meta.status}` });
                         const info = await meta.json();
                         const url = info?.download_url;
-                        if (!url) return { error: 'no download_url for file' };
+                        if (!url) return JSON.stringify({ error: 'no download_url for file' });
                         let r = await fetch(url, { credentials: 'include', headers });
                         if (!r.ok && r.status !== 404) r = await fetch(url, { credentials: 'include' });
-                        if (!r.ok) return { error: `download failed: ${r.status}` };
+                        if (!r.ok) return JSON.stringify({ error: `download failed: ${r.status}` });
                         const blob = await r.blob();
-                        const buf = new Uint8Array(await blob.arrayBuffer());
-                        let bin = '';
-                        for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-                        return { content_type: blob.type || r.headers.get('content-type') || 'application/octet-stream', size: buf.length, file_name: info?.file_name || null, base64: btoa(bin) };
+                        // Return one primitive string: Playwright cannot serialize page-realm
+                        // objects out of the Firefox (camoufox) page ("Permission denied to access
+                        // property constructor"), and FileReader yields base64 without huge apply().
+                        const dataUrl = await new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onload = () => resolve(String(reader.result || ''));
+                            reader.onerror = () => reject(reader.error || new Error('read failed'));
+                            reader.readAsDataURL(blob);
+                        });
+                        const comma = dataUrl.indexOf(',');
+                        return JSON.stringify({ content_type: String(blob.type || r.headers.get('content-type') || 'application/octet-stream'), size: blob.size, file_name: info && info.file_name ? String(info.file_name) : null, base64: comma >= 0 ? dataUrl.slice(comma + 1) : '' });
                     }, fileId);
+                    file = typeof file === 'string' ? JSON.parse(file) : file;
                 } catch (e) {
                     file = { error: e?.message || String(e) };
                 }
