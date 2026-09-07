@@ -157,43 +157,32 @@ async function dispatchNewConversation({ prompt, model = 'gpt-instant', agent, p
     }
 }
 
-async function callChatGPT({ model = 'gpt-instant', messages, conversation_url, agent, project, timeout = 300000 }) {
-    const body = { model, messages };
-    if (conversation_url) body.conversation_url = conversation_url;
-    if (typeof agent === 'string' && agent.trim()) body.agent = agent.trim();
-    if (typeof project === 'string' && project.trim()) body.project = project.trim();
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeout);
-
-    try {
-        const response = await fetch(`${API_URL}/v1/chat/completions`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${API_KEY}`,
-            },
-            body: JSON.stringify(body),
-            signal: controller.signal,
-        });
-        const data = await response.json();
-        if (response.ok && !data?.error) await persistChatGptSession().catch(() => {});
-        return data;
-    } finally {
-        clearTimeout(timer);
-    }
+const DISPATCH_MODELS = new Set(['gpt-instant', 'gpt-thinking', 'gpt-pro']);
+function allowedDispatchModel(value) {
+    return DISPATCH_MODELS.has(value) ? value : 'gpt-instant';
 }
 
-function formatResult(data) {
-    if (data.error) {
-        return { content: [{ type: 'text', text: `Error: ${data.error.message || JSON.stringify(data.error)}` }], isError: true };
-    }
-    const content = data.choices?.[0]?.message?.content || 'No response';
-    const convUrl = data.conversation_url || '';
-    const model = data.model || '';
-    let text = content;
-    if (convUrl) text += `\n\n[conversation: ${convUrl} | model: ${model}]`;
-    return { content: [{ type: 'text', text }], _meta: { conversation_url: convUrl, model } };
+// Fire-and-forget result. The tool returns the moment ChatGPT accepts the
+// message; the reply is never awaited or returned here (Mike, 2026-09-07).
+function acceptedResult({ conversationId, conversationUrl, model, mode, dispatched = {} }) {
+    const text = `Accepted. ChatGPT received the message and is answering server-side; this tool does not wait for the reply.\n`
+        + `Read it later with conversation_read on the exact URL below, or have the agent report back with notify aiva.\n\n`
+        + `[conversation: ${conversationUrl}${model ? ` | model: ${model}` : ''}]`;
+    return {
+        content: [{ type: 'text', text }],
+        _meta: {
+            conversation_id: conversationId || null,
+            conversation_url: conversationUrl,
+            model: model || null,
+            mode,
+            accepted: true,
+            detached: true,
+            completion_polling: false,
+            active_before: !!dispatched.active_before,
+            exact_user_turn_confirmed: !!dispatched.exact_user_turn_confirmed,
+            response_started: dispatched.stream_status_after ?? dispatched.response_started ?? null,
+        },
+    };
 }
 
 // ==========================================
@@ -346,7 +335,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             // Keep the published connector name working while clients migrate
             // to the explicit create/send surface below.
             name: 'chatgpt',
-            description: 'Compatibility entry point for sending a ChatGPT message. It creates a new conversation unless an exact conversation URL is supplied.',
+            description: 'Compatibility entry point. Sends one message and returns as soon as ChatGPT accepts it, with the exact conversation URL. It never waits for or returns the reply: read it later with conversation_read on that URL, or have the agent report back with notify aiva. Creates a new conversation unless an exact conversation URL is supplied.',
             inputSchema: {
                 type: 'object',
                 properties: {
@@ -401,7 +390,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: 'send',
-            description: 'Send a message to one exact existing ChatGPT conversation. Requires an exact conversation ID or URL and never creates a new chat. If that conversation is currently generating, send automatically performs Stop, waits for the old response to stop, then sends the new message through the normal exact-send path.',
+            description: 'Send a message to one exact existing ChatGPT conversation and return as soon as ChatGPT accepts it. Requires an exact conversation ID or URL and never creates a new chat. It never waits for or returns the reply: read it later with conversation_read on the URL, or have the agent report back with notify aiva. If the conversation is still generating, Stop is pressed and confirmed first, then the message is sent.',
             inputSchema: {
                 type: 'object',
                 properties: {
@@ -436,7 +425,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: 'create',
-            description: 'Create a brand-new ChatGPT conversation and send its first message. This is the only tool in this MCP that is allowed to create a new conversation.',
+            description: 'Create a brand-new ChatGPT conversation and send its first message. This is the only tool in this MCP that is allowed to create a new conversation. Returns as soon as ChatGPT accepts the message, with the new exact conversation URL. It never waits for or returns the reply: read it later with conversation_read on that URL, or have the agent report back with notify aiva.',
             inputSchema: {
                 type: 'object',
                 properties: {
@@ -617,33 +606,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
             if (!prompt) return { content: [{ type: 'text', text: 'Error: prompt is required.' }], isError: true };
 
-            const allowedModels = new Set(['gpt-instant', 'gpt-thinking', 'gpt-pro']);
-            const model = allowedModels.has(args.model) ? args.model : 'gpt-instant';
-            const messages = [];
-            if (typeof args.system_prompt === 'string' && args.system_prompt.trim()) {
-                messages.push({ role: 'system', content: args.system_prompt.trim() });
-            }
-            messages.push({ role: 'user', content: prompt });
+            const model = allowedDispatchModel(args.model);
+            const systemPrompt = typeof args.system_prompt === 'string' ? args.system_prompt.trim() : '';
+            const fullPrompt = systemPrompt ? `System instructions:\n${systemPrompt}\n\nUser:\n${prompt}` : prompt;
+            const agent = typeof args.agent === 'string' ? args.agent.trim() : undefined;
+            const project = typeof args.project === 'string' ? args.project.trim() : undefined;
+            const continueRef = typeof args.conversation_url === 'string' && args.conversation_url.trim()
+                ? parseConversationRef(args.conversation_url.trim())
+                : null;
+            if (typeof args.conversation_url === 'string' && args.conversation_url.trim() && !continueRef) return exactRefError();
 
-            const data = await callChatGPT({
-                model,
-                messages,
-                conversation_url: typeof args.conversation_url === 'string' ? args.conversation_url.trim() : undefined,
-                agent: typeof args.agent === 'string' ? args.agent.trim() : undefined,
-                project: typeof args.project === 'string' ? args.project.trim() : undefined,
-            });
-            const result = formatResult(data);
-            const convUrl = data.conversation_url || '';
-            if (convUrl && !data.error) {
+            const dispatched = continueRef
+                ? await dispatchExactConversation({ conversation_url: continueRef.url, prompt: fullPrompt, agent, project })
+                : await dispatchNewConversation({ prompt: fullPrompt, model, agent, project });
+            const convUrl = continueRef ? continueRef.url : (dispatched.conversation_url || '');
+            const convId = continueRef ? continueRef.id : (dispatched.conversation_id || null);
+            if (convUrl) {
                 await recordSession({
                     conversation_url: convUrl,
                     model,
                     prompt,
-                    response_content: data.choices?.[0]?.message?.content || '',
+                    response_content: '',
                     topic: typeof args.topic === 'string' ? args.topic.trim() : '',
                 });
             }
-            return result;
+            return acceptedResult({ conversationId: convId, conversationUrl: convUrl, model, mode: continueRef ? 'send' : 'create', dispatched });
         }
 
         if (name === 'conversations_list') {
@@ -736,12 +723,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             await recordSession({ conversation_url: ref.url, model: 'unknown', prompt: message, response_content: '', topic: '' });
             const behavior = dispatched.active_before ? 'The previous active response was stopped first, then the message was sent.' : 'The message was sent to the idle conversation.';
             return {
-                content: [{ type: 'text', text: `${behavior}\n\n[conversation: ${ref.url}]` }],
+                content: [{ type: 'text', text: `${behavior} This tool did not wait for the reply; read it later with conversation_read on this URL, or have the agent report back with notify aiva.\n\n[conversation: ${ref.url}]` }],
                 _meta: {
                     conversation_id: ref.id,
                     conversation_url: ref.url,
-                    detached: dispatched.detached !== false,
-                    completion_polling: dispatched.completion_polling !== false,
+                    accepted: true,
+                    detached: true,
+                    completion_polling: false,
                     active_before: !!dispatched.active_before,
                     exact_user_turn_confirmed: !!dispatched.exact_user_turn_confirmed,
                     response_started: dispatched.response_started ?? null,
@@ -781,7 +769,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     conversation_id: dispatched.conversation_id,
                     conversation_url: conversationUrl,
                     detached: true,
-                    completion_polling: true,
+                    completion_polling: false,
                     stream_status: dispatched.stream_status_after || null,
                 },
             };
@@ -790,25 +778,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (name === 'create') {
             const message = typeof args.message === 'string' ? args.message.trim() : '';
             if (!message) return { content: [{ type: 'text', text: 'Error: message is required.' }], isError: true };
-            const model = args.model || 'gpt-instant';
-            const data = await callChatGPT({
+            const model = allowedDispatchModel(args.model);
+            const dispatched = await dispatchNewConversation({
+                prompt: message,
                 model,
-                messages: [{ role: 'user', content: message }],
                 agent: typeof args.agent === 'string' ? args.agent.trim() : undefined,
                 project: typeof args.project === 'string' ? args.project.trim() : undefined,
             });
-            const result = formatResult(data);
-            const convUrl = data.conversation_url || '';
-            if (convUrl && !data.error) {
-                await recordSession({
-                    conversation_url: convUrl,
-                    model,
-                    prompt: message,
-                    response_content: data.choices?.[0]?.message?.content || '',
-                    topic: '',
-                });
+            const convUrl = dispatched.conversation_url || '';
+            if (convUrl) {
+                await recordSession({ conversation_url: convUrl, model, prompt: message, response_content: '', topic: '' });
             }
-            return result;
+            return acceptedResult({ conversationId: dispatched.conversation_id, conversationUrl: convUrl, model, mode: 'create', dispatched });
         }
 
         if (name === 'stop') {
