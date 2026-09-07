@@ -2018,12 +2018,23 @@ export function createAdminRouter(context) {
                 let file;
                 try {
                     file = await filePage.evaluate(async (id) => {
-                        const meta = await fetch(`/backend-api/files/download/${id}`, { credentials: 'include' });
+                        // Same auth as the conversation reader: the files API wants the
+                        // session bearer, cookies alone answer 403.
+                        let headers = {};
+                        try {
+                            const sessionRes = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' });
+                            if (sessionRes.ok) {
+                                const session = await sessionRes.json();
+                                if (session?.accessToken) headers = { Authorization: `Bearer ${session.accessToken}` };
+                            }
+                        } catch { }
+                        const meta = await fetch(`/backend-api/files/download/${id}`, { credentials: 'include', headers });
                         if (!meta.ok) return { error: `download lookup failed: ${meta.status}` };
                         const info = await meta.json();
                         const url = info?.download_url;
                         if (!url) return { error: 'no download_url for file' };
-                        const r = await fetch(url, { credentials: 'include' });
+                        let r = await fetch(url, { credentials: 'include', headers });
+                        if (!r.ok && r.status !== 404) r = await fetch(url, { credentials: 'include' });
                         if (!r.ok) return { error: `download failed: ${r.status}` };
                         const blob = await r.blob();
                         const buf = new Uint8Array(await blob.arrayBuffer());
