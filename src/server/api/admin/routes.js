@@ -2001,6 +2001,49 @@ export function createAdminRouter(context) {
 
             // GET /admin/chatgpt/conversation?conversation=<exact id> or
             // GET /admin/chatgpt/conversation/:id - 获取指定会话的完整历史
+            // GET /admin/chatgpt/file/<file_id> - fetch one ChatGPT-hosted file (image
+            // replies) through the logged-in page and stream the bytes back. One request,
+            // on demand, never a poll. The download URL is cookie-gated on chatgpt.com,
+            // so it can only be read from inside the browser session.
+            const fileMatch = pathname.match(/^\/chatgpt\/file\/(file[_-][A-Za-z0-9_-]+)$/);
+            if (method === 'GET' && fileMatch) {
+                const fileId = fileMatch[1];
+                let filePool = queueManager?.getPoolContext?.();
+                if (!filePool) filePool = await queueManager?.initializePool?.();
+                const filePage = await selectChatGptControlPage(filePool);
+                if (!filePage) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: 'ChatGPT browser page unavailable' });
+                    return;
+                }
+                let file;
+                try {
+                    file = await filePage.evaluate(async (id) => {
+                        const meta = await fetch(`/backend-api/files/download/${id}`, { credentials: 'include' });
+                        if (!meta.ok) return { error: `download lookup failed: ${meta.status}` };
+                        const info = await meta.json();
+                        const url = info?.download_url;
+                        if (!url) return { error: 'no download_url for file' };
+                        const r = await fetch(url, { credentials: 'include' });
+                        if (!r.ok) return { error: `download failed: ${r.status}` };
+                        const blob = await r.blob();
+                        const buf = new Uint8Array(await blob.arrayBuffer());
+                        let bin = '';
+                        for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+                        return { content_type: blob.type || r.headers.get('content-type') || 'application/octet-stream', size: buf.length, file_name: info?.file_name || null, base64: btoa(bin) };
+                    }, fileId);
+                } catch (e) {
+                    file = { error: e?.message || String(e) };
+                }
+                if (!file || file.error) {
+                    sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: file?.error || 'file fetch failed' });
+                    return;
+                }
+                const bytes = Buffer.from(file.base64, 'base64');
+                res.writeHead(200, { 'Content-Type': file.content_type, 'Content-Length': bytes.length, 'X-File-Name': encodeURIComponent(file.file_name || fileId) });
+                res.end(bytes);
+                return;
+            }
+
             const convDetailMatch = pathname.match(/^\/chatgpt\/conversation\/([0-9a-f-]+)$/);
             let convDetailId = convDetailMatch?.[1] || null;
             if (method === 'GET' && pathname === '/chatgpt/conversation') {
