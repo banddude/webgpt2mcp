@@ -1,18 +1,27 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import http from 'node:http';
+import vm from 'node:vm';
 import { createGlobalRouter } from '../src/server/api/index.js';
 import { createQueueManager } from '../src/server/queue.js';
 import { fillExactPrompt, submitTurnOnce } from '../src/server/chatgptSubmit.js';
 import { AdapterRegistry } from '../src/backend/registry.js';
 import { manifest as textBrowser, chatgptCloudRequest } from '../src/backend/adapter/chatgpt_text.js';
 import { manifest as imageBrowser } from '../src/backend/adapter/chatgpt.js';
+import { isolateSessionTests } from './session-test-isolation.mjs';
+
+isolateSessionTests();
 
 const ID = '12345678-1234-1234-1234-1234567890ab';
 const URL = `https://chatgpt.com/c/${ID}`;
 const PROMPT = '  Exact café 🧪\n\nKeep\tspacing, `ticks` and $(literal).\n  ';
 async function fixture(context) {
-    const server = http.createServer(createGlobalRouter({ authToken: 'test-token', config: {}, ...context }));
+    const missingSessionFake = () => { throw new Error('HTTP fixture requires an explicit fake session operation'); };
+    const server = http.createServer(createGlobalRouter({ authToken: 'test-token', config: {}, ...context,
+        chatGptSession: context.chatGptSession ?? {
+            inspect: missingSessionFake, openLogin: missingSessionFake, persistAfterSuccess: missingSessionFake,
+        },
+    }));
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
     return {
@@ -26,6 +35,17 @@ async function fixture(context) {
         close: () => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }),
     };
 }
+
+test('HTTP fixture rejects an omitted auth fake before browser or notifier access', async () => {
+    let browserAccesses = 0;
+    const api = await fixture({ queueManager: { getPoolContext: () => { browserAccesses++; } } });
+    try {
+        const result = await api.call('/admin/chatgpt/status', { method: 'GET' });
+        assert.equal(result.status, 500);
+        assert.match(JSON.stringify(result.body), /HTTP fixture requires an explicit fake session operation/);
+        assert.equal(browserAccesses, 0);
+    } finally { await api.close(); }
+});
 
 test('retired HTTP model and task endpoints cannot inspect a browser or enqueue work', async () => {
     let calls = 0;
@@ -160,6 +180,51 @@ test('an explicit HTTP read returns one snapshot or a rate limit without complet
         assert.equal(reads, 2, '429 returns immediately and never starts a scheduled retry');
     } finally { await api.close(); }
 });
+
+for (const { name, path, target } of [
+    { name: 'conversation list',
+        path: '/admin/chatgpt/conversations?offset=2&limit=3&include_status=1&include_last_message=1',
+        target: 'https://chatgpt.com/backend-api/conversations?offset=2&limit=3&order=updated' },
+    { name: 'conversation search',
+        path: '/admin/chatgpt/search?q=fixture%20%26%20phrase&cursor=fake%2Fcursor',
+        target: 'https://chatgpt.com/backend-api/conversations/search?query=fixture+%26+phrase&cursor=fake%2Fcursor' },
+]) {
+    test(`${name} returns a rate limit after one authenticated read with no scheduled wait`, async () => {
+        for (const accessToken of ['fake-only-access-token', undefined]) {
+            const requests = [];
+            const waits = [];
+            // Run the actual browser callback with isolated fetch/timer fakes.
+            // No website connection or browser process is used by this fixture.
+            const page = { evaluate: async (callback, input) => vm.runInNewContext(`(${callback.toString()})(input)`, {
+                input, URL: globalThis.URL,
+                fetch: async (url, options) => {
+                    requests.push({ url, options });
+                    if (url === '/api/auth/session') return { ok: true, json: async () => ({ accessToken }) };
+                    assert.equal(url, target, 'no fallback or additional read is allowed');
+                    return { ok: false, status: 429 };
+                },
+                setTimeout: (callback, delay) => { waits.push(delay); callback(); },
+            }, { timeout: 1000 }) };
+            const queue = { getPoolContext: () => ({ poolManager: { getFirstPage: () => page } }) };
+            const api = await fixture({ queueManager: queue, chatGptSession: { inspect: async () => ({ loggedIn: true }) } });
+            try {
+                assert.equal((await api.call(path, { method: 'GET', auth: false })).status, 401);
+                assert.equal(requests.length, 0, 'HTTP auth denial must happen before browser reads');
+                const result = await api.call(path, { method: 'GET' });
+                assert.equal(requests.filter(request => request.url === target).length, 1);
+                assert.deepEqual(waits, [], 'a rate limit must not schedule a retry delay');
+                assert.equal(requests.length, 2, 'one auth lookup and one conversation read');
+                assert.equal(requests[0].url, '/api/auth/session');
+                assert.equal(requests[0].options.credentials, 'include');
+                assert.equal(requests[0].options.cache, 'no-store');
+                assert.equal(requests[1].options.credentials, 'include');
+                assert.deepEqual({ ...requests[1].options.headers }, accessToken ? { Authorization: `Bearer ${accessToken}` } : {});
+                assert.equal(result.status, 500);
+                assert.match(JSON.stringify(result.body), /api failed: 429/);
+            } finally { await api.close(); }
+        }
+    });
+}
 
 test('keyboard submission is only used when no click was attempted, and preserves modal denial', async () => {
     let presses = 0;

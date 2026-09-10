@@ -1504,12 +1504,7 @@ export function createAdminRouter(context) {
                                 if (session?.accessToken) headers = { Authorization: `Bearer ${session.accessToken}` };
                             }
                         } catch { }
-                        let res = null;
-                        for (let attempt = 0; attempt < 4; attempt += 1) {
-                            res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { credentials: 'include', headers });
-                            if (res.ok || res.status !== 429) break;
-                            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
-                        }
+                        const res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { credentials: 'include', headers });
                         if (!res?.ok) return { error: `api failed: ${res?.status || 'unknown'}` };
                         const data = await res.json();
                         const items = (data.items || []).map(c => ({
@@ -1610,12 +1605,7 @@ export function createAdminRouter(context) {
                         searchUrl.searchParams.set('query', q);
                         if (c) searchUrl.searchParams.set('cursor', c);
 
-                        let res = null;
-                        for (let attempt = 0; attempt < 4; attempt += 1) {
-                            res = await fetch(searchUrl.toString(), { credentials: 'include', headers });
-                            if (res.ok || res.status !== 429) break;
-                            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
-                        }
+                        const res = await fetch(searchUrl.toString(), { credentials: 'include', headers });
                         if (!res?.ok) return { error: `api failed: ${res?.status || 'unknown'}` };
                         return await res.json();
                     } catch (e) { return { error: e.message }; }

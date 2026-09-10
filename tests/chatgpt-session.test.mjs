@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 import { createChatGptSessionManager } from '../src/server/chatgptSession.js';
+import { isolateSessionTests } from './session-test-isolation.mjs';
+
+const isolation = isolateSessionTests();
 
 function jwt(payload) {
     const encode = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
@@ -49,7 +51,7 @@ function fakeBrowser(sessionResults, { storageCookies = [] } = {}) {
 }
 
 async function tempDir() {
-    return fs.mkdtemp(path.join(os.tmpdir(), 'webgpt-session-test-'));
+    return fs.mkdtemp(path.join(isolation.dataRoot(), 'session-'));
 }
 
 test('logged-in status reports token age/expiry and persists browser state', async () => {
