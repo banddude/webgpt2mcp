@@ -1,7 +1,7 @@
 {
 	"name": "chatgpt-web-gateway",
 	"version": "3.0.0",
-	"description": "OpenAI-compatible ChatGPT Web gateway based on WebAI2API, Playwright and Camoufox",
+	"description": "Explicit ChatGPT website commands through CLI and MCP",
 	"license": "MIT",
 	"author": "foxhui",
 	"type": "module",
@@ -10,8 +10,8 @@
 		"genkey": "node scripts/genkey.js",
 		"init": "node scripts/init.js",
 		"postinstall": "node scripts/postinstall.js",
-		"test": "node --test tests/*.test.mjs",
-		"smoke:chatgpt": "node scripts/smoke-chatgpt-current-ui.mjs --dispatch"
+		"test": "node --test tests/*.test.mjs tests/test_*.mjs",
+		"smoke:chatgpt": "node --test tests/one-shot-http.test.mjs"
 	},
 	"imports": {
 		"#config": "./src/config/index.js",

@@ -12,15 +12,29 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONV = '6a9f18a6-3510-83e8-b328-f178696257a7';
 
 function fakeApi() {
-    const hits = { dispatch: 0, completions: 0 };
+    const hits = { dispatch: 0, completions: 0, reads: 0, requests: [] };
     const server = http.createServer((req, res) => {
         let body = '';
         req.on('data', c => { body += c; });
         req.on('end', () => {
+            const payload = body ? JSON.parse(body) : {};
+            hits.requests.push({ path: req.url, body: payload });
             if (req.url === '/admin/chatgpt/dispatch') {
                 hits.dispatch += 1;
+                if (payload.prompt === '__uncertain__') {
+                    res.writeHead(502, { 'content-type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, submitted: null, submission_attempted: true, error: 'send_outcome_unknown', actual_url: `https://chatgpt.com/c/${CONV}` }));
+                    return;
+                }
+                if (payload.prompt === '__disconnect__') { req.socket.destroy(); return; }
                 res.writeHead(200, { 'content-type': 'application/json' });
                 res.end(JSON.stringify({ success: true, submitted: true, detached: true, conversation_id: CONV, conversation_url: `https://chatgpt.com/c/${CONV}`, exact_user_turn_confirmed: true, stream_status_after: 'IS_STREAMING' }));
+                return;
+            }
+            if (req.url === `/admin/chatgpt/conversation/${CONV}`) {
+                hits.reads++;
+                res.writeHead(200, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ id: CONV, stream_status: 'IS_STREAMING', messages: [{ role: 'assistant', text: 'Partial answer' }] }));
                 return;
             }
             if (req.url === '/v1/chat/completions') { hits.completions += 1; return; } // hang forever: a slow ChatGPT answer
@@ -50,7 +64,7 @@ function mcpClient(port) {
     let id = 0;
     const call = (method, params, timeoutMs = 5000) => new Promise((resolve, reject) => { const mid = ++id; const t = setTimeout(() => { pending.delete(mid); reject(new Error(`${method} did not return within ${timeoutMs}ms`)); }, timeoutMs); pending.set(mid, m => { clearTimeout(t); resolve(m); }); child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: mid, method, params }) + '\n'); });
     const notify = (method, params = {}) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
-    const close = () => { child.kill(); fs.rmSync(tmp, { recursive: true, force: true }); };
+    const close = async () => { const exited = new Promise(resolve => child.once('exit', resolve)); child.kill(); await exited; fs.rmSync(tmp, { recursive: true, force: true }); };
     return { call, notify, close };
 }
 
@@ -80,7 +94,7 @@ test('create returns on acceptance while ChatGPT is still generating and never t
             const tool = list.result.tools.find(t => t.name === name);
             assert.match(tool.description, /never waits for or returns the reply/i, `${name} description must say it never waits`);
         }
-    } finally { c.close(); api.server.close(); }
+    } finally { await c.close(); api.server.closeAllConnections(); api.server.close(); }
 });
 
 test('no background poller and no cloud stream_status polling remain in the service', () => {
@@ -88,8 +102,69 @@ test('no background poller and no cloud stream_status polling remain in the serv
     assert.ok(!routes.includes('startWorkerRegistryPoller'), 'worker registry poller must not be wired');
     assert.ok(!routes.includes('completion_polling: true'), 'dispatch must not advertise polling');
     const adapter = fs.readFileSync(path.join(root, 'src/backend/adapter/chatgpt_text.js'), 'utf8');
-    assert.ok(adapter.includes('readCloudStreamStatus: async () => null'), 'watchdog must not poll stream_status');
+    assert.ok(!adapter.includes('startStreamWatchdog'), 'retired watchdog implementation must be gone');
     assert.equal((adapter.match(/backend-api\/conversation\/\$\{id\}\/stream_status/g) || []).length, 0);
     const mcp = fs.readFileSync(path.join(root, 'mcp-server/index.mjs'), 'utf8');
     assert.ok(!mcp.includes('/v1/chat/completions'), 'MCP must not use the blocking completions endpoint');
+});
+
+
+test('MCP sends exact text once for every send tool; unknown options and failed sends never replay', { skip: sdkModulesDir() ? false : 'MCP SDK dependencies required' }, async () => {
+    const api = await fakeApi();
+    const c = mcpClient(api.port);
+    const exact = '  Café 🧪\n\nKeep\tspacing and `ticks` $(literal).\n  ';
+    try {
+        await c.call('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'exact', version: '1' } });
+        c.notify('notifications/initialized');
+        for (const [name, args] of [
+            ['create', { message: exact }],
+            ['dispatch', { prompt: exact }],
+            ['chatgpt', { prompt: exact }],
+            ['chatgpt', { prompt: exact, conversation_url: `https://chatgpt.com/c/${CONV}` }],
+            ['send', { message: exact, conversation: `https://chatgpt.com/c/${CONV}` }],
+        ]) {
+            const before = api.hits.requests.length;
+            const result = await c.call('tools/call', { name, arguments: args });
+            assert.equal(result.result.isError, undefined, result.result.content[0].text);
+            assert.equal(api.hits.requests.length, before + 1, 'exactly one HTTP command; no persistence or completion request');
+            assert.equal(api.hits.requests.at(-1).body.prompt, exact);
+            assert.equal(api.hits.requests.at(-1).path, '/admin/chatgpt/dispatch');
+            assert.equal(api.hits.reads, 0);
+        }
+        const count = api.hits.requests.length;
+        for (const [name, args] of [
+            ['chatgpt', { prompt: exact, system_prompt: 'secret instructions' }],
+            ['chatgpt', { prompt: exact, conversation_url: 0 }],
+            ['chatgpt', { prompt: exact, conversation_url: '' }],
+            ['create', { message: exact, agent: 'aiva' }],
+            ['send', { message: exact, conversation: `https://chatgpt.com/c/${CONV}`, tools: [] }],
+            ['dispatch', { prompt: exact, model: 'codex' }],
+            ['send', { message: exact, conversation: 'a fuzzy title' }],
+            ['delete', { conversation: `https://chatgpt.com/c/${CONV}` }],
+            ['project_delete', { project: 'g-p-abc123', confirm: false }],
+        ]) {
+            const result = await c.call('tools/call', { name, arguments: args });
+            assert.equal(result.result.isError, true, name);
+        }
+        assert.equal(api.hits.requests.length, count, 'rejected arguments must not touch HTTP');
+        for (const prompt of ['__uncertain__', '__disconnect__']) {
+            const before = api.hits.dispatch;
+            const result = await c.call('tools/call', { name: 'create', arguments: { message: prompt } });
+            assert.equal(result.result.isError, true);
+            assert.match(result.result.content[0].text, /do not resubmit automatically/i);
+            assert.equal(api.hits.dispatch, before + 1);
+            assert.equal(api.hits.reads, 0);
+        }
+        const read = await c.call('tools/call', { name: 'conversation_read', arguments: { conversation: `https://chatgpt.com/c/${CONV}` } });
+        assert.equal(read.result._meta.stream_status, 'IS_STREAMING');
+        assert.match(read.result.content[0].text, /Partial answer/);
+        assert.equal(api.hits.reads, 1, 'explicit read returns the current partial reply without waiting');
+        assert.equal(api.hits.completions, 0);
+        const schemas = await c.call('tools/list', {});
+        for (const name of ['create', 'dispatch', 'chatgpt', 'send']) {
+            const tool = schemas.result.tools.find(tool => tool.name === name);
+            assert.equal(tool.inputSchema.properties.system_prompt, undefined);
+            assert.doesNotMatch(tool.description, /notify aiva/);
+        }
+    } finally { await c.close(); api.server.closeAllConnections(); api.server.close(); }
 });

@@ -13,7 +13,6 @@ import { fileURLToPath } from 'node:url';
 
 const REGISTRY_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'data');
 const REGISTRY_PATH = path.join(REGISTRY_DIR, 'worker-registry.jsonl');
-const DEFAULT_POLL_INTERVAL_MS = 5000;
 
 // Matches plain https://chatgpt.com/c/<id> and project-scoped
 // https://chatgpt.com/g/<project>/c/<id> URLs alike.
@@ -32,9 +31,7 @@ function cleanText(value) {
     return typeof value === 'string' ? value.trim() : '';
 }
 
-// Keep append operations ordered. A completion poll can run at the same time as
-// a newly accepted dispatch, and the append-only journal must never put the
-// close line ahead of the corresponding open line.
+// Keep explicit journal writes ordered; no completion observer runs here.
 let appendTail = Promise.resolve();
 
 function appendLine(entry) {
@@ -52,10 +49,6 @@ function appendLine(entry) {
 
 function normalizeConversationId(conversationId, url) {
     return cleanText(conversationId).toLowerCase() || conversationIdFromUrl(url);
-}
-
-function normalizeMessageText(value) {
-    return cleanText(value).replace(/\s+/g, ' ');
 }
 
 function registryEntryUrl(id, url) {
@@ -155,99 +148,4 @@ export async function openWorkerRegistryStates() {
     }
     return workerRegistryStates(parseRegistryLines(content))
         .filter(state => state.status === 'open');
-}
-
-/**
- * A conversation is complete only when its cloud read is authoritative,
- * reports a non-streaming state, and the visible transcript ends in an
- * assistant turn. This prevents a transient 429/unknown state or a prompt
- * that has not started yet from being closed prematurely.
- */
-export function isConversationComplete(conversation, expectedPrompt = '') {
-    if (!conversation || conversation.error) return false;
-    const streamStatus = String(conversation.stream_status || conversation.streamStatus || '').toUpperCase();
-    if (!streamStatus || streamStatus === 'IS_STREAMING' || streamStatus.startsWith('HTTP_')) return false;
-    const messages = Array.isArray(conversation.messages) ? conversation.messages : [];
-    const lastMessage = messages[messages.length - 1];
-    if (lastMessage?.role !== 'assistant' || typeof lastMessage.text !== 'string' || !lastMessage.text.trim()) return false;
-    const expected = normalizeMessageText(expectedPrompt);
-    if (!expected) return true;
-    const latestUser = [...messages].reverse().find(message => message?.role === 'user');
-    return normalizeMessageText(latestUser?.text) === expected;
-}
-
-/**
- * Start a best-effort, unref'd completion poller. It performs periodic cloud
- * conversation reads through the supplied existing conversation endpoint; it
- * never opens a stream or holds a browser control lock.
- */
-export function startWorkerRegistryPoller({
-    readConversation,
-    intervalMs = DEFAULT_POLL_INTERVAL_MS,
-    logger = console,
-} = {}) {
-    if (typeof readConversation !== 'function') {
-        return { pollNow: async () => ({ checked: 0, closed: 0 }), stop: () => {} };
-    }
-
-    const parsedInterval = Number(intervalMs);
-    const delay = Number.isFinite(parsedInterval) && parsedInterval > 0
-        ? parsedInterval
-        : DEFAULT_POLL_INTERVAL_MS;
-    let polling = false;
-    let stopped = false;
-
-    const log = (level, message, meta) => {
-        if (typeof logger?.[level] === 'function') {
-            logger[level]('Worker registry', message, meta);
-        }
-    };
-
-    const pollNow = async () => {
-        if (stopped || polling) return { checked: 0, closed: 0, skipped: true };
-        polling = true;
-        let checked = 0;
-        let closed = 0;
-        try {
-            const workers = await openWorkerRegistryStates();
-            for (const worker of workers) {
-                checked += 1;
-                let conversation = null;
-                try {
-                    conversation = await readConversation(worker.conversation_id);
-                } catch (err) {
-                    log('warn', `Completion read failed for ${worker.conversation_id}: ${err?.message || err}`);
-                    continue;
-                }
-                if (!isConversationComplete(conversation, worker.prompt)) continue;
-                recordWorkerClose({
-                    conversationId: worker.conversation_id,
-                    url: worker.url,
-                    note: 'completion poller',
-                });
-                closed += 1;
-                log('info', `Closed completed worker ${worker.conversation_id}`);
-            }
-            return { checked, closed };
-        } catch (err) {
-            log('warn', `Completion poll failed: ${err?.message || err}`);
-            return { checked, closed, error: err?.message || String(err) };
-        } finally {
-            polling = false;
-        }
-    };
-
-    const timer = setInterval(() => { void pollNow(); }, delay);
-    timer.unref?.();
-    const initialTimer = setTimeout(() => { void pollNow(); }, Math.min(delay, 1000));
-    initialTimer.unref?.();
-
-    return {
-        pollNow,
-        stop: () => {
-            stopped = true;
-            clearInterval(timer);
-            clearTimeout(initialTimer);
-        },
-    };
 }

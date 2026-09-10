@@ -38,3 +38,8 @@ start.sh
 admin-fixed.sh
 mcp-server/.test-tmp-*
 mcp-server/node_modules
+
+# Local verification artifacts
+/node_modules
+__pycache__/
+*.pyc

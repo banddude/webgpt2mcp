@@ -1,0 +1,23 @@
+name: One-shot website controls
+on:
+  pull_request:
+    branches: [chatgpt-web-management-wip]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.24.0
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: npm ci --prefix mcp-server --ignore-scripts
+      - run: npm test
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - run: pnpm --dir webui install --frozen-lockfile --ignore-scripts
+      - run: npm --prefix webui run build

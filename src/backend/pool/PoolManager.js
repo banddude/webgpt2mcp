@@ -5,9 +5,6 @@
 
 import { logger } from '../../utils/logger.js';
 import { registry } from '../registry.js';
-import { createStrategySelector } from '../strategies/index.js';
-import { executeWithFailover } from '../strategies/failover.js';
-import { normalizeError } from '../utils/error.js';
 import { Worker } from './Worker.js';
 
 /**
@@ -21,7 +18,6 @@ export class PoolManager {
         this.config = config;
         this.workers = [];
         this.strategy = config.backend.pool.strategy || 'least_busy';
-        this.strategySelector = createStrategySelector(this.strategy);
         this.initialized = false;
         this.roundRobinIndex = 0;
     }
@@ -130,104 +126,6 @@ export class PoolManager {
 
         this.initialized = true;
         logger.info('工作池', `工作池初始化完成，共 ${this.workers.length} 个 Worker 就绪 (${browserMap.size} 个浏览器实例)`);
-    }
-
-    /**
-     * 根据模型选择 Worker
-     */
-    selectWorker(modelId) {
-        const candidates = this.workers.filter(w => w.supports(modelId));
-
-        if (candidates.length === 0) {
-            throw new Error(`没有 Worker 支持模型: ${modelId}`);
-        }
-
-        if (candidates.length === 1) {
-            return candidates[0];
-        }
-
-        switch (this.strategy) {
-            case 'round_robin': {
-                const idx = this.roundRobinIndex % candidates.length;
-                this.roundRobinIndex++;
-                return candidates[idx];
-            }
-            case 'random': {
-                const idx = Math.floor(Math.random() * candidates.length);
-                return candidates[idx];
-            }
-            case 'least_busy':
-            default: {
-                return candidates.reduce((min, w) => w.busyCount < min.busyCount ? w : min, candidates[0]);
-            }
-        }
-    }
-
-    /**
-     * 分发生图任务（支持故障转移）
-     */
-    async generate(ctx, prompt, paths, modelId, meta) {
-        const failoverConfig = this.config.backend?.pool?.failover || {};
-        const failoverEnabled = failoverConfig.enabled !== false;
-        const maxRetries = failoverConfig.maxRetries || 2;
-
-        let candidates = this.workers.filter(w => w.supports(modelId));
-
-        if (candidates.length === 0) {
-            return { error: `没有 Worker 支持模型: ${modelId}` };
-        }
-
-        // 如果请求包含图片，优先选择 imagePolicy 为 optional 的 Worker
-        const hasImages = paths && paths.length > 0;
-        if (hasImages && candidates.length > 1) {
-            const optionalCandidates = candidates.filter(w => {
-                const policy = w.getImagePolicy(modelId);
-                return policy === 'optional' || policy === 'required';
-            });
-
-            if (optionalCandidates.length > 0) {
-                logger.debug('工作池', `请求包含图片，优先选择支持图片的 Worker (${optionalCandidates.length}/${candidates.length} 个)`);
-                candidates = optionalCandidates;
-            } else {
-                logger.warn('工作池', `请求包含图片，但没有 Worker 的 imagePolicy 为 optional`);
-            }
-        }
-
-        const sortedCandidates = this.strategySelector.sort(candidates);
-
-        if (!failoverEnabled) {
-            const worker = sortedCandidates[0];
-            logger.debug('工作池', `任务分发至: ${worker.name} (busy: ${worker.busyCount})`);
-            return await this._safeExecuteWorker(worker, ctx, prompt, paths, modelId, meta);
-        }
-
-        return await executeWithFailover(
-            sortedCandidates,
-            async (worker) => {
-                logger.debug('工作池', `任务分发至: ${worker.name} (busy: ${worker.busyCount})`);
-                return await this._safeExecuteWorker(worker, ctx, prompt, paths, modelId, meta);
-            },
-            {
-                maxRetries,
-                meta,
-                onRetry: (worker, error) => {
-                    logger.warn('工作池', `[${worker.name}] 失败，尝试下一个 Worker...`, { error, ...meta });
-                }
-            }
-        );
-    }
-
-    /**
-     * 安全执行 Worker（带错误边界）
-     * @private
-     */
-    async _safeExecuteWorker(worker, ctx, prompt, paths, modelId, meta) {
-        try {
-            return await worker.generate(ctx, prompt, paths, modelId, meta);
-        } catch (err) {
-            logger.error('工作池', `[${worker.name}] 执行异常`, { error: err.message, ...meta });
-            return normalizeError(err.message || '执行异常');
-        }
     }
 
     /**

@@ -227,21 +227,7 @@ test('landing on the project page instead of the chat is a loud mismatch, never 
     assert.equal(attached.actualUrl, PROJECT_LANDING_URL);
 });
 
-test('generate() sends nothing when the target conversation cannot be shown on screen', async () => {
-    const { page, state } = createFakePage({
-        startUrl: `https://chatgpt.com/c/${OTHER_ID}`,
-        cloudConversation: { id: CONV_ID, gizmo_id: PROJECT_ID },
-        gotoBehavior: () => PROJECT_LANDING_URL,
-    });
-    const result = await manifest.generate(
-        { page, config: {} },
-        'Say the same color.',
-        [],
-        null,
-        { conversationUrl: `https://chatgpt.com/c/${CONV_ID}`, gateTimeoutMs: 100 },
-    );
-    assert.ok(result.error, 'the generation must fail');
-    assert.ok(result.error.includes('conversation_navigation_mismatch'), `unexpected error: ${result.error}`);
-    assert.equal(result.actual_url, PROJECT_LANDING_URL);
-    assert.equal(state.keyboardCalls.length, 0, 'no keystroke may reach an unverified composer');
+test('the ChatGPT adapter has no model-generation entry point', () => {
+    assert.equal(manifest.generate, undefined);
+    assert.equal(manifest.controlsOnly, true);
 });
