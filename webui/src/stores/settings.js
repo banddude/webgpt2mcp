@@ -7,16 +7,6 @@ export const useSettingsStore = defineStore('settings', {
         serverConfig: {},
         browserConfig: {},
         workerConfig: [],
-        poolConfig: {
-            strategy: 'least_busy',
-            waitTimeout: 120,
-            failover: {
-                enabled: false,
-                maxRetries: 3,
-                imgDlRetry: false,
-                imgDlRetryMaxRetries: 2
-            }
-        },
         adapterConfig: {},
         adaptersMeta: []
     }),
@@ -150,46 +140,6 @@ export const useSettingsStore = defineStore('settings', {
                 const result = await this.handleResponse(res, '实例配置保存成功');
                 if (result.success) {
                     this.workerConfig = config;
-                    return true;
-                }
-            } catch (e) {
-                Modal.error({ title: '保存失败 (网络异常)', content: e.message });
-            }
-            return false;
-        },
-
-        // --- 工作池配置 ---
-        async fetchPoolConfig() {
-            try {
-                const res = await fetch('/admin/config/pool', { headers: this.getHeaders() });
-                if (res.ok) {
-                    const data = await res.json();
-                    // 合并以确保结构存在
-                    this.poolConfig = {
-                        strategy: data.strategy || 'least_busy',
-                        waitTimeout: data.waitTimeout ?? 120,
-                        failover: {
-                            enabled: data.failover?.enabled || false,
-                            maxRetries: data.failover?.maxRetries || 3,
-                            imgDlRetry: data.failover?.imgDlRetry || false,
-                            imgDlRetryMaxRetries: data.failover?.imgDlRetryMaxRetries ?? 2
-                        }
-                    };
-                }
-            } catch (e) {
-                console.error('Fetch pool config failed', e);
-            }
-        },
-        async savePoolConfig(config) {
-            try {
-                const res = await fetch('/admin/config/pool', {
-                    method: 'POST',
-                    headers: this.getHeaders(),
-                    body: JSON.stringify(config)
-                });
-                const result = await this.handleResponse(res, '工作池设置保存成功');
-                if (result.success) {
-                    this.poolConfig = config;
                     return true;
                 }
             } catch (e) {

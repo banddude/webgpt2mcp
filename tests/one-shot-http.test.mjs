@@ -34,7 +34,7 @@ test('retired HTTP model and task endpoints cannot inspect a browser or enqueue 
         getModels: forbidden, chatGptSession: { inspect: forbidden } });
     try {
         for (const route of ['/v1', '/v1/models', '/v1/responses', '/v1/responses/anything', '/v1/chat/completions',
-            '/responses', '/chat/completions', '/models', '/admin/chatgpt/skill/execute', '/admin/chatgpt/skill/status/old']) {
+            '/responses', '/chat/completions', '/models', '/admin/queue', '/admin/config/pool', '/admin/chatgpt/skill/execute', '/admin/chatgpt/skill/status/old']) {
             for (const method of ['POST', 'GET']) {
                 assert.equal((await api.call(route, { method })).status, 404, `${method} ${route}`);
             }
@@ -187,4 +187,38 @@ test('mutating website control does not retry an HTTP 429 denial', async () => {
         assert.equal(result.http, 429);
         assert.equal(commands, 1);
     } finally { globalThis.fetch = originalFetch; }
+});
+
+
+test('login HTTP command rejects waiting options and returns one explicit current snapshot', async () => {
+    let opens = 0;
+    const snapshot = { opened: true, authenticated: false, loginRequired: true,
+        status: { state: 'logged-out' }, url: 'https://chatgpt.com/auth/login' };
+    const api = await fixture({ chatGptSession: {
+        inspect: async () => { throw new Error('login must not add an auth probe'); },
+        openLogin: async (...args) => { assert.equal(args.length, 0); opens++; return snapshot; },
+    } });
+    try {
+        for (const body of [{ wait_seconds: 300 }, { wait_seconds: 0 }, { waitSeconds: 0 }, { wait: true }, [], null]) {
+            assert.equal((await api.call('/admin/chatgpt/login', { body })).status, 400);
+        }
+        assert.equal((await api.call('/admin/chatgpt/login', { body: {}, auth: false })).status, 401);
+        assert.equal(opens, 0);
+        const result = await api.call('/admin/chatgpt/login', { body: {} });
+        assert.equal(result.status, 200);
+        assert.deepEqual(result.body.status, snapshot.status);
+        assert.equal(result.body.authenticated, false);
+        assert.equal(opens, 1);
+    } finally { await api.close(); }
+});
+
+test('retired server model settings fail before any configuration write', async () => {
+    const api = await fixture({});
+    try {
+        for (const key of ['keepaliveMode', 'queueBuffer', 'imageLimit', 'imageMarkdown']) {
+            const result = await api.call('/admin/config/server', { body: { [key]: 1 } });
+            assert.equal(result.status, 400);
+            assert.match(JSON.stringify(result.body), /Unsupported retired model setting/);
+        }
+    } finally { await api.close(); }
 });

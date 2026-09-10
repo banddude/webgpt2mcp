@@ -19,20 +19,15 @@ import {
     saveServerConfig,
     getBrowserConfig,
     saveBrowserConfig,
-    getQueueConfig,
-    saveQueueConfig,
     getInstancesConfig,
     saveInstancesConfig,
     getAdaptersConfig,
-    saveAdaptersConfig,
-    getPoolConfig,
-    savePoolConfig
+    saveAdaptersConfig
 } from '../../../config/manager.js';
 import {
     validateServerConfig,
     validateBrowserConfig,
     validateInstancesConfig,
-    validatePoolConfig,
     validateAdaptersConfig
 } from '../../../config/validator.js';
 import { registry } from '../../../backend/registry.js';
@@ -206,7 +201,7 @@ export function createAdminRouter(context) {
                 sendJson(res, 200, await queueManager.getWorkerCookies(url.searchParams.get('name'), url.searchParams.get('domain')));
                 return;
             }
-            if (pathname === '/chatgpt/skill' || pathname.startsWith('/chatgpt/skill/')) {
+            if (['/queue', '/config/pool', '/chatgpt/skill'].includes(pathname) || pathname.startsWith('/chatgpt/skill/')) {
                 sendJson(res, 404, { error: 'Not Found' });
                 return;
             }
@@ -250,9 +245,12 @@ export function createAdminRouter(context) {
 
             // POST /admin/chatgpt/login - open the existing bridge browser on ChatGPT login
             if (method === 'POST' && pathname === '/chatgpt/login') {
-                const body = await readBody(req).catch(() => ({}));
-                const waitSeconds = Math.max(0, Math.min(Number(body.wait_seconds || 0), 300));
-                const result = await chatGptSession.openLogin({ waitSeconds });
+                const body = await readBody(req).catch(() => null);
+                if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) {
+                    sendJson(res, 400, { error: 'Unsupported login options; request status separately after signing in.' });
+                    return;
+                }
+                const result = await chatGptSession.openLogin();
                 const vnc = await getVncInfo().catch(() => null);
                 sendJson(res, result.opened ? 200 : 503, { ...result, vnc });
                 return;
@@ -412,13 +410,7 @@ export function createAdminRouter(context) {
             // GET/POST /admin/config/server
             if (pathname === '/config/server') {
                 if (method === 'GET') {
-                    const serverConfig = getServerConfig();
-                    const queueConfig = getQueueConfig();
-                    sendJson(res, 200, {
-                        ...serverConfig,
-                        queueBuffer: queueConfig.queueBuffer,
-                        imageLimit: queueConfig.imageLimit
-                    });
+                    sendJson(res, 200, getServerConfig());
                 } else if (method === 'POST') {
                     const body = await readBody(req);
 
@@ -432,11 +424,7 @@ export function createAdminRouter(context) {
                         return;
                     }
 
-                    // 分别保存 server 和 queue 配置
                     saveServerConfig(body);
-                    if (body.queueBuffer !== undefined || body.imageLimit !== undefined) {
-                        saveQueueConfig(body);
-                    }
                     sendJson(res, 200, { success: true, message: '配置已保存，请重启服务生效' });
                 } else {
                     res.writeHead(405);
@@ -523,32 +511,6 @@ export function createAdminRouter(context) {
                 return;
             }
 
-            // GET/POST /admin/config/pool - 负载均衡和故障转移配置
-            if (pathname === '/config/pool') {
-                if (method === 'GET') {
-                    sendJson(res, 200, getPoolConfig());
-                } else if (method === 'POST') {
-                    const body = await readBody(req);
-
-                    // 校验配置
-                    const validation = validatePoolConfig(body);
-                    if (!validation.valid) {
-                        sendApiError(res, {
-                            code: ERROR_CODES.INVALID_REQUEST_BODY,
-                            message: `配置校验失败: ${validation.errors.join('; ')}`
-                        });
-                        return;
-                    }
-
-                    savePoolConfig(body);
-                    sendJson(res, 200, { success: true, message: '配置已保存，请重启服务生效' });
-                } else {
-                    res.writeHead(405);
-                    res.end();
-                }
-                return;
-            }
-
             // ==================== 元数据 ====================
 
             // GET /admin/adapters - 获取适配器列表（含 configSchema）
@@ -626,20 +588,6 @@ export function createAdminRouter(context) {
                 return;
             }
 
-            // GET /admin/queue - 任务队列状态
-            if (method === 'GET' && pathname === '/queue') {
-                const queueStatus = queueManager.getStatus();
-                const detailedStatus = queueManager.getDetailedStatus();
-
-                sendJson(res, 200, {
-                    processing: queueStatus.processing,
-                    waiting: queueStatus.queueLength,
-                    total: queueStatus.total,
-                    processingTasks: detailedStatus.processing,
-                    waitingTasks: detailedStatus.waiting
-                });
-                return;
-            }
 
             // ChatGPT redirects conversations assigned to a project from the public
             // /c/<id> URL to /g/<project>/c/<id>. Keep exact-ID validation at the
@@ -2327,10 +2275,7 @@ export function createAdminRouter(context) {
                     const poolContext = queueManager?.getPoolContext?.();
                     const page = poolContext?.getFirstPage?.();
                     if (page) {
-                        const imgDlCfg = config?.backend?.pool?.failover || {};
-                        downloadFn = (url) => useContextDownload(url, page, {
-                            retries: imgDlCfg.imgDlRetry ? (imgDlCfg.imgDlRetryMaxRetries || 3) : 1
-                        });
+                        downloadFn = (url) => useContextDownload(url, page, { retries: 1 });
                     }
                 } catch { /* Pool 未初始化，使用后备方案 */ }
 

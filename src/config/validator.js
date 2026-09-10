@@ -31,13 +31,6 @@ export function validateServerConfig(data) {
         }
     }
 
-    // Keepalive Mode 校验
-    if (data.keepaliveMode !== undefined) {
-        if (!['comment', 'content'].includes(data.keepaliveMode)) {
-            errors.push('keepaliveMode 必须是 comment 或 content');
-        }
-    }
-
     // Log Level 校验
     if (data.logLevel !== undefined) {
         if (!['debug', 'info', 'warn', 'error'].includes(data.logLevel)) {
@@ -45,27 +38,9 @@ export function validateServerConfig(data) {
         }
     }
 
-    // Queue Buffer 校验
-    if (data.queueBuffer !== undefined) {
-        if (typeof data.queueBuffer !== 'number' || !Number.isInteger(data.queueBuffer)) {
-            errors.push('queueBuffer 必须是整数');
-        } else if (data.queueBuffer < 0) {
-            errors.push('queueBuffer 不能为负数');
-        }
-    }
-
-    // Image Limit 校验
-    if (data.imageLimit !== undefined) {
-        if (typeof data.imageLimit !== 'number' || !Number.isInteger(data.imageLimit)) {
-            errors.push('imageLimit 必须是整数');
-        } else if (data.imageLimit < 1 || data.imageLimit > 10) {
-            errors.push('imageLimit 必须在 1-10 范围内');
-        }
-    }
-
-    // Image Markdown 校验
-    if (data.imageMarkdown !== undefined && typeof data.imageMarkdown !== 'boolean') {
-        errors.push('imageMarkdown 必须是布尔值');
+    // Removed model settings must fail before any configuration write.
+    for (const key of ['keepaliveMode', 'queueBuffer', 'imageLimit', 'imageMarkdown']) {
+        if (Object.hasOwn(data, key)) errors.push(`Unsupported retired model setting: ${key}`);
     }
 
     return { valid: errors.length === 0, errors };
@@ -221,48 +196,6 @@ export function validateInstancesConfig(data) {
                         errors.push(`${wPrefix}: mergeMonitor "${w.mergeMonitor}" 必须是 mergeTypes 中的一个`);
                     }
                 }
-            }
-        }
-    }
-
-    return { valid: errors.length === 0, errors };
-}
-
-/**
- * 校验 Pool 配置
- * @param {object} data - Pool 配置
- * @returns {{valid: boolean, errors: string[]}}
- */
-export function validatePoolConfig(data) {
-    const errors = [];
-
-    // Strategy 校验
-    if (data.strategy !== undefined) {
-        if (!['least_busy', 'round_robin', 'random'].includes(data.strategy)) {
-            errors.push('strategy 必须是 least_busy、round_robin 或 random');
-        }
-    }
-
-    // Failover 校验
-    if (data.failover) {
-        if (data.failover.enabled !== undefined && typeof data.failover.enabled !== 'boolean') {
-            errors.push('failover.enabled 必须是布尔值');
-        }
-        if (data.failover.maxRetries !== undefined) {
-            if (typeof data.failover.maxRetries !== 'number' || !Number.isInteger(data.failover.maxRetries)) {
-                errors.push('failover.maxRetries 必须是整数');
-            } else if (data.failover.maxRetries < 0) {
-                errors.push('failover.maxRetries 不能为负数');
-            }
-        }
-        if (data.failover.imgDlRetry !== undefined && typeof data.failover.imgDlRetry !== 'boolean') {
-            errors.push('failover.imgDlRetry 必须是布尔值');
-        }
-        if (data.failover.imgDlRetryMaxRetries !== undefined) {
-            if (typeof data.failover.imgDlRetryMaxRetries !== 'number' || !Number.isInteger(data.failover.imgDlRetryMaxRetries)) {
-                errors.push('failover.imgDlRetryMaxRetries 必须是整数');
-            } else if (data.failover.imgDlRetryMaxRetries < 1 || data.failover.imgDlRetryMaxRetries > 10) {
-                errors.push('failover.imgDlRetryMaxRetries 必须在 1-10 范围内');
             }
         }
     }

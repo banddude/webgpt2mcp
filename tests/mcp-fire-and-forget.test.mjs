@@ -37,6 +37,13 @@ function fakeApi() {
                 res.end(JSON.stringify({ id: CONV, stream_status: 'IS_STREAMING', messages: [{ role: 'assistant', text: 'Partial answer' }] }));
                 return;
             }
+            if (req.url === '/admin/chatgpt/login' || req.url === '/admin/chatgpt/status') {
+                res.writeHead(200, { 'content-type': 'application/json' });
+                res.end(JSON.stringify(req.url.endsWith('/login')
+                    ? { opened: true, authenticated: false, loginRequired: true, status: { state: 'logged-out' }, url: 'https://chatgpt.com/auth/login' }
+                    : { loggedIn: true, state: 'logged-in' }));
+                return;
+            }
             if (req.url === '/v1/chat/completions') { hits.completions += 1; return; } // hang forever: a slow ChatGPT answer
             res.writeHead(404); res.end('{}');
         });
@@ -166,5 +173,33 @@ test('MCP sends exact text once for every send tool; unknown options and failed 
             assert.equal(tool.inputSchema.properties.system_prompt, undefined);
             assert.doesNotMatch(tool.description, /notify aiva/);
         }
+    } finally { await c.close(); api.server.closeAllConnections(); api.server.close(); }
+});
+
+
+test('MCP login is one nonwaiting command and rejects retired options without HTTP work', { skip: sdkModulesDir() ? false : 'MCP SDK dependencies required' }, async () => {
+    const api = await fakeApi();
+    const c = mcpClient(api.port);
+    try {
+        await c.call('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '0' } });
+        c.notify('notifications/initialized');
+        const list = await c.call('tools/list', {});
+        const login = list.result.tools.find(tool => tool.name === 'login');
+        assert.deepEqual(login.inputSchema.properties, {});
+        assert.equal(login.inputSchema.additionalProperties, false);
+        for (const args of [{ wait_seconds: 300 }, { wait_seconds: 0 }, { waitSeconds: 0 }, { wait: true }]) {
+            const result = await c.call('tools/call', { name: 'login', arguments: args });
+            assert.equal(result.result.isError, true);
+            assert.match(result.result.content[0].text, /Unsupported login options/);
+        }
+        assert.equal(api.hits.requests.length, 0);
+        const result = await c.call('tools/call', { name: 'login', arguments: {} });
+        assert.equal(result.result.isError, undefined);
+        assert.equal(result.result._meta.status.state, 'logged-out');
+        assert.equal(result.result._meta.authenticated, false);
+        assert.deepEqual(api.hits.requests, [{ path: '/admin/chatgpt/login', body: {} }]);
+        const status = await c.call('tools/call', { name: 'status', arguments: {} });
+        assert.equal(status.result._meta.loggedIn, true);
+        assert.equal(api.hits.requests.length, 2);
     } finally { await c.close(); api.server.closeAllConnections(); api.server.close(); }
 });

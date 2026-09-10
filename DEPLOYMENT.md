@@ -15,5 +15,3 @@ After approval:
 5. Recheck session-file checksums and service readiness. Use authenticated inert requests to verify that retired model routes return 404, and use explicit session status/tool-discovery commands. Do not create website chats for tests, run completion watchers, replay queued jobs, or reauthenticate as a fallback. Preserve any denial and return it to the owner.
 
 All automated verification uses fake browser/HTTP fixtures. A green build does not prove current live website compatibility. Existing persisted browser state remains the recovery source. If rollout fails, report the exact failure rather than automatically restoring the retired model bridge.
-
-The prior deployment guide is retained in [the historical documentation](docs/archive/2026-09-10/DEPLOYMENT.md). Its model APIs, generated-client installation, live-generation smoke test, and completion polling are retired.

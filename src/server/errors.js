@@ -23,6 +23,8 @@ export const ERROR_TYPES = {
  * @enum {string}
  */
 export const ERROR_CODES = {
+    /** Invalid explicit command/configuration parameters. */
+    INVALID_REQUEST_BODY: 'INVALID_REQUEST_BODY',
     /** 未授权（Token 无效或缺失） */
     UNAUTHORIZED: 'UNAUTHORIZED',
     /** 浏览器未初始化 */
@@ -54,6 +56,11 @@ export const ERROR_CODES = {
  * @type {Record<string, {message: string, status: number, type: string}>}
  */
 const ERROR_DETAILS = {
+    [ERROR_CODES.INVALID_REQUEST_BODY]: {
+        message: 'Invalid request body',
+        status: 400,
+        type: ERROR_TYPES.INVALID_REQUEST,
+    },
     [ERROR_CODES.UNAUTHORIZED]: {
         message: 'Unauthorized (token invalid or missing)',
         status: 401,
@@ -182,4 +189,3 @@ export const ADAPTER_ERRORS = {
     /** 内容被阻止 (API/页面检测到错误关键词) */
     CONTENT_BLOCKED: 'CONTENT_BLOCKED',
 };
-

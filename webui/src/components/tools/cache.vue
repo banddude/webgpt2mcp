@@ -1,50 +1,20 @@
 <script setup>
-import { h, ref, onMounted } from 'vue';
+import { ref, onMounted } from 'vue';
 import { message } from 'ant-design-vue';
 import { useSystemStore } from '@/stores/system';
 import { useSettingsStore } from '@/stores/settings';
 import {
     PoweroffOutlined,
-    CheckCircleOutlined,
-    LoadingOutlined,
-    ClockCircleOutlined,
     DeleteOutlined,
     FolderOutlined,
     StopOutlined,
     LoginOutlined,
-    DownOutlined
 } from '@ant-design/icons-vue';
 
 const systemStore = useSystemStore();
 const settingsStore = useSettingsStore();
 
-// 重启步骤当前状态
-const currentStep = ref(0);
 const restarting = ref(false);
-
-// 重启步骤定义
-const restartSteps = ref([
-    {
-        title: '准备重启',
-        status: 'wait',
-        icon: h(ClockCircleOutlined),
-    },
-    {
-        title: '发送指令',
-        status: 'wait',
-        icon: h(PoweroffOutlined),
-    },
-    {
-        title: '等待重启',
-        status: 'wait',
-        icon: h(LoadingOutlined),
-    },
-    {
-        title: '重启完成',
-        status: 'wait',
-        icon: h(CheckCircleOutlined),
-    },
-]);
 
 // 实例文件夹抽屉
 const instanceDrawerOpen = ref(false);
@@ -52,9 +22,6 @@ const selectedFolders = ref([]);
 
 // 实例文件夹列表
 const instanceFolders = ref([]);
-
-// 重启弹窗状态
-const restartModalVisible = ref(false);
 
 // Workers 列表（用于登录模式选择）
 const workers = ref([]);
@@ -101,65 +68,16 @@ onMounted(() => {
     fetchWorkers();
 });
 
-// 辅助函数：延迟
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-// 执行重启
+// Submit the explicit restart command once; readiness is a separate manual read.
 const handleRestart = async (options = {}) => {
-    restartModalVisible.value = true;
+    if (restarting.value) return;
     restarting.value = true;
-    currentStep.value = 0;
-
-    // 步骤1: 准备
-    restartSteps.value[0].status = 'process';
-    await sleep(500);
-    restartSteps.value[0].status = 'finish';
-    currentStep.value = 1;
-
-    // 步骤2: 发送指令 (调用API)
-    restartSteps.value[1].status = 'process';
     try {
-        await systemStore.restartService(options);
-        restartSteps.value[1].status = 'finish';
-        currentStep.value = 2;
-    } catch (e) {
-        restartSteps.value[1].status = 'error';
-        message.error('无法连接到服务器');
-        return;
-    }
-
-    // 步骤3: 等待服务恢复 (轮询检查)
-    restartSteps.value[2].status = 'process';
-    // 先等待一小段时间让服务重启
-    await sleep(3000);
-    let retries = 20;
-    while (retries > 0) {
-        try {
-            await systemStore.fetchStatus();
-            if (systemStore.status) {
-                break;
-            }
-        } catch (e) {
-            // ignore
-        }
-        await sleep(2000);
-        retries--;
-    }
-    restartSteps.value[2].status = 'finish';
-    currentStep.value = 3;
-
-    // 步骤4: 完成
-    restartSteps.value[3].status = 'finish';
-
-    message.success('服务重启成功');
-
-    // 延迟关闭弹窗并重置状态
-    setTimeout(() => {
-        restartModalVisible.value = false;
+        const accepted = await systemStore.restartService(options);
+        if (accepted) message.info('重启指令已发送。请在「状态概览」手动刷新检查服务。');
+    } finally {
         restarting.value = false;
-        restartSteps.value.forEach(step => step.status = 'wait');
-        currentStep.value = 0;
-    }, 1500);
+    }
 };
 
 // 停止服务
@@ -261,7 +179,7 @@ const handleDeleteSelectedFolders = async () => {
                 <div>
                     <a-space>
                         <!-- 下拉式重启按钮 -->
-                        <a-dropdown-button type="primary" size="large" @click="showRestartConfirm()">
+                        <a-dropdown-button type="primary" size="large" :loading="restarting" @click="showRestartConfirm()">
                             <PoweroffOutlined />
                             重启
                             <template #overlay>
@@ -317,17 +235,6 @@ const handleDeleteSelectedFolders = async () => {
                     <span style="color: #1890ff;">仅初始化 Worker: {{ pendingRestartOptions.workerName }}</span>
                 </p>
                 <p v-else>确定要以<b>登录模式</b>重启服务吗？</p>
-            </div>
-        </a-modal>
-
-        <!-- 重启进度模态框 -->
-        <a-modal v-model:open="restartModalVisible" title="系统服务重启中" :footer="null" :closable="false"
-            :maskClosable="false" width="500px">
-            <div style="padding: 24px 0;">
-                <a-steps :current="currentStep" :items="restartSteps" />
-                <div style="text-align: center; margin-top: 24px; color: #8c8c8c;">
-                    请稍候，系统正在执行重启操作...
-                </div>
             </div>
         </a-modal>
 

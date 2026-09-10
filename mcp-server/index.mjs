@@ -316,12 +316,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: 'login',
-            description: 'Open the bridge browser on the ChatGPT login page. Optionally wait for authentication to complete.',
+            description: 'Open the existing browser on the ChatGPT login page and return its current authentication status once. Complete sign-in, then request status separately.',
             inputSchema: {
                 type: 'object',
-                properties: {
-                    wait_seconds: { type: 'number', minimum: 0, maximum: 300, default: 0, description: 'How long to wait for the browser session to become authenticated after opening login.' },
-                },
+                properties: {},
+                additionalProperties: false,
             },
         },
         {
@@ -586,14 +585,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         if (name === 'login') {
-            const waitSeconds = Math.max(0, Math.min(Number(args.wait_seconds || 0), 300));
+            if (Object.keys(args).length) throw new Error('Unsupported login options; request status separately after signing in.');
             const result = await adminJson('/admin/chatgpt/login', {
                 method: 'POST',
-                body: JSON.stringify({ wait_seconds: waitSeconds }),
+                body: JSON.stringify({}),
             });
             const text = result.authenticated
                 ? 'ChatGPT login is complete; the bridge session is authenticated and persisted.'
-                : 'ChatGPT login page is open in the bridge browser. Complete sign-in once, then call status.';
+                : `ChatGPT login page is open. Current session status: ${result.status?.state || 'unknown'}. ${result.loginRequired ? 'Complete sign-in once, then call status.' : 'Call status separately to check again.'}`;
             return { content: [{ type: 'text', text }], _meta: result };
         }
 

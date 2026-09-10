@@ -1,7 +1,6 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue';
+import { ref, onMounted } from 'vue';
 import { useSystemStore } from '@/stores/system';
-import { useSettingsStore } from '@/stores/settings';
 import {
     DesktopOutlined,
     PieChartOutlined,
@@ -9,46 +8,20 @@ import {
     FieldTimeOutlined,
     LineChartOutlined,
     SyncOutlined,
-    ExclamationCircleOutlined,
     CheckCircleOutlined,
     CloseCircleOutlined
 } from '@ant-design/icons-vue';
 
 const systemStore = useSystemStore();
-const queueData = ref([]);
-const timer = ref(null);
-const queueStats = ref({ processing: 0, waiting: 0, total: 0 });
-
-// 获取队列数据
-const fetchQueue = async () => {
-    const settingsStore = useSettingsStore(); // 获取store
-    try {
-        const res = await fetch('/admin/queue', { headers: settingsStore.getHeaders() });
-        if (res.ok) {
-            const data = await res.json();
-
-            // 更新统计信息
-            queueStats.value = {
-                processing: data.processing || 0,
-                waiting: data.waiting || 0,
-                total: data.total || 0
-            };
-
-            const processing = (data.processingTasks || []).map(t => ({ ...t, status: 'processing' }));
-            const waiting = (data.waitingTasks || []).map(t => ({ ...t, status: 'waiting' }));
-            queueData.value = [...processing, ...waiting];
-        }
-    } catch (e) {
-        console.error('Fetch queue failed', e);
-    }
-};
-
+const refreshing = ref(false);
 const refreshData = async () => {
-    await Promise.all([
-        systemStore.fetchStatus(),
-        systemStore.fetchStats(),
-        fetchQueue()
-    ]);
+    if (refreshing.value) return;
+    refreshing.value = true;
+    try {
+        await Promise.all([systemStore.fetchStatus(), systemStore.fetchStats()]);
+    } finally {
+        refreshing.value = false;
+    }
 };
 
 const formatUptime = (seconds) => {
@@ -84,18 +57,17 @@ const getStatusConfig = (status) => {
     return map[status] || { color: 'red', text: '未运行' };
 };
 
-onMounted(() => {
-    refreshData();
-    timer.value = setInterval(refreshData, 5000); // 每5秒轮询
-});
-
-onUnmounted(() => {
-    if (timer.value) clearInterval(timer.value);
-});
+onMounted(refreshData);
 </script>
 
 <template>
     <a-layout style="width: 100%; background: transparent;">
+        <div style="display: flex; justify-content: flex-end; margin-bottom: 16px;">
+            <a-button @click="refreshData" :loading="refreshing">
+                <template #icon><SyncOutlined /></template>
+                刷新状态
+            </a-button>
+        </div>
         <!-- 安全模式告警横幅 -->
         <a-alert v-if="systemStore.safeMode?.enabled" type="error" show-icon style="margin-bottom: 16px;" closable>
             <template #message>
@@ -104,7 +76,7 @@ onUnmounted(() => {
             <template #description>
                 <div>
                     <p style="margin-bottom: 8px;">
-                        服务因初始化失败进入安全模式，OpenAI API 不可用。
+                        服务因初始化失败进入安全模式，浏览器控制不可用。
                     </p>
                     <p style="margin-bottom: 8px; color: #cf1322;">
                         <b>原因：</b>{{ systemStore.safeMode.reason }}
@@ -173,7 +145,7 @@ onUnmounted(() => {
 
             <!-- 统计数据卡片 -->
             <a-col :xs="24" :md="12">
-                <a-card title="业务统计" :bordered="false" style="height: 100%">
+                <a-card title="浏览器与历史统计" :bordered="false" style="height: 100%">
                     <a-row :gutter="16" style="margin-bottom: 24px">
                         <a-col :span="12">
                             <a-statistic title="窗口数量" :value="systemStore.stats.workers || 0">
@@ -186,22 +158,6 @@ onUnmounted(() => {
                             <a-statistic title="实例数量" :value="systemStore.stats.instances || 0">
                                 <template #suffix>
                                     <span style=" font-size: 14px; color: #8c8c8c;">个</span>
-                                </template>
-                            </a-statistic>
-                        </a-col>
-                    </a-row>
-                    <a-row :gutter="16">
-                        <a-col :span="12">
-                            <a-statistic title="正在进行" :value="queueStats.processing">
-                                <template #suffix>
-                                    <span style="font-size: 14px; color: #8c8c8c;">/ {{ queueStats.total }}</span>
-                                </template>
-                            </a-statistic>
-                        </a-col>
-                        <a-col :span="12">
-                            <a-statistic title="等待排队" :value="queueStats.waiting">
-                                <template #suffix>
-                                    <span style="font-size: 14px; color: #8c8c8c;">/ {{ queueStats.total }}</span>
                                 </template>
                             </a-statistic>
                         </a-col>
@@ -226,49 +182,5 @@ onUnmounted(() => {
             </a-col>
         </a-row>
 
-        <!-- 任务队列列表 -->
-        <a-card title="任务队列实时监控" :bordered="false" style="width: 100%" :bodyStyle="{ padding: '0 24px' }">
-            <template #extra>
-                <div style="color: #8c8c8c; font-size: 12px;">
-                    <SyncOutlined :spin="true" style="margin-right: 4px" /> 实时刷新中
-                </div>
-            </template>
-            <a-list item-layout="horizontal" :data-source="queueData">
-                <template #renderItem="{ item }">
-                    <a-list-item>
-                        <a-list-item-meta :description="`ID: ${item.id}`">
-                            <template #title>
-                                <span style="font-weight: 500; margin-right: 8px;">{{ item.model }}</span>
-                                <a-tag v-if="item.worker" color="blue">{{ item.worker }}</a-tag>
-                            </template>
-                        </a-list-item-meta>
-
-                        <div>
-                            <a-tag v-if="item.status === 'processing'" color="processing">
-                                <template #icon>
-                                    <SyncOutlined :spin="true" />
-                                </template>
-                                进行中
-                            </a-tag>
-                            <a-tag v-else-if="item.status === 'waiting'" color="warning">
-                                <template #icon>
-                                    <ExclamationCircleOutlined />
-                                </template>
-                                等待中
-                            </a-tag>
-                            <a-tag v-else-if="item.status === 'success'" color="success">
-                                <template #icon>
-                                    <CheckCircleOutlined />
-                                </template>
-                                已完成
-                            </a-tag>
-                        </div>
-                    </a-list-item>
-                </template>
-                <div v-if="queueData.length === 0" style="text-align: center; padding: 24px; color: #8c8c8c;">
-                    暂无任务
-                </div>
-            </a-list>
-        </a-card>
     </a-layout>
 </template>

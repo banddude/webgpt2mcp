@@ -46,9 +46,7 @@ export function getServerConfig() {
     return {
         port: config.server?.port || 3000,
         authToken: config.server?.auth || '',
-        keepaliveMode: config.server?.keepalive?.mode || 'comment',
-        logLevel: config.logLevel || 'info',
-        imageMarkdown: config.server?.imageMarkdown || false
+        logLevel: config.logLevel || 'info'
     };
 }
 
@@ -63,12 +61,7 @@ export function saveServerConfig(data) {
 
     if (data.port !== undefined) config.server.port = data.port;
     if (data.authToken !== undefined) config.server.auth = data.authToken;
-    if (data.keepaliveMode !== undefined) {
-        if (!config.server.keepalive) config.server.keepalive = {};
-        config.server.keepalive.mode = data.keepaliveMode;
-    }
     if (data.logLevel !== undefined) config.logLevel = data.logLevel;
-    if (data.imageMarkdown !== undefined) config.server.imageMarkdown = data.imageMarkdown;
 
     writeConfig(config);
 }
@@ -139,33 +132,6 @@ export function saveBrowserConfig(data) {
         if (p.username !== undefined) config.browser.proxy.user = p.username;
         if (p.password !== undefined) config.browser.proxy.passwd = p.password;
     }
-
-    writeConfig(config);
-}
-
-/**
- * 获取队列配置
- * @returns {object}
- */
-export function getQueueConfig() {
-    const config = readRawConfig();
-    return {
-        queueBuffer: config.queue?.queueBuffer ?? 2,
-        imageLimit: config.queue?.imageLimit ?? 5
-    };
-}
-
-/**
- * 保存队列配置
- * @param {object} data - 队列配置
- */
-export function saveQueueConfig(data) {
-    const config = readRawConfig();
-
-    if (!config.queue) config.queue = {};
-
-    if (data.queueBuffer !== undefined) config.queue.queueBuffer = data.queueBuffer;
-    if (data.imageLimit !== undefined) config.queue.imageLimit = data.imageLimit;
 
     writeConfig(config);
 }
@@ -268,66 +234,6 @@ export function saveAdaptersConfig(data) {
         ...(config.backend.adapter || {}),
         ...data
     };
-
-    writeConfig(config);
-}
-
-/**
- * 获取 Pool 配置（负载均衡和故障转移）
- * @returns {object}
- */
-export function getPoolConfig() {
-    const config = readRawConfig();
-    const pool = config.backend?.pool || {};
-    const failover = pool.failover || {};
-
-    return {
-        strategy: pool.strategy || 'least_busy',
-        waitTimeout: pool.waitTimeout != null ? Math.round(pool.waitTimeout / 1000) : 120,
-        failover: {
-            enabled: failover.enabled !== false, // 默认 true
-            maxRetries: failover.maxRetries ?? 2,
-            imgDlRetry: failover.imgDlRetry || false,
-            imgDlRetryMaxRetries: failover.imgDlRetryMaxRetries ?? 2
-        }
-    };
-}
-
-/**
- * 保存 Pool 配置
- * @param {object} data - Pool 配置
- */
-export function savePoolConfig(data) {
-    const config = readRawConfig();
-
-    if (!config.backend) config.backend = {};
-    if (!config.backend.pool) config.backend.pool = {};
-
-    if (data.strategy !== undefined) {
-        config.backend.pool.strategy = data.strategy;
-    }
-
-    if (data.waitTimeout !== undefined) {
-        // 前端传入秒，写入 YAML 为毫秒
-        const ms = Number(data.waitTimeout) * 1000;
-        if (ms > 0) config.backend.pool.waitTimeout = ms;
-    }
-
-    if (data.failover) {
-        if (!config.backend.pool.failover) config.backend.pool.failover = {};
-        if (data.failover.enabled !== undefined) {
-            config.backend.pool.failover.enabled = data.failover.enabled;
-        }
-        if (data.failover.maxRetries !== undefined) {
-            config.backend.pool.failover.maxRetries = data.failover.maxRetries;
-        }
-        if (data.failover.imgDlRetry !== undefined) {
-            config.backend.pool.failover.imgDlRetry = data.failover.imgDlRetry;
-        }
-        if (data.failover.imgDlRetryMaxRetries !== undefined) {
-            config.backend.pool.failover.imgDlRetryMaxRetries = data.failover.imgDlRetryMaxRetries;
-        }
-    }
 
     writeConfig(config);
 }

@@ -1,6 +1,6 @@
 /**
  * @fileoverview PoolManager 类
- * @description 管理 Worker 池，负责初始化、任务分发和故障转移
+ * @description 管理浏览器实例的初始化和显式控制
  */
 
 import { logger } from '../../utils/logger.js';
@@ -17,9 +17,7 @@ export class PoolManager {
     constructor(config) {
         this.config = config;
         this.workers = [];
-        this.strategy = config.backend.pool.strategy || 'least_busy';
         this.initialized = false;
-        this.roundRobinIndex = 0;
     }
 
     /**
@@ -146,37 +144,6 @@ export class PoolManager {
         }
 
         return { object: 'list', data: allModels };
-    }
-
-    /**
-     * 获取图片策略（宽松策略：只要有一个 Worker 支持 optional 就返回 optional）
-     */
-    getImagePolicy(modelKey) {
-        const policies = new Set();
-
-        for (const worker of this.workers) {
-            if (worker.supports(modelKey)) {
-                policies.add(worker.getImagePolicy(modelKey));
-            }
-        }
-
-        // 宽松策略：只要有一个 optional 就返回 optional
-        if (policies.has('optional')) return 'optional';
-        if (policies.has('required')) return 'required';
-        if (policies.has('forbidden')) return 'forbidden';
-        return 'optional';
-    }
-
-    /**
-     * 获取模型类型
-     */
-    getModelType(modelKey) {
-        for (const worker of this.workers) {
-            if (worker.supports(modelKey)) {
-                return worker.getModelType(modelKey);
-            }
-        }
-        return 'image';
     }
 
     /**

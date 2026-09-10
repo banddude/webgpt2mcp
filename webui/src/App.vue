@@ -1,20 +1,12 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { Modal, message } from 'ant-design-vue';
 import {
   DashboardOutlined,
   SettingOutlined,
   ToolOutlined,
   PoweroffOutlined,
   GithubOutlined,
-  ApiOutlined,
-  CheckCircleOutlined,
-  CloseCircleOutlined,
-  LoadingOutlined,
-  InboxOutlined,
-  PictureOutlined,
-  HistoryOutlined,
   RocketOutlined,
   MenuOutlined
 } from '@ant-design/icons-vue';
@@ -29,14 +21,9 @@ const collapsed = ref(false);
 const isMobile = ref(false);
 const loginVisible = ref(false);
 
-const iconLoading = ref(false);
-const enterIconLoading = () => {
-  iconLoading.value = true;
+const logout = () => {
   settingsStore.setToken('');
-  setTimeout(() => {
-    iconLoading.value = false;
-    loginVisible.value = true;
-  }, 500);
+  loginVisible.value = true;
 };
 
 const menuRoutes = {
@@ -62,44 +49,14 @@ const handleMenuClick = ({ key }) => {
 
 const isInitializing = ref(true);
 
-// 后端连接检测
-let connectionCheckInterval = null;
-let disconnectModalShown = false;
+const checkScreenSize = () => {
+  isMobile.value = window.innerWidth <= 768;
+  if (isMobile.value) collapsed.value = true;
+};
+onUnmounted(() => window.removeEventListener('resize', checkScreenSize));
 
-async function checkConnection() {
-  try {
-    const res = await fetch('/admin/status', {
-      headers: settingsStore.getHeaders(),
-      signal: AbortSignal.timeout(5000)
-    });
-    if (res.ok && disconnectModalShown) {
-      // 连接恢复，刷新页面
-      disconnectModalShown = false;
-      Modal.destroyAll();
-      window.location.reload();
-    }
-  } catch (e) {
-    if (!disconnectModalShown && !isInitializing.value) {
-      disconnectModalShown = true;
-      Modal.warning({
-        title: '后端连接断开',
-        content: '无法连接到后端服务，请检查服务是否正在运行。连接恢复后页面将自动刷新。',
-        okText: '我知道了',
-        centered: true
-      });
-    }
-  }
-}
-
-// 挂载时检查身份验证
+// Check authentication once when this page is opened.
 onMounted(async () => {
-  // 响应式侧边栏
-  const checkScreenSize = () => {
-    isMobile.value = window.innerWidth <= 768;
-    if (isMobile.value) {
-      collapsed.value = true;
-    }
-  };
   checkScreenSize();
   window.addEventListener('resize', checkScreenSize);
 
@@ -123,16 +80,6 @@ onMounted(async () => {
     isInitializing.value = false;
   }
 
-  // 启动后端连接检测（每 5 秒检测一次）
-  connectionCheckInterval = setInterval(checkConnection, 5000);
-
-  // 清理监听器
-  onUnmounted(() => {
-    window.removeEventListener('resize', checkScreenSize);
-    if (connectionCheckInterval) {
-      clearInterval(connectionCheckInterval);
-    }
-  });
 });
 </script>
 
@@ -152,7 +99,7 @@ onMounted(async () => {
         </div>
         <a-flex justify="end" align="center" style="flex: 1;" :gap="8">
 
-          <a-button danger :loading="iconLoading" @click="enterIconLoading" :size="isMobile ? 'small' : 'middle'">
+          <a-button danger @click="logout" :size="isMobile ? 'small' : 'middle'">
             <template #icon>
               <PoweroffOutlined />
             </template>
@@ -183,7 +130,7 @@ onMounted(async () => {
                 </span>
               </template>
               <a-menu-item key="settings-server">服务器</a-menu-item>
-              <a-menu-item key="settings-workers">工作池</a-menu-item>
+              <a-menu-item key="settings-workers">浏览器实例</a-menu-item>
               <a-menu-item key="settings-browser">浏览器</a-menu-item>
               <a-menu-item key="settings-adapters">适配器</a-menu-item>
             </a-sub-menu>

@@ -18,7 +18,7 @@ If the browser is busy, a send returns 409 with no retained job. A click failure
 
 The sender still verifies the exact conversation and composer before typing. An active existing response is stopped and that stop is confirmed before an explicit replacement message is sent. Requested new-chat models must be selected successfully in the website UI before submission. There is no completion or response-start wait. Textareas normalize CR/CRLF to LF; all other input whitespace is checked before sending. Raw image/file uploads through the retired model API are no longer supported. The website may generate images from a text request; explicit reads retain image references and the existing download control.
 
-Authentication, browser/session recovery, exact stop/delete/rename/archive controls, project management, VNC, and saved history remain. Delete confirmations and sender refusals remain enforced. Session recovery is on demand. Local dashboard/log refreshes read service state, not website model completion. Reads may perform bounded metadata and image-link lookups; they do not wait for a final answer. All of these website capabilities depend on the current website UI and existing authenticated browser session.
+Authentication, browser/session recovery, exact stop/delete/rename/archive controls, project management, VNC, and saved history remain. Delete confirmations and sender refusals remain enforced. Session recovery is on demand. The login command opens the login page and returns one current auth snapshot; waiting options are rejected. Dashboard and logs load once when opened and refresh only on an explicit action. Service restart returns command acceptance; readiness is checked separately. Model queue, generation timeout, load balancing, failover, and SSE settings are retired. Existing browser-instance, proxy, and authentication configuration is preserved; legacy model fields in local configuration are inactive. Reads may perform bounded metadata and image-link lookups; they do not wait for a final answer. All of these website capabilities depend on the current website UI and existing authenticated browser session.
 
 Run verification without a browser or a website chat:
 
@@ -28,4 +28,4 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 npm --prefix webui run build
 ```
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for the staged rollout and [historical documentation](docs/archive/2026-09-10/README_EN.md) for the original project. The MIT license and upstream attribution are unchanged.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the staged rollout. The MIT license and upstream attribution are unchanged.

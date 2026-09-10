@@ -14,6 +14,7 @@ function jwt(payload) {
 function fakeBrowser(sessionResults, { storageCookies = [] } = {}) {
     const results = [...sessionResults];
     const addedCookies = [];
+    const calls = { reads: 0, navigations: 0, waits: 0 };
     const context = {
         async storageState({ path: target }) {
             await fs.writeFile(target, JSON.stringify({ cookies: storageCookies, origins: [] }));
@@ -26,23 +27,25 @@ function fakeBrowser(sessionResults, { storageCookies = [] } = {}) {
         currentUrl: 'https://chatgpt.com/',
         context: () => context,
         async evaluate() {
+            calls.reads++;
             if (!results.length) throw new Error('no fake session result left');
             return results.shift();
         },
         async goto(url) {
+            calls.navigations++;
             this.currentUrl = url;
         },
         url() {
             return this.currentUrl;
         },
-        async waitForTimeout() {},
+        async waitForTimeout() { calls.waits++; throw new Error('login must not poll'); },
     };
     const queueManager = {
         getPoolContext() {
             return { poolManager: { getFirstPage: () => page } };
         },
     };
-    return { queueManager, page, addedCookies };
+    return { queueManager, page, addedCookies, calls };
 }
 
 async function tempDir() {
@@ -123,7 +126,7 @@ test('login command opens the bridge browser login page without exposing credent
     const dir = await tempDir();
     const manager = createChatGptSessionManager({ queueManager: browser.queueManager, dataDir: dir, notifier: async () => {} });
 
-    const result = await manager.openLogin({ waitSeconds: 0 });
+    const result = await manager.openLogin();
     assert.equal(result.opened, true);
     assert.equal(result.authenticated, false);
     assert.equal(result.loginRequired, true);
@@ -216,4 +219,52 @@ test('a 5xx auth probe is also transient, while a real 401 still alerts', async 
     assert.equal(s2.state, 'logged-out');
     assert.equal(s2.loginRequired, true);
     assert.equal(alerts401.length, 1, 'a real logout must still page');
+});
+
+
+test('login returns the first auth snapshot and never waits for later authentication', async () => {
+    const browser = fakeBrowser([
+        { ok: false, backendMeHttpStatus: 401 },
+        { ok: true, authMode: 'cookies', backendMeHttpStatus: 200 },
+    ]);
+    const dir = await tempDir();
+    const manager = createChatGptSessionManager({ queueManager: browser.queueManager, dataDir: dir,
+        now: () => 0, notifier: async () => { throw new Error('login must not notify'); } });
+    const result = await manager.openLogin();
+    assert.equal(result.status.state, 'logged-out');
+    assert.equal(result.authenticated, false);
+    assert.equal(result.loginRequired, true);
+    assert.deepEqual(browser.calls, { reads: 1, navigations: 1, waits: 0 });
+    const explicitStatus = await manager.inspect({ allowRestore: false, alert: false });
+    assert.equal(explicitStatus.loggedIn, true);
+    assert.equal(explicitStatus.persisted, true);
+    assert.equal(browser.calls.reads, 2);
+});
+
+test('login rejects all options before touching the browser and preserves transient auth status', async () => {
+    const browser = fakeBrowser([{ ok: false, sessionHttpStatus: 429, backendMeHttpStatus: 429 }]);
+    const dir = await tempDir();
+    const manager = createChatGptSessionManager({ queueManager: browser.queueManager, dataDir: dir,
+        notifier: async () => { throw new Error('transient auth must not notify'); } });
+    for (const options of [{ waitSeconds: 300 }, { wait_seconds: 0 }, { wait: true }, [], null]) {
+        await assert.rejects(manager.openLogin(options), /does not accept options/);
+    }
+    assert.deepEqual(browser.calls, { reads: 0, navigations: 0, waits: 0 });
+    const result = await manager.openLogin();
+    assert.equal(result.status.state, 'auth-check-unavailable');
+    assert.equal(result.loginRequired, false);
+    assert.deepEqual(browser.calls, { reads: 1, navigations: 1, waits: 0 });
+});
+
+test('already authenticated login persists the existing session once', async () => {
+    const browser = fakeBrowser([{ ok: true, authMode: 'cookies', backendMeHttpStatus: 200 }]);
+    const dir = await tempDir();
+    const manager = createChatGptSessionManager({ queueManager: browser.queueManager, dataDir: dir,
+        notifier: async () => { throw new Error('authenticated login must not notify'); } });
+    const result = await manager.openLogin();
+    assert.equal(result.authenticated, true);
+    assert.equal(result.status.persisted, true);
+    assert.equal(result.loginRequired, false);
+    assert.deepEqual(browser.calls, { reads: 1, navigations: 1, waits: 0 });
+    assert.equal((await fs.stat(manager.storageStatePath)).mode & 0o777, 0o600);
 });
