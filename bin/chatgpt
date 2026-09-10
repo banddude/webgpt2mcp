@@ -42,7 +42,7 @@ DEFAULT_LIST_LIMIT = 20
 DEFAULT_SEARCH_LIMIT = 20
 DEFAULT_PROJECT_LIMIT = 50
 DEFAULT_PROJECT_CONVERSATION_LIMIT = 28
-DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_TIMEOUT_SECONDS = 60
 
 
 class ChatGPTError(Exception):
@@ -222,85 +222,11 @@ class ApiClient:
                 data=data,
             ) from exc
         except (URLError, TimeoutError, OSError) as exc:
-            raise ChatGPTError(f"local ChatGPT API is unreachable: {exc}") from exc
+            raise ChatGPTError(f"local ChatGPT API request failed: {exc}. Send outcome may be unknown; do not resubmit automatically") from exc
 
         if status >= 400:
             raise ChatGPTError(_error_message(data, f"HTTP {status}"), status=status, data=data)
         return data
-
-    def request_stream(self, method: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        """POST an SSE chat completion and return it as a chat.completion object.
-
-        The bridge accepts streaming submits even when its queue is full
-        (non-streaming ones are rejected as SERVER_BUSY), and delivers the full
-        text plus conversation_url in the final stop chunk.
-        """
-        request = Request(
-            f"{self.base_url}{path}",
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Accept": "text/event-stream",
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.auth}",
-                "User-Agent": "chatgpt-cli/1.0",
-            },
-            method=method.upper(),
-        )
-        content_parts: list[str] = []
-        model: str | None = None
-        conversation_url: str | None = None
-        completion_id: str | None = None
-        try:
-            # No socket timeout: the bridge sends no bytes while a queued task
-            # waits for a browser slot, so any read timeout would abort a task
-            # that is still going to run (and resubmitting would duplicate it).
-            with urlopen(request, timeout=None) as response:
-                for raw_line in response:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[len("data:"):].strip()
-                    if not payload or payload == "[DONE]":
-                        continue
-                    try:
-                        event = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-                    if event.get("error"):
-                        raise ChatGPTError(_error_message(event, "ChatGPT returned an error"), data=event)
-                    model = event.get("model") or model
-                    completion_id = event.get("id") or completion_id
-                    conversation_url = event.get("conversation_url") or conversation_url
-                    choices = event.get("choices") or []
-                    delta = ((choices[0] if choices else {}) or {}).get("delta") or {}
-                    piece = delta.get("content")
-                    if isinstance(piece, str):
-                        content_parts.append(piece)
-        except HTTPError as exc:
-            data = _json_or_text(exc.read())
-            raise ChatGPTError(
-                _error_message(data, f"HTTP {exc.code}"),
-                status=exc.code,
-                data=data,
-            ) from exc
-        except (URLError, TimeoutError, OSError) as exc:
-            raise ChatGPTError(f"local ChatGPT API is unreachable: {exc}") from exc
-
-        return {
-            "id": completion_id or "chatcmpl-cli",
-            "object": "chat.completion",
-            "model": model,
-            "conversation_url": conversation_url,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "".join(content_parts)},
-                    "finish_reason": "stop",
-                }
-            ],
-        }
 
 
 def _conversation_ref(value: str) -> tuple[str, str] | None:
@@ -348,8 +274,8 @@ def _positive_limit(value: str) -> int:
 
 
 def _message(parts: Iterable[str], label: str) -> str:
-    value = " ".join(parts).strip()
-    if not value:
+    value = " ".join(parts)
+    if not value.strip():
         raise CliUsageError(f"{label} is required")
     return value
 
@@ -625,41 +551,25 @@ def _cmd_send(client: ApiClient, args: argparse.Namespace) -> Any:
         "/admin/chatgpt/dispatch",
         body={"conversation_url": url, "prompt": message},
     )
-    if args.json_output:
-        _print_json(data)
-    else:
-        behavior = (
-            "The previous active response was stopped first, then the message was sent."
-            if data.get("active_before")
-            else "The message was sent to the idle conversation."
-        )
-        print(behavior)
-        print(f"Conversation: {url}")
+    _print_acceptance(data, args.json_output)
     return data
 
 
 def _cmd_new(client: ApiClient, args: argparse.Namespace) -> Any:
     message = _message(args.message, "message")
-    # Streamed submits are accepted even when the bridge queue is full;
-    # non-streamed ones are rejected as SERVER_BUSY under load.
-    data = client.request_stream(
-        "POST",
-        "/v1/chat/completions",
-        body={
-            "model": "gpt-instant",
-            "messages": [{"role": "user", "content": message}],
-            "stream": True,
-        },
-    )
-    if args.json_output:
+    data = client.request("POST", "/admin/chatgpt/dispatch", body={"prompt": message, "model": args.model})
+    _print_acceptance(data, args.json_output)
+    return data
+
+
+def _print_acceptance(data: Any, json_output: bool) -> None:
+    if not isinstance(data, dict) or not data.get("success") or not data.get("submitted") or not data.get("conversation_url"):
+        raise ChatGPTError("Send acceptance is unconfirmed. Do not resubmit automatically; inspect the exact URL if available.", data=data)
+    if json_output:
         _print_json(data)
     else:
-        content = (((data.get("choices") or [{}])[0] or {}).get("message") or {}).get("content")
-        print(content or "No response")
-        conversation_url = data.get("conversation_url")
-        if conversation_url:
-            print(f"\nConversation: {conversation_url}")
-    return data
+        print(f"Conversation: {data['conversation_url']}")
+        print("Accepted. This command does not wait for the reply. Read this URL later only when requested.")
 
 
 def _cmd_dispatch(client: ApiClient, args: argparse.Namespace) -> Any:
@@ -672,17 +582,8 @@ def _cmd_dispatch(client: ApiClient, args: argparse.Namespace) -> Any:
         body["spawner"] = args.spawner
     if args.task:
         body["task"] = " ".join(args.task)
-    # Dispatch confirms the exact user turn, then releases the browser lane.
-    # ChatGPT continues the response server-side and the registry poller closes
-    # the worker after a later conversation read reports completion.
     data = client.request("POST", "/admin/chatgpt/dispatch", body=body)
-    if args.json_output:
-        _print_json(data)
-        return data
-    conversation_url = data.get("conversation_url")
-    if conversation_url:
-        print(f"\nWorker chat: {conversation_url}")
-        print("Submitted; ChatGPT continues server-side and the worker will close after completion.")
+    _print_acceptance(data, args.json_output)
     return data
 
 
@@ -813,16 +714,18 @@ def _build_parser() -> argparse.ArgumentParser:
     send.add_argument("message", nargs="+", help="message to send")
 
     new = commands.add_parser("new", help="create a new conversation")
-    new.add_argument("message", nargs="+", help="first message")
+    new.add_argument("message", nargs="+", help="exact first message; quote it as one argument")
+    new.add_argument("--model", choices=["gpt-instant", "gpt-thinking", "gpt-pro"], default="gpt-instant")
 
-    dispatch = commands.add_parser("dispatch", help="spawn a worker chat and register it")
-    dispatch.add_argument("message", nargs="+", help="first message (the task prompt)")
+    dispatch = commands.add_parser("dispatch", help="send once in a new chat and return its URL")
+    dispatch.add_argument("message", nargs="+", help="exact first message; quote it as one argument")
     dispatch.add_argument("--spawner", default=None, help="name recorded for whoever spawned the worker")
     dispatch.add_argument("--task", nargs="+", default=None, help="short task description for the registry")
     dispatch.add_argument(
         "--model",
         default="gpt-instant",
-        help="bridge model for the worker chat (gpt-instant, gpt-thinking, gpt-pro)",
+        choices=["gpt-instant", "gpt-thinking", "gpt-pro"],
+        help="website model selection",
     )
 
     rename = commands.add_parser("rename", help="rename one exact conversation")

@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Alias for the maintained single-command CLI; no generated client or model backend."""
+import os
+import sys
+from pathlib import Path
+command = str(Path(__file__).resolve().with_name("chatgpt"))
+os.execv(command, [command, *sys.argv[1:]])

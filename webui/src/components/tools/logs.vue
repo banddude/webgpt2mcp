@@ -1,10 +1,9 @@
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { ref, onMounted, computed } from 'vue';
 import { useSettingsStore } from '@/stores/settings';
 import {
     ReloadOutlined,
     DeleteOutlined,
-    SearchOutlined,
     DownloadOutlined,
     WarningOutlined,
     CloseCircleOutlined,
@@ -19,8 +18,6 @@ const settingsStore = useSettingsStore();
 const logs = ref([]);
 const loading = ref(false);
 const total = ref(0);
-const autoRefresh = ref(false);
-const refreshInterval = ref(null);
 const searchText = ref('');
 const levelFilter = ref('all');
 
@@ -39,6 +36,7 @@ const levelConfig = {
 
 // 获取日志
 const fetchLogs = async () => {
+    if (loading.value) return;
     loading.value = true;
     try {
         const res = await fetch('/admin/logs?lines=500', {
@@ -133,20 +131,6 @@ const exportLogs = () => {
     URL.revokeObjectURL(url);
 };
 
-// 切换自动刷新
-const toggleAutoRefresh = (newState) => {
-    autoRefresh.value = newState;
-    if (newState) {
-        fetchLogs(); // 立即刷新一次
-        refreshInterval.value = setInterval(fetchLogs, 5000);
-    } else {
-        if (refreshInterval.value) {
-            clearInterval(refreshInterval.value);
-            refreshInterval.value = null;
-        }
-    }
-};
-
 // 查询日期范围统计
 const fetchRangeStats = async () => {
     if (!dateRange.value || dateRange.value.length !== 2) {
@@ -206,11 +190,6 @@ onMounted(() => {
     fetchLogs();
 });
 
-onUnmounted(() => {
-    if (refreshInterval.value) {
-        clearInterval(refreshInterval.value);
-    }
-});
 </script>
 
 <template>
@@ -267,9 +246,8 @@ onUnmounted(() => {
                     <a-select-option value="DBUG">DEBUG</a-select-option>
                 </a-select>
                 <a-space :size="4">
-                    <a-tooltip :title="autoRefresh ? '关闭自动刷新' : '开启自动刷新'">
-                        <a-button size="small" :type="autoRefresh ? 'primary' : 'default'"
-                            @click="toggleAutoRefresh(!autoRefresh)">
+                    <a-tooltip title="刷新日志">
+                        <a-button size="small" :loading="loading" @click="fetchLogs">
                             <template #icon>
                                 <ReloadOutlined />
                             </template>
@@ -301,9 +279,6 @@ onUnmounted(() => {
         <!-- 统计信息 -->
         <div style="margin-bottom: 12px; color: #8c8c8c; font-size: 12px;">
             共 {{ total }} 条日志，当前显示 {{ filteredLogs.length }} 条
-            <span v-if="autoRefresh" style="color: #1890ff; margin-left: 8px;">
-                <ReloadOutlined :spin="true" /> 自动刷新中
-            </span>
         </div>
 
         <!-- 日志列表 -->

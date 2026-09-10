@@ -5,20 +5,10 @@ import { Modal } from 'ant-design-vue';
 
 const settingsStore = useSettingsStore();
 
-const poolConfig = computed({
-    get: () => settingsStore.poolConfig,
-    set: (val) => settingsStore.poolConfig = val
-});
-
-const handleSavePool = async () => {
-    await settingsStore.savePoolConfig(poolConfig.value);
-};
-
 // 获取初始数据
 onMounted(async () => {
     await Promise.all([
         settingsStore.fetchWorkerConfig(),
-        settingsStore.fetchPoolConfig(),
         settingsStore.fetchAdaptersMeta()
     ]);
 });
@@ -327,97 +317,6 @@ const handleRemoveWorker = (index) => {
 
 <template>
     <a-layout style="background: transparent;">
-        <a-card title="负载均衡" :bordered="false" style="width: 100%; margin-bottom: 10px;">
-            <!-- 调度策略 -->
-            <div style="margin-bottom: 24px;">
-                <div style="font-weight: 600; margin-bottom: 8px;">调度策略</div>
-                <div style="font-size: 12px; color: #8c8c8c; margin-bottom: 12px;">
-                    选择任务分配到工作实例的调度算法
-                </div>
-                <a-segmented v-model:value="poolConfig.strategy" block :options="[
-                    { label: '最少繁忙', value: 'least_busy' },
-                    { label: '轮询', value: 'round_robin' },
-                    { label: '随机', value: 'random' }
-                ]" />
-            </div>
-
-            <!-- 生成等待超时 -->
-            <div style="margin-bottom: 24px;">
-                <div style="font-weight: 600; margin-bottom: 8px;">生成等待超时</div>
-                <div style="font-size: 12px; color: #8c8c8c; margin-bottom: 12px;">
-                    等待 AI 生成结果的最长时间，单位：秒（默认 120 秒）
-                </div>
-                <a-input-number v-model:value="poolConfig.waitTimeout" :min="30" :max="3600" :step="30"
-                    style="width: 100%" placeholder="请输入超时秒数">
-                    <template #addonAfter>秒</template>
-                </a-input-number>
-            </div>
-
-            <!-- 故障转移（折叠面板） -->
-            <div style="margin-bottom: 24px;">
-                <a-collapse>
-                    <a-collapse-panel key="failover" header="故障转移">
-                        <a-row :gutter="16">
-                            <a-col :xs="24" :md="12">
-                                <div style="margin-bottom: 8px;">
-                                    <div style="font-weight: 600; margin-bottom: 8px;">启用故障转移</div>
-                                    <div style="font-size: 12px; color: #8c8c8c; margin-bottom: 12px;">
-                                        启用后，任务失败时会自动切换到其他可用实例重试
-                                    </div>
-                                    <a-switch v-model:checked="poolConfig.failover.enabled" />
-                                </div>
-                            </a-col>
-
-                            <a-col :xs="24" :md="12">
-                                <div style="margin-bottom: 8px;">
-                                    <div style="font-weight: 600; margin-bottom: 8px;">重试次数</div>
-                                    <div style="font-size: 12px; color: #8c8c8c; margin-bottom: 12px;">
-                                        故障转移时最大重试次数，范围 1-10
-                                    </div>
-                                    <a-input-number v-model:value="poolConfig.failover.maxRetries" :min="1" :max="10"
-                                        :disabled="!poolConfig.failover.enabled" style="width: 100%" placeholder="请输入重试次数" />
-                                </div>
-                            </a-col>
-                        </a-row>
-
-                        <a-divider style="margin: 12px 0;" />
-
-                        <a-row :gutter="16">
-                            <a-col :xs="24" :md="12">
-                                <div style="margin-bottom: 8px;">
-                                    <div style="font-weight: 600; margin-bottom: 8px;">图片下载重试</div>
-                                    <div style="font-size: 12px; color: #8c8c8c; margin-bottom: 12px;">
-                                        启用后，图片/视频下载失败时会自动重试下载（不重新生成）
-                                    </div>
-                                    <a-switch v-model:checked="poolConfig.failover.imgDlRetry" />
-                                </div>
-                            </a-col>
-
-                            <a-col :xs="24" :md="12">
-                                <div style="margin-bottom: 8px;">
-                                    <div style="font-weight: 600; margin-bottom: 8px;">下载重试次数</div>
-                                    <div style="font-size: 12px; color: #8c8c8c; margin-bottom: 12px;">
-                                        图片下载失败时的最大重试次数，范围 1-10
-                                    </div>
-                                    <a-input-number v-model:value="poolConfig.failover.imgDlRetryMaxRetries" :min="1"
-                                        :max="10" :disabled="!poolConfig.failover.imgDlRetry" style="width: 100%"
-                                        placeholder="请输入下载重试次数" />
-                                </div>
-                            </a-col>
-                        </a-row>
-                    </a-collapse-panel>
-                </a-collapse>
-            </div>
-
-            <!-- 保存按钮 -->
-            <div style="display: flex; justify-content: flex-end; margin-top: 24px;">
-                <a-button type="primary" @click="handleSavePool">
-                    保存设置
-                </a-button>
-            </div>
-        </a-card>
-
-
         <a-card :bordered="false" style="width: 100%;">
             <!-- 卡片标题和创建按钮 -->
             <template #title>

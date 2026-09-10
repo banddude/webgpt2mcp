@@ -123,7 +123,7 @@ class AdapterRegistry {
             errors.push('缺少 id 或类型不正确');
         }
 
-        if (!manifest.generate || typeof manifest.generate !== 'function') {
+        if (!manifest.controlsOnly && typeof manifest.generate !== 'function') {
             errors.push('缺少 generate 函数');
         }
 

@@ -8,7 +8,6 @@ import { ERROR_CODES } from '../../errors.js';
 import { logger } from '../../../utils/logger.js';
 import { recordWorkerSpawn } from '../worker-registry.js';
 import { mapConversationMessages } from './cloud-transcript.js';
-import yaml from 'yaml';
 import {
     getSystemStatus,
     getDataFolders,
@@ -20,20 +19,15 @@ import {
     saveServerConfig,
     getBrowserConfig,
     saveBrowserConfig,
-    getQueueConfig,
-    saveQueueConfig,
     getInstancesConfig,
     saveInstancesConfig,
     getAdaptersConfig,
-    saveAdaptersConfig,
-    getPoolConfig,
-    savePoolConfig
+    saveAdaptersConfig
 } from '../../../config/manager.js';
 import {
     validateServerConfig,
     validateBrowserConfig,
     validateInstancesConfig,
-    validatePoolConfig,
     validateAdaptersConfig
 } from '../../../config/validator.js';
 import { registry } from '../../../backend/registry.js';
@@ -64,22 +58,18 @@ import {
     renameChatGptProject,
     deleteChatGptProject,
     moveChatGptConversationToProject,
-    routeChatGptConversationToProject,
     chatgptCloudRequest,
     isTransientChatGptBrowserError,
-    chatGptReadRetryDelayMs,
     parseChatGptConversationReference,
     resolveChatGptConversationUrl,
     selectChatGptModel,
     findChatInput,
     focusChatGptInput,
     findChatGptSendButton,
-    isChatGptSendControlVisibilityRace,
     waitForChatInput,
     readChatInputText,
     readCurrentChatGptDomTranscript,
     dismissStaleChatGptAuthDialog,
-    CHATGPT_SEND_BUTTON_SELECTOR,
     CHATGPT_STOP_BUTTON_SELECTOR
 } from '../../../backend/adapter/chatgpt_text.js';
 import {
@@ -88,8 +78,9 @@ import {
     waitForVerifiedComposerTarget,
 } from '../../../backend/adapter/chatgpt-exact-send.js';
 import { getBackend } from '../../../backend/index.js';
-import { gotoWithCheck, waitForInput } from '../../../backend/utils/page.js';
-import { safeClick, humanType } from '../../../backend/engine/utils.js';
+import { gotoWithCheck } from '../../../backend/utils/page.js';
+import { safeClick } from '../../../backend/engine/utils.js';
+import { fillExactPrompt, submitTurnOnce } from '../../chatgptSubmit.js';
 import { createChatGptSessionManager } from '../../chatgptSession.js';
 import { selectChatGptControlPage } from '../../chatgptPageSelector.js';
 
@@ -112,28 +103,6 @@ function firstText(...values) {
         if (typeof value === 'string' && value.trim()) return value.trim();
     }
     return null;
-}
-
-function requestAgentHint(body, req) {
-    return firstText(
-        body.agent,
-        body.agent_name,
-        body.metadata?.agent,
-        body.metadata?.agent_name,
-        req.headers?.['x-aiva-agent'],
-        req.headers?.['x-chatgpt-agent']
-    );
-}
-
-function requestProjectHint(body, req) {
-    return firstText(
-        body.project,
-        body.project_id,
-        body.metadata?.project,
-        body.metadata?.project_id,
-        req.headers?.['x-aiva-project'],
-        req.headers?.['x-chatgpt-project']
-    );
 }
 
 function getConversationKey(record) {
@@ -218,124 +187,29 @@ async function deleteCloudConversations(records, queueManager) {
  */
 export function createAdminRouter(context) {
     const { config, queueManager, tempDir, getSafeMode } = context;
-    const chatGptSession = createChatGptSessionManager({ queueManager });
+    const chatGptSession = context.chatGptSession ?? createChatGptSessionManager({ queueManager });
     const recentDispatchDomReadUntil = new Map();
     const recentDispatchDomReadTtlMs = 3 * 60 * 1000;
 
-    // Dispatches are short browser handoffs, not generation lanes. Serialize
-    // only the physical page interaction so simultaneous callers do not type
-    // into the same composer; the lock is released as soon as the user turn is
-    // confirmed and never waits for the assistant response.
-    const dispatchJobs = [];
-    let dispatchQueueRunning = false;
-
-    const waitForDispatchControl = async () => {
-        const acquire = queueManager?.acquireControlLock;
-        if (typeof acquire !== 'function') {
-            throw new Error('browser_control_unavailable');
-        }
-        while (true) {
-            const release = acquire('chatgpt-dispatch');
-            if (typeof release === 'function') return release;
-            await new Promise(resolve => setTimeout(resolve, 100));
-        }
-    };
-
-    const drainDispatchJobs = async () => {
-        if (dispatchQueueRunning) return;
-        dispatchQueueRunning = true;
-        let releaseControlLock = null;
-        try {
-            if (dispatchJobs.length > 0) {
-                releaseControlLock = await waitForDispatchControl();
-            }
-            while (dispatchJobs.length > 0) {
-                const job = dispatchJobs.shift();
-                try {
-                    job.resolve(await job.operation());
-                } catch (error) {
-                    job.reject(error);
-                }
-            }
-        } catch (error) {
-            while (dispatchJobs.length > 0) {
-                dispatchJobs.shift().reject(error);
-            }
-        } finally {
-            releaseControlLock?.();
-            dispatchQueueRunning = false;
-            if (dispatchJobs.length > 0) void drainDispatchJobs();
-        }
-    };
-
-    const enqueueDispatch = operation => new Promise((resolve, reject) => {
-        dispatchJobs.push({ operation, resolve, reject });
-        void drainDispatchJobs();
-    });
-
-    // No background completion poller. Nothing in this service re-polls ChatGPT
-    // after a send; callers read a conversation once, on demand (Mike, 2026-09-07).
-
-    // ==================== Skill 系统 ====================
-
-    const SKILLS_DIR = path.join(process.cwd(), 'skills');
-
-    // Skill 任务状态追踪
-    const skillTasks = new Map();
-
-    /**
-     * 加载 skill 定义
-     * @param {string} name - skill 名称（不含扩展名）
-     * @returns {object|null}
-     */
-    async function loadSkill(name) {
-        const yamlPath = path.join(SKILLS_DIR, `${name}.yaml`);
-        const ymlPath = path.join(SKILLS_DIR, `${name}.yml`);
-        let filePath = null;
-        try { await fs.access(yamlPath); filePath = yamlPath; } catch { try { await fs.access(ymlPath); filePath = ymlPath; } catch {} }
-        if (!filePath) return null;
-        const content = await fs.readFile(filePath, 'utf-8');
-        return yaml.parse(content);
-    }
-
-    /**
-     * 列出所有可用 skills
-     */
-    async function listSkills() {
-        try {
-            const files = await fs.readdir(SKILLS_DIR);
-            const skills = [];
-            for (const file of files) {
-                if (!file.endsWith('.yaml') && !file.endsWith('.yml')) continue;
-                try {
-                    const content = await fs.readFile(path.join(SKILLS_DIR, file), 'utf-8');
-                    const skill = yaml.parse(content);
-                    if (skill?.name) {
-                        skills.push({
-                            name: skill.name,
-                            description: skill.description || '',
-                            model: skill.model || 'gpt-thinking',
-                            file: file
-                        });
-                    }
-                } catch { /* skip invalid */ }
-            }
-            return skills;
-        } catch {
-            return [];
-        }
-    }
-
-    /**
-     * Admin 路由处理函数
-     * @param {import('http').IncomingMessage} req
-     * @param {import('http').ServerResponse} res
-     * @param {string} pathname - 去除 /admin 前缀后的路径
-     */
     return async function handleAdminRequest(req, res, pathname) {
         const method = req.method;
+        let sendAttempted = false;
 
         try {
+            if (method === 'GET' && pathname === '/cookies') {
+                const url = new URL(req.url, `http://${req.headers.host}`);
+                sendJson(res, 200, await queueManager.getWorkerCookies(url.searchParams.get('name'), url.searchParams.get('domain')));
+                return;
+            }
+            if (['/queue', '/config/pool', '/chatgpt/skill'].includes(pathname) || pathname.startsWith('/chatgpt/skill/')) {
+                sendJson(res, 404, { error: 'Not Found' });
+                return;
+            }
+
+            if (method === 'POST' && ['/chatgpt/dispatch', '/chatgpt/steer'].includes(pathname) && queueManager?.isControlLocked?.()) {
+                sendJson(res, 409, { success: false, submitted: false, error: 'browser_control_locked', retry_automatically: false });
+                return;
+            }
             const isChatGptOperation = pathname.startsWith('/chatgpt/')
                 && !['/chatgpt/status', '/chatgpt/login', '/chatgpt/session/persist'].includes(pathname);
             if (isChatGptOperation) {
@@ -371,9 +245,12 @@ export function createAdminRouter(context) {
 
             // POST /admin/chatgpt/login - open the existing bridge browser on ChatGPT login
             if (method === 'POST' && pathname === '/chatgpt/login') {
-                const body = await readBody(req).catch(() => ({}));
-                const waitSeconds = Math.max(0, Math.min(Number(body.wait_seconds || 0), 300));
-                const result = await chatGptSession.openLogin({ waitSeconds });
+                const body = await readBody(req).catch(() => null);
+                if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) {
+                    sendJson(res, 400, { error: 'Unsupported login options; request status separately after signing in.' });
+                    return;
+                }
+                const result = await chatGptSession.openLogin();
                 const vnc = await getVncInfo().catch(() => null);
                 sendJson(res, result.opened ? 200 : 503, { ...result, vnc });
                 return;
@@ -533,13 +410,7 @@ export function createAdminRouter(context) {
             // GET/POST /admin/config/server
             if (pathname === '/config/server') {
                 if (method === 'GET') {
-                    const serverConfig = getServerConfig();
-                    const queueConfig = getQueueConfig();
-                    sendJson(res, 200, {
-                        ...serverConfig,
-                        queueBuffer: queueConfig.queueBuffer,
-                        imageLimit: queueConfig.imageLimit
-                    });
+                    sendJson(res, 200, getServerConfig());
                 } else if (method === 'POST') {
                     const body = await readBody(req);
 
@@ -553,11 +424,7 @@ export function createAdminRouter(context) {
                         return;
                     }
 
-                    // 分别保存 server 和 queue 配置
                     saveServerConfig(body);
-                    if (body.queueBuffer !== undefined || body.imageLimit !== undefined) {
-                        saveQueueConfig(body);
-                    }
                     sendJson(res, 200, { success: true, message: '配置已保存，请重启服务生效' });
                 } else {
                     res.writeHead(405);
@@ -644,32 +511,6 @@ export function createAdminRouter(context) {
                 return;
             }
 
-            // GET/POST /admin/config/pool - 负载均衡和故障转移配置
-            if (pathname === '/config/pool') {
-                if (method === 'GET') {
-                    sendJson(res, 200, getPoolConfig());
-                } else if (method === 'POST') {
-                    const body = await readBody(req);
-
-                    // 校验配置
-                    const validation = validatePoolConfig(body);
-                    if (!validation.valid) {
-                        sendApiError(res, {
-                            code: ERROR_CODES.INVALID_REQUEST_BODY,
-                            message: `配置校验失败: ${validation.errors.join('; ')}`
-                        });
-                        return;
-                    }
-
-                    savePoolConfig(body);
-                    sendJson(res, 200, { success: true, message: '配置已保存，请重启服务生效' });
-                } else {
-                    res.writeHead(405);
-                    res.end();
-                }
-                return;
-            }
-
             // ==================== 元数据 ====================
 
             // GET /admin/adapters - 获取适配器列表（含 configSchema）
@@ -747,20 +588,6 @@ export function createAdminRouter(context) {
                 return;
             }
 
-            // GET /admin/queue - 任务队列状态
-            if (method === 'GET' && pathname === '/queue') {
-                const queueStatus = queueManager.getStatus();
-                const detailedStatus = queueManager.getDetailedStatus();
-
-                sendJson(res, 200, {
-                    processing: queueStatus.processing,
-                    waiting: queueStatus.queueLength,
-                    total: queueStatus.total,
-                    processingTasks: detailedStatus.processing,
-                    waitingTasks: detailedStatus.waiting
-                });
-                return;
-            }
 
             // ChatGPT redirects conversations assigned to a project from the public
             // /c/<id> URL to /g/<project>/c/<id>. Keep exact-ID validation at the
@@ -943,30 +770,13 @@ export function createAdminRouter(context) {
                 return { forced: false, overlay: null };
             };
 
-            const submitVerifiedChatGptTurn = async (page) => {
-                const sendButton = await findChatGptSendButton(page);
-                if (sendButton) {
-                    try {
-                        const click = await clickVerifiedChatGptControl(page, sendButton);
-                        return { ok: true, method: 'button', click };
-                    } catch (error) {
-                        if (!isChatGptSendControlVisibilityRace(error)) throw error;
-                    }
-                }
-
-                // ChatGPT can rerender the composer between locating its send button and
-                // clicking it. If that pre-click visibility race happens, reacquire and
-                // focus the already-verified composer, then use ChatGPT's normal Enter
-                // submission path. Do not replay ambiguous click failures here.
-                const overlay = await clearConversationRateLimitModal(page);
-                if (overlay.visible) {
-                    return { ok: false, error: 'conversation_rate_limit_modal' };
-                }
-                const composer = await waitForChatInput(page, { click: false, timeout: 15000 });
-                await composer.focus();
-                await page.keyboard.press('Enter');
-                return { ok: true, method: 'keyboard' };
-            };
+            const submitVerifiedChatGptTurn = page => submitTurnOnce({
+                page, findSendButton: findChatGptSendButton, clickControl: clickVerifiedChatGptControl,
+                clearModal: clearConversationRateLimitModal,
+                waitForComposer: p => waitForChatInput(p, { click: false, timeout: 5000 }),
+                cancelled: () => !!(req.aborted || res.destroyed || sendAttempted),
+                onAttempt: () => { sendAttempted = true; },
+            });
 
             const waitForStoppedStream = async (page, convId, timeoutMs = 20000) => {
                 const deadline = Date.now() + timeoutMs;
@@ -1039,30 +849,7 @@ export function createAdminRouter(context) {
                 return { element, active };
             };
 
-            const readLatestCloudUserTurn = async (page, convId, retries = 3) => {
-                const result = await chatgptCloudRequest(page, {
-                    path: `/conversation/${convId}`,
-                    retries: Math.max(0, retries - 1),
-                });
-                if (!result?.ok || !result.data) {
-                    return { latest: null, http: result?.http || null, error: result?.error || null };
-                }
-                let latest = null;
-                for (const node of Object.values(result.data.mapping || {})) {
-                    const msg = node?.message;
-                    if (!msg || msg.author?.role !== 'user' || !msg.content) continue;
-                    const type = msg.content.content_type;
-                    if (type !== 'text' && type !== 'multimodal_text') continue;
-                    const parts = Array.isArray(msg.content.parts) ? msg.content.parts : [];
-                    const text = parts.map(part => typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : '')).join('');
-                    if (!text.trim()) continue;
-                    const item = { id: msg.id || null, text, create_time: msg.create_time || 0 };
-                    if (!latest || item.create_time >= latest.create_time) latest = item;
-                }
-                return { latest, http: result.http, auth_mode: result.authMode || null };
-            };
-
-            const waitForExactUserTurn = async (page, conversationUrl, prompt, countBefore, convId, cloudUserBefore, timeoutMs = 30000) => {
+            const waitForExactUserTurn = async (page, conversationUrl, prompt, countBefore, timeoutMs = 10000) => {
                 const userMessages = page.locator('[data-message-author-role="user"]');
                 const composer = await waitForChatInput(page, { click: false, timeout: 60000 });
                 const stopButton = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first();
@@ -1070,8 +857,6 @@ export function createAdminRouter(context) {
                 const deadline = Date.now() + timeoutMs;
                 let lastText = '';
                 let count = countBefore;
-                let lastCloud = null;
-                let nextCloudCheck = 0;
                 while (Date.now() < deadline) {
                     if (normalizeChatUrl(page.url()) !== targetUrl) {
                         return { accepted: false, count, lastText, error: 'conversation_navigation_mismatch', actual_url: page.url() };
@@ -1095,48 +880,15 @@ export function createAdminRouter(context) {
                         return { accepted: true, count, lastText, confirmed_by: 'ui_new_generation' };
                     }
 
-                    // Cloud graph is only a fallback when a baseline message ID was captured.
-                    if (cloudUserBefore?.id && Date.now() >= nextCloudCheck) {
-                        lastCloud = await readLatestCloudUserTurn(page, convId, 2);
-                        const latest = lastCloud?.latest;
-                        if (latest?.id && latest.id !== cloudUserBefore.id &&
-                            normalizeVisibleText(latest.text) === normalizeVisibleText(prompt)) {
-                            return { accepted: true, count, lastText: latest.text, confirmed_by: 'cloud_new_id', cloud_id: latest.id };
-                        }
-                        nextCloudCheck = Date.now() + 1000;
-                    }
                     await page.waitForTimeout(200);
                 }
-                return { accepted: false, count, lastText, cloud_http: lastCloud?.http || null };
+                return { accepted: false, count, lastText };
             };
-
-            const waitForNewAssistantResponse = async (page, convId, assistantCountBefore, timeoutMs = 15000) => {
-                const assistantMessages = page.locator('[data-message-author-role="assistant"]');
-                const stopButton = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first();
-                const deadline = Date.now() + timeoutMs;
-                let state = null;
-                let assistantCount = assistantCountBefore;
-                let newStopVisible = false;
-                while (Date.now() < deadline) {
-                    assistantCount = await assistantMessages.count().catch(() => assistantCountBefore);
-                    newStopVisible = await stopButton.isVisible().catch(() => false);
-                    state = await readChatGptStreamState(page, convId);
-                    // Do not trust IS_STREAMING alone here: it may be the stale status from the
-                    // response we just stopped. A new assistant DOM turn or a newly visible Stop
-                    // control proves the replacement generation actually began.
-                    if (assistantCount > assistantCountBefore || newStopVisible) {
-                        return { started: true, state, assistantCount, stopVisible: newStopVisible };
-                    }
-                    await page.waitForTimeout(250);
-                }
-                return { started: false, state, assistantCount, stopVisible: newStopVisible };
-            };
-
 
             // Single normal exact-send implementation. Steering is special only through the
             // Stop step; once the old stream is confirmed stopped, it hands off here exactly
             // like any other idle conversation continuation.
-            const sendExactTurn = async (page, conversationUrl, convId, prompt, { assistantCountBefore = null, requireResponseStart = false } = {}) => {
+            const sendExactTurn = async (page, conversationUrl, convId, prompt) => {
                 const nav = await navigateExactChat(page, conversationUrl);
                 if (!nav.ok) {
                     return {
@@ -1150,11 +902,7 @@ export function createAdminRouter(context) {
 
                 const userMessages = page.locator('[data-message-author-role="user"]');
                 const userCountBefore = await userMessages.count().catch(() => 0);
-                const cloudUserBeforeResult = await readLatestCloudUserTurn(page, convId, 3);
-                const cloudUserBefore = cloudUserBeforeResult?.latest || null;
-                // Reacquire the post-Stop composer and use the exact same click/type machinery
-                // as the normal ChatGPT adapter. Stop can rerender this node, so never reuse a
-                // pre-Stop ElementHandle.
+                // Reacquire the post-Stop composer; never reuse a stale ElementHandle.
                 const composer = await focusChatGptInput(page, { timeout: 15000 });
 
                 // PRE-TYPE GATE (issue #18 round 2), immediately before any
@@ -1174,37 +922,25 @@ export function createAdminRouter(context) {
                     };
                 }
 
-                // Ensure a short steering prompt does not append to any text ChatGPT preserved
-                // across the Stop rerender. humanType itself performs this clear for long text;
-                // do it explicitly here so short and long prompts have the same semantics.
-                const modifierKey = process.platform === 'darwin' ? 'Meta' : 'Control';
-                await page.keyboard.down(modifierKey);
-                await page.keyboard.press('A');
-                await page.keyboard.up(modifierKey);
-                await page.keyboard.press('Backspace');
-                await page.waitForTimeout(100);
-                await humanType(page, composer, prompt);
-                logger.info('Admin', `Typed exact turn for ${convId} (composer verified at ${preType.url}); submitting`);
-
-                const freshComposer = await waitForChatInput(page, { click: false, timeout: 60000 });
-                const composerText = (await readChatInputText(freshComposer)).trim();
-                if (normalizeVisibleText(composerText) !== normalizeVisibleText(prompt)) {
+                // Replace any draft text and verify the entire supplied message before sending.
+                const exact = await fillExactPrompt(composer, prompt, readChatInputText);
+                if (!exact) {
                     return {
                         ok: false,
                         error: 'composer_text_mismatch',
                         expected_length: prompt.length,
-                        actual_length: composerText.length,
-                        composer_diagnostic: await describeChatInput(page, freshComposer),
+                        actual_length: (await readChatInputText(composer)).length,
+                        composer_diagnostic: await describeChatInput(page, composer),
                     };
                 }
 
                 const submission = await submitVerifiedChatGptTurn(page);
                 if (!submission.ok) {
-                    return { ok: false, error: submission.error || 'send_button_unavailable' };
+                    return { ...submission, actual_url: page.url() };
                 }
                 logger.info('Admin', `Submitted exact turn for ${convId}; url after submit: ${page.url()}`);
 
-                const accepted = await waitForExactUserTurn(page, conversationUrl, prompt, userCountBefore, convId, cloudUserBefore);
+                const accepted = await waitForExactUserTurn(page, conversationUrl, prompt, userCountBefore);
                 if (!accepted.accepted) {
                     if (accepted.error === 'conversation_navigation_mismatch') {
                         // The submit left the target conversation: ChatGPT
@@ -1222,24 +958,7 @@ export function createAdminRouter(context) {
                             ...(stray.conversationId && stray.conversationId !== convId ? { stray_conversation_id: stray.conversationId } : {}),
                         };
                     }
-                    return { ok: false, error: accepted.error || 'exact_user_turn_not_confirmed', last_user_text: accepted.lastText, actual_url: accepted.actual_url || page.url() };
-                }
-
-                let responseStarted = null;
-                if (requireResponseStart) {
-                    const baseline = Number.isInteger(assistantCountBefore)
-                        ? assistantCountBefore
-                        : await page.locator('[data-message-author-role="assistant"]').count().catch(() => 0);
-                    responseStarted = await waitForNewAssistantResponse(page, convId, baseline);
-                    if (!responseStarted.started) {
-                        return {
-                            ok: false,
-                            submitted: true,
-                            exact_user_turn_confirmed: true,
-                            error: 'replacement_response_not_started',
-                            stream_status_after: responseStarted.state?.status || null,
-                        };
-                    }
+                    return { ok: false, submitted: null, submission_attempted: true, retry_automatically: false, error: accepted.error || 'exact_user_turn_not_confirmed', last_user_text: accepted.lastText, actual_url: accepted.actual_url || page.url() };
                 }
 
                 return {
@@ -1247,19 +966,9 @@ export function createAdminRouter(context) {
                     submitted: true,
                     exact_user_turn_confirmed: true,
                     acceptance_confirmed_by: accepted.confirmed_by || null,
-                    response_started: requireResponseStart ? !!responseStarted?.started : null,
-                    stream_status_after: responseStarted?.state?.status || null,
+                    response_started: null,
+                    stream_status_after: null,
                 };
-            };
-
-            const waitForExistingGenerationToFinish = async (queueManager, timeoutMs = 120000) => {
-                const deadline = Date.now() + timeoutMs;
-                let status = queueManager.getStatus();
-                while (status.processing > 0 && Date.now() < deadline) {
-                    await new Promise(resolve => setTimeout(resolve, 250));
-                    status = queueManager.getStatus();
-                }
-                return { idle: status.processing === 0, status };
             };
 
             const navigateNewChat = async page => {
@@ -1293,37 +1002,31 @@ export function createAdminRouter(context) {
                     const modelSelected = modelCodeNames[model]
                         ? await selectChatGptModel(page, modelCodeNames[model], { source: 'admin-dispatch' })
                         : false;
+                    if (model && !modelSelected) {
+                        return { ok: false, submitted: false, error: 'model_selection_unconfirmed' };
+                    }
 
                     const userMessages = page.locator('[data-message-author-role="user"]');
                     const userCountBefore = await userMessages.count().catch(() => 0);
                     const composer = await focusChatGptInput(page, { timeout: 15000 });
 
-                    const modifierKey = process.platform === 'darwin' ? 'Meta' : 'Control';
-                    await page.keyboard.down(modifierKey);
-                    await page.keyboard.press('A');
-                    await page.keyboard.up(modifierKey);
-                    await page.keyboard.press('Backspace');
-                    await page.waitForTimeout(100);
-                    await humanType(page, composer, prompt);
-
-                    const freshComposer = await waitForChatInput(page, { click: false, timeout: 60000 });
-                    const composerText = (await readChatInputText(freshComposer)).trim();
-                    if (normalizeVisibleText(composerText) !== normalizeVisibleText(prompt)) {
+                    const exact = await fillExactPrompt(composer, prompt, readChatInputText);
+                    if (!exact) {
                         return {
                         ok: false,
                         error: 'composer_text_mismatch',
                         expected_length: prompt.length,
-                        actual_length: composerText.length,
-                        composer_diagnostic: await describeChatInput(page, freshComposer),
+                        actual_length: (await readChatInputText(composer)).length,
+                        composer_diagnostic: await describeChatInput(page, composer),
                     };
                     }
 
                     try {
                         const submission = await submitVerifiedChatGptTurn(page);
                         if (!submission.ok) {
-                            return { ok: false, error: submission.error || 'send_button_unavailable' };
+                            return { ...submission, actual_url: page.url() };
                         }
-                        const deadline = Date.now() + 30000;
+                        const deadline = Date.now() + 10000;
                         let latestUserText = '';
                         let stopVisible = false;
                         let capturedConversationId = null;
@@ -1341,9 +1044,6 @@ export function createAdminRouter(context) {
                                         capturedConversationId = conversationIdFromPageUrl(page.url());
                                     }
                                     if (!capturedConversationId) continue;
-                                    const streamState = capturedConversationId
-                                        ? await readChatGptStreamState(page, capturedConversationId).catch(() => null)
-                                        : null;
                                     return {
                                         ok: true,
                                         submitted: true,
@@ -1351,8 +1051,8 @@ export function createAdminRouter(context) {
                                         conversation_url: capturedConversationId ? `https://chatgpt.com/c/${capturedConversationId}` : null,
                                         exact_user_turn_confirmed: true,
                                         acceptance_confirmed_by: 'dom',
-                                        response_started: stopVisible || streamState?.status === 'IS_STREAMING' ? true : null,
-                                        stream_status_after: streamState?.status || null,
+                                        response_started: null,
+                                        stream_status_after: null,
                                         model_selected: modelSelected,
                                     };
                                 }
@@ -1361,7 +1061,6 @@ export function createAdminRouter(context) {
                             stopVisible = await page.locator(CHATGPT_STOP_BUTTON_SELECTOR).first().isVisible().catch(() => false);
                             const composerEmpty = !normalizeVisibleText(await readChatInputText(composer));
                             if (capturedConversationId && composerEmpty && stopVisible) {
-                                const streamState = await readChatGptStreamState(page, capturedConversationId).catch(() => null);
                                 return {
                                     ok: true,
                                     submitted: true,
@@ -1370,7 +1069,7 @@ export function createAdminRouter(context) {
                                     exact_user_turn_confirmed: true,
                                     acceptance_confirmed_by: 'ui_new_generation',
                                     response_started: true,
-                                    stream_status_after: streamState?.status || null,
+                                    stream_status_after: null,
                                     model_selected: modelSelected,
                                 };
                             }
@@ -1378,7 +1077,9 @@ export function createAdminRouter(context) {
                         }
                         return {
                             ok: false,
-                            submitted: false,
+                            submitted: null,
+                            submission_attempted: true,
+                            retry_automatically: false,
                             error: 'new_conversation_user_turn_not_confirmed',
                             conversation_id: capturedConversationId,
                             last_user_text: latestUserText,
@@ -1390,7 +1091,7 @@ export function createAdminRouter(context) {
                         // then leaves the assistant generation entirely alone.
                     }
                 } catch (error) {
-                    return { ok: false, submitted: false, error: error?.message || 'new_conversation_submit_failed' };
+                    return { ok: false, submitted: sendAttempted ? null : false, submission_attempted: sendAttempted, retry_automatically: false, actual_url: page.url(), error: error?.message || 'new_conversation_submit_failed' };
                 }
             };
 
@@ -1419,20 +1120,6 @@ export function createAdminRouter(context) {
                         return;
                     }
 
-                    const targetUrl = normalizeChatUrl(conversationUrl);
-                    if (normalizeChatUrl(page.url()) !== targetUrl) {
-                        const idle = await waitForExistingGenerationToFinish(queueManager, 120000);
-                        if (!idle.idle) {
-                            sendJson(res, 409, {
-                                success: false,
-                                error: 'existing_generation_did_not_finish',
-                                processing: idle.status.processing,
-                                waiting: idle.status.queueLength,
-                                conversation_url: conversationUrl,
-                            });
-                            return;
-                        }
-                    }
 
                     const nav = await navigateExactChat(page, conversationUrl);
                     if (!nav.ok) {
@@ -1500,9 +1187,9 @@ export function createAdminRouter(context) {
             if (method === 'POST' && pathname === '/chatgpt/steer') {
                 const body = await readBody(req);
                 const conversationUrl = body.conversation_url || body.conversationUrl;
-                const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+                const prompt = typeof body.prompt === 'string' ? body.prompt : '';
                 const convRef = parseChatGptConversationReference(conversationUrl);
-                if (!convRef || !prompt) {
+                if (!convRef || !prompt.trim()) {
                     sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: 'prompt and an exact conversation_url (https://chatgpt.com/c/... or project-scoped https://chatgpt.com/g/g-p-.../c/...) are required' });
                     return;
                 }
@@ -1522,23 +1209,6 @@ export function createAdminRouter(context) {
                     return;
                 }
 
-                const targetUrl = normalizeChatUrl(conversationUrl);
-                if (normalizeChatUrl(page.url()) !== targetUrl) {
-                    // A request that was already processing before we acquired the control lock
-                    // is allowed to finish. The lock prevents any queued request from starting
-                    // behind it, so once processing reaches zero the browser is exclusively ours.
-                    const idle = await waitForExistingGenerationToFinish(queueManager, 120000);
-                    if (!idle.idle) {
-                        sendJson(res, 409, {
-                            success: false,
-                            active: null,
-                            error: 'existing_generation_did_not_finish',
-                            processing: idle.status.processing,
-                            waiting: idle.status.queueLength,
-                        });
-                        return;
-                    }
-                }
                 const nav = await navigateExactChat(page, conversationUrl);
                 if (!nav.ok) {
                     sendJson(res, 503, {
@@ -1572,7 +1242,6 @@ export function createAdminRouter(context) {
                 }
 
                 const assistantMessages = page.locator('[data-message-author-role="assistant"]');
-                const assistantCountBefore = await assistantMessages.count().catch(() => 0);
 
                 // Cross-browser steering is intentionally Stop -> paste -> Send. A normal Send
                 // while a stale page only knows cloud IS_STREAMING can create a transcript turn
@@ -1587,10 +1256,7 @@ export function createAdminRouter(context) {
 
                 // The active-stream special case ends here. From this point onward use the
                 // same exact-send function as a normal stopped/idle conversation.
-                const sent = await sendExactTurn(page, conversationUrl, convId, prompt, {
-                    assistantCountBefore,
-                    requireResponseStart: true,
-                });
+                const sent = await sendExactTurn(page, conversationUrl, convId, prompt);
                 if (!sent.ok) {
                     sendJson(res, sent.submitted ? 502 : 409, {
                         success: false,
@@ -1611,7 +1277,7 @@ export function createAdminRouter(context) {
                     stream_status_before: attached.state?.status || null,
                     stream_status_after: sent.stream_status_after || null,
                     exact_user_turn_confirmed: true,
-                    response_started: true,
+                    response_started: null,
                     stop_click_forced: !!stopClick.forced,
                 });
                 return;
@@ -1624,19 +1290,32 @@ export function createAdminRouter(context) {
             // confirm the user turn, and return without waiting for the assistant.
             if (method === 'POST' && pathname === '/chatgpt/dispatch') {
                 const body = await readBody(req);
-                const requestedConversationUrl = body.conversation_url || body.conversationUrl;
-                const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+                const allowed = new Set(['prompt', 'model', 'conversation_url', 'conversationUrl', 'spawner', 'task', 'metadata']);
+                const unsupported = Object.keys(body).filter(key => !allowed.has(key));
+                if (unsupported.length) {
+                    sendJson(res, 400, { success: false, submitted: false, error: 'unsupported_send_options', fields: unsupported });
+                    return;
+                }
+                const hasConversation = Object.hasOwn(body, 'conversation_url') || Object.hasOwn(body, 'conversationUrl');
+                const requestedConversationUrl = body.conversation_url ?? body.conversationUrl;
+                const prompt = typeof body.prompt === 'string' ? body.prompt : '';
                 const convRef = parseChatGptConversationReference(requestedConversationUrl);
-                if ((requestedConversationUrl && !convRef) || !prompt) {
-                    sendApiError(res, {
-                        code: ERROR_CODES.INVALID_REQUEST_BODY,
-                        message: 'prompt and, when continuing a chat, an exact conversation_url (https://chatgpt.com/c/... or project-scoped https://chatgpt.com/g/g-p-.../c/...) are required'
-                    });
+                if ((hasConversation && !convRef) || !prompt.trim()) {
+                    sendJson(res, 400, { success: false, submitted: false, error: 'invalid_send_target_or_prompt' });
                     return;
                 }
 
+                if (body.model !== undefined && (!['gpt-instant', 'gpt-thinking', 'gpt-pro'].includes(body.model) || convRef)) {
+                    sendJson(res, 400, { success: false, submitted: false, error: 'model_selection_requires_valid_new_chat_model' });
+                    return;
+                }
                 try {
-                    await enqueueDispatch(async () => {
+                    const releaseControlLock = queueManager?.acquireControlLock?.('chatgpt-dispatch');
+                    if (typeof releaseControlLock !== 'function') {
+                        sendJson(res, 409, { success: false, submitted: false, error: 'browser_control_locked', retry_automatically: false });
+                        return;
+                    }
+                    try {
                         let poolContext = queueManager?.getPoolContext?.();
                         if (!poolContext) poolContext = await queueManager?.initializePool?.();
                         const page = await selectChatGptControlPage(poolContext);
@@ -1647,8 +1326,6 @@ export function createAdminRouter(context) {
 
                         const spawnerHint = firstText(body.spawner, body.metadata?.spawner);
                         const taskHint = firstText(body.task, body.metadata?.task, body.metadata?.task_description);
-                        const agentHint = requestAgentHint(body, req);
-                        const projectHint = requestProjectHint(body, req);
                         const isNewConversation = !convRef;
                         let conversationUrl = convRef?.url || requestedConversationUrl || null;
                         let convId = convRef?.id || null;
@@ -1658,28 +1335,12 @@ export function createAdminRouter(context) {
                         let sent = null;
 
                         if (isNewConversation) {
-                            // A normal queued generation may still own the browser. Wait
-                            // only for that physical page use to end, never for a detached
-                            // ChatGPT response represented in the worker registry.
-                            const idle = await waitForExistingGenerationToFinish(queueManager, 120000);
-                            if (!idle.idle) {
-                                sendJson(res, 409, {
-                                    success: false,
-                                    submitted: false,
-                                    detached: false,
-                                    error: 'existing_generation_did_not_finish',
-                                    processing: idle.status.processing,
-                                    waiting: idle.status.queueLength,
-                                });
-                                return;
-                            }
-
                             sent = await sendNewTurn(page, prompt, { model: body.model });
                             if (!sent.ok || !sent.conversation_id) {
                                 logger.warn('Admin', `New ChatGPT dispatch failed during submission (${sent.error || 'conversation ID unavailable'})`);
                                 sendJson(res, sent.submitted ? 502 : 503, {
                                     success: false,
-                                    submitted: !!sent.submitted,
+                                    submitted: sent.submitted ?? (sendAttempted ? null : false),
                                     detached: false,
                                     ...sent,
                                 });
@@ -1689,22 +1350,6 @@ export function createAdminRouter(context) {
                             conversationUrl = sent.conversation_url;
                             recentDispatchDomReadUntil.set(convId, Date.now() + recentDispatchDomReadTtlMs);
                         } else {
-                            const targetUrl = normalizeChatUrl(conversationUrl);
-                            if (normalizeChatUrl(page.url()) !== targetUrl) {
-                                const idle = await waitForExistingGenerationToFinish(queueManager, 120000);
-                                if (!idle.idle) {
-                                    sendJson(res, 409, {
-                                        success: false,
-                                        submitted: false,
-                                        detached: false,
-                                        error: 'existing_generation_did_not_finish',
-                                        processing: idle.status.processing,
-                                        waiting: idle.status.queueLength,
-                                        conversation_url: conversationUrl,
-                                    });
-                                    return;
-                                }
-                            }
 
                             const nav = await navigateExactChat(page, conversationUrl);
                             if (!nav.ok) {
@@ -1734,7 +1379,6 @@ export function createAdminRouter(context) {
 
                             wasActive = attached.state?.status === 'IS_STREAMING' || attached.stopVisible;
                             const assistantMessages = page.locator('[data-message-author-role="assistant"]');
-                            const assistantCountBefore = await assistantMessages.count().catch(() => 0);
 
                             if (wasActive) {
                                 if (!attached.stopVisible) {
@@ -1765,15 +1409,12 @@ export function createAdminRouter(context) {
                                 }
                             }
 
-                            sent = await sendExactTurn(page, conversationUrl, convId, prompt, {
-                                assistantCountBefore,
-                                requireResponseStart: wasActive,
-                            });
+                            sent = await sendExactTurn(page, conversationUrl, convId, prompt);
                             if (!sent.ok) {
                                 logger.warn('Admin', `Exact ChatGPT dispatch failed after navigation/stop: ${convId} (${sent.error || 'unknown'})`);
                                 sendJson(res, sent.submitted ? 502 : 409, {
                                     success: false,
-                                    submitted: !!sent.submitted,
+                                    submitted: sent.submitted ?? (sendAttempted ? null : false),
                                     detached: false,
                                     active_before: wasActive,
                                     ...sent,
@@ -1784,21 +1425,6 @@ export function createAdminRouter(context) {
                             }
                         }
 
-                        // Organizing a chat into a project is auxiliary cloud work. Start it
-                        // after the user turn is confirmed and do not make the dispatch caller
-                        // wait for it or for the assistant response.
-                        const projectRouting = { scheduled: true };
-                        void Promise.resolve().then(async () => {
-                            const result = await routeChatGptConversationToProject(page, conversationUrl, config, {
-                                agent: agentHint,
-                                project: projectHint,
-                                source: 'admin-dispatch'
-                            });
-                            logger.info('Admin', `Project routing finished for dispatched ChatGPT conversation: ${convId}`, result);
-                        }).catch(error => {
-                            logger.warn('Admin', `Project routing failed for dispatched ChatGPT conversation: ${convId} (${error?.message || error})`);
-                        });
-
                         // New-chat dispatches are worker launches even when a caller does
                         // not supply optional attribution. Exact existing-chat sends remain
                         // out of the worker registry unless explicitly attributed.
@@ -1806,7 +1432,7 @@ export function createAdminRouter(context) {
                             recordWorkerSpawn({
                                 conversationId: convId,
                                 url: conversationUrl,
-                                spawner: spawnerHint || agentHint || 'unknown',
+                                spawner: spawnerHint || 'unknown',
                                 task: taskHint || (isNewConversation ? prompt.slice(0, 200) : ''),
                                 model: body.model,
                                 prompt,
@@ -1829,17 +1455,21 @@ export function createAdminRouter(context) {
                             exact_user_turn_confirmed: !!sent.exact_user_turn_confirmed,
                             acceptance_confirmed_by: sent.acceptance_confirmed_by || null,
                             response_started: sent.response_started,
-                            project_routing: projectRouting,
+                            model_selected: sent.model_selected ?? null,
+
                         });
-                    });
+                    } finally { releaseControlLock(); }
                 } catch (error) {
-                    logger.error('Admin', 'ChatGPT dispatch queue failed', { error: error?.message || String(error) });
+                    logger.error('Admin', 'ChatGPT dispatch failed', { error: error?.message || String(error) });
                     if (!res.writableEnded) {
                         sendJson(res, error?.status || 500, {
                             success: false,
                             submitted: false,
                             detached: false,
                             error: error?.message || 'chatgpt_dispatch_failed',
+                            submitted: sendAttempted ? null : false,
+                            submission_attempted: sendAttempted,
+                            retry_automatically: false,
                         });
                     }
                 }
@@ -1874,12 +1504,7 @@ export function createAdminRouter(context) {
                                 if (session?.accessToken) headers = { Authorization: `Bearer ${session.accessToken}` };
                             }
                         } catch { }
-                        let res = null;
-                        for (let attempt = 0; attempt < 4; attempt += 1) {
-                            res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { credentials: 'include', headers });
-                            if (res.ok || res.status !== 429) break;
-                            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
-                        }
+                        const res = await fetch(`https://chatgpt.com/backend-api/conversations?offset=${o}&limit=${l}&order=updated`, { credentials: 'include', headers });
                         if (!res?.ok) return { error: `api failed: ${res?.status || 'unknown'}` };
                         const data = await res.json();
                         const items = (data.items || []).map(c => ({
@@ -1980,12 +1605,7 @@ export function createAdminRouter(context) {
                         searchUrl.searchParams.set('query', q);
                         if (c) searchUrl.searchParams.set('cursor', c);
 
-                        let res = null;
-                        for (let attempt = 0; attempt < 4; attempt += 1) {
-                            res = await fetch(searchUrl.toString(), { credentials: 'include', headers });
-                            if (res.ok || res.status !== 429) break;
-                            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
-                        }
+                        const res = await fetch(searchUrl.toString(), { credentials: 'include', headers });
                         if (!res?.ok) return { error: `api failed: ${res?.status || 'unknown'}` };
                         return await res.json();
                     } catch (e) { return { error: e.message }; }
@@ -2096,19 +1716,9 @@ export function createAdminRouter(context) {
                     recentDispatchDomReadUntil.delete(convId);
                 }
 
-                let result = null;
-                for (let attempt = 0; attempt < 6; attempt += 1) {
-                    if (attempt > 0) {
-                        poolContext = queueManager?.getPoolContext?.();
-                        if (!poolContext) poolContext = await queueManager?.initializePool?.();
-                    }
-                    const attemptPage = await selectChatGptControlPage(poolContext);
-                    if (!attemptPage) {
-                        result = { error: 'ChatGPT browser page unavailable' };
-                        break;
-                    }
+                let result;
                     try {
-                        result = await attemptPage.evaluate(async ({ id, mapperSrc }) => {
+                        result = await page.evaluate(async ({ id, mapperSrc }) => {
                         const mapConversationMessages = new Function(`return (${mapperSrc})`)();
                     try {
                         let headers = {};
@@ -2175,16 +1785,6 @@ export function createAdminRouter(context) {
                     } catch (e) {
                         result = { error: e.message };
                     }
-                    const retryable = result?.error && (
-                        result.error.includes('api failed: 429') ||
-                        result.error.includes('Target page, context or browser has been closed') ||
-                        isTransientChatGptBrowserError(result.error)
-                    );
-                    if (!retryable || attempt === 5) break;
-                    const delayMs = chatGptReadRetryDelayMs(result, attempt);
-                    await new Promise(resolve => setTimeout(resolve, delayMs));
-                }
-
                 if (result.error) {
                     sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: result.error });
                 } else {
@@ -2665,10 +2265,7 @@ export function createAdminRouter(context) {
                     const poolContext = queueManager?.getPoolContext?.();
                     const page = poolContext?.getFirstPage?.();
                     if (page) {
-                        const imgDlCfg = config?.backend?.pool?.failover || {};
-                        downloadFn = (url) => useContextDownload(url, page, {
-                            retries: imgDlCfg.imgDlRetry ? (imgDlCfg.imgDlRetryMaxRetries || 3) : 1
-                        });
+                        downloadFn = (url) => useContextDownload(url, page, { retries: 1 });
                     }
                 } catch { /* Pool 未初始化，使用后备方案 */ }
 
@@ -2730,185 +2327,6 @@ export function createAdminRouter(context) {
                 }
 
                 sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: '缺少 ids 数组或日期范围参数' });
-                return;
-            }
-
-            // ==================== Skill 管理 ====================
-
-            // GET /admin/skills - 列出所有可用 skills
-            if (method === 'GET' && pathname === '/skills') {
-                const skills = await listSkills();
-                sendJson(res, 200, skills);
-                return;
-            }
-
-            // GET /admin/skills/:name - 获取 skill 详情
-            const skillDetailMatch = pathname.match(/^\/skills\/([^/]+)$/);
-            if (method === 'GET' && skillDetailMatch) {
-                const skill = await loadSkill(skillDetailMatch[1]);
-                if (!skill) {
-                    sendApiError(res, { code: ERROR_CODES.NOT_FOUND, message: `Skill '${skillDetailMatch[1]}' not found`, status: 404 });
-                } else {
-                    sendJson(res, 200, skill);
-                }
-                return;
-            }
-
-            // POST /admin/chatgpt/skill/execute - 执行 skill 任务
-            // Body: { skill: "name", files: ["/path"], task: "描述", model?: "gpt-thinking" }
-            //   或: { system_prompt: "...", files: [...], task: "描述", model?: "..." }
-            if (method === 'POST' && pathname === '/chatgpt/skill/execute') {
-                const body = await readBody(req);
-                const { skill: skillName, system_prompt: rawSystemPrompt, files: filePaths, task, model: modelOverride } = body;
-
-                if (!task) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: '缺少 task 参数' });
-                    return;
-                }
-
-                // 加载 skill 模板，或使用原始 system_prompt
-                let skill = null;
-                let systemPrompt = rawSystemPrompt || '';
-                let skillModel = null;
-                if (skillName) {
-                    const skill = await loadSkill(skillName);
-                    if (!skill) {
-                        sendApiError(res, { code: ERROR_CODES.NOT_FOUND, message: `Skill '${skillName}' not found`, status: 404 });
-                        return;
-                    }
-                    systemPrompt = skill.system_prompt || '';
-                    skillModel = skill.model || null;
-                }
-                if (!systemPrompt) {
-                    sendApiError(res, { code: ERROR_CODES.INVALID_REQUEST_BODY, message: '需要 skill 或 system_prompt 参数' });
-                    return;
-                }
-
-                const taskId = `skill-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-                const requestedModel = modelOverride || skillModel || 'gpt-thinking';
-
-                // 异步执行 skill 任务（直接调用 backend generate，避免 HTTP 自引用死锁）
-                const executePromise = (async () => {
-                    const state = { status: 'running', startedAt: Date.now() };
-                    skillTasks.set(taskId, state);
-
-                    try {
-                        // Step 1: 读取文件内容
-                        state.step = 'reading_files';
-                        let fileContext = '';
-                        if (filePaths && filePaths.length > 0) {
-                            const parts = [];
-                            for (const fp of filePaths) {
-                                try {
-                                    const content = await fs.readFile(fp, 'utf-8');
-                                    parts.push(`--- FILE: ${path.basename(fp)} ---\n${content}\n--- END FILE ---`);
-                                } catch (e) {
-                                    parts.push(`--- FILE: ${path.basename(fp)} (读取失败: ${e.message}) ---`);
-                                }
-                            }
-                            fileContext = parts.join('\n\n');
-                        }
-
-                        // Step 2: 直接调用 backend generate（绕过 HTTP，避免单 worker 死锁）
-                        state.step = 'executing';
-                        const backend = getBackend();
-                        const poolCtx = queueManager?.getPoolContext?.();
-                        if (!poolCtx) {
-                            throw new Error('浏览器 Pool 未初始化');
-                        }
-
-                        const userPrompt = `${fileContext ? '## 上下文文件\n\n' + fileContext + '\n\n' : ''}## 任务\n\n${task}`;
-                        const fullPrompt = `${systemPrompt}\n\n${userPrompt}`;
-
-                        const result = await backend.generate(poolCtx, fullPrompt, [], requestedModel, {
-                            id: taskId,
-                            reasoning: requestedModel === 'gpt-thinking' || requestedModel === 'gpt-pro'
-                        });
-
-                        if (result.error) {
-                            throw new Error(`生成失败: ${result.error}`);
-                        }
-
-                        state.status = 'completed';
-                        state.completedAt = Date.now();
-                        state.result = result.text || result.content || '';
-                        state.conversationUrl = result.conversationUrl || null;
-
-                        // gpt-thinking stream_handoff 只返回简介，从云端获取完整回复
-                        if (state.result.length < 200 && state.conversationUrl) {
-                            state.step = 'fetching_full_response';
-                            const convIdMatch = state.conversationUrl.match(/\/c\/([0-9a-f-]+)/);
-                            if (convIdMatch) {
-                                await new Promise(r => setTimeout(r, 30000));
-                                const page = await selectChatGptControlPage(poolCtx);
-                                if (page) {
-                                    const fullResult = await page.evaluate(async (convId) => {
-                                        try {
-                                            let headers = {};
-                                            try {
-                                                const sessionRes = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' });
-                                                if (sessionRes.ok) {
-                                                    const session = await sessionRes.json();
-                                                    if (session?.accessToken) headers = { Authorization: `Bearer ${session.accessToken}` };
-                                                }
-                                            } catch { }
-                                            const r = await fetch(`https://chatgpt.com/backend-api/conversation/${convId}`, { credentials: 'include', headers });
-                                            if (!r.ok) return null;
-                                            const d = await r.json();
-                                            const msgs = [];
-                                            for (const node of Object.values(d.mapping || {})) {
-                                                const msg = node.message;
-                                                if (!msg || msg.author?.role !== 'assistant' || !msg.content) continue;
-                                                if (msg.content.content_type === 'text') {
-                                                    msgs.push({ text: msg.content.parts?.join('') || '', time: msg.create_time || 0 });
-                                                }
-                                            }
-                                            msgs.sort((a, b) => b.time - a.time);
-                                            return msgs[0]?.text || null;
-                                        } catch { return null; }
-                                    }, convIdMatch[1]);
-                                    if (fullResult && fullResult.length > state.result.length) {
-                                        state.result = fullResult;
-                                    }
-                                }
-                            }
-                        }
-
-                    } catch (err) {
-                        state.status = 'failed';
-                        state.error = err.message;
-                        state.completedAt = Date.now();
-                    }
-                })();
-
-                // 立即返回 taskId，客户端可轮询状态
-                sendJson(res, 200, {
-                    taskId,
-                    skill: skillName || 'custom',
-                    model: requestedModel,
-                    status: 'running',
-                    statusUrl: `/admin/chatgpt/skill/status/${taskId}`
-                });
-
-                // 后台执行
-                executePromise.catch(() => {});
-                return;
-            }
-
-            // GET /admin/chatgpt/skill/status/:taskId - 查询 skill 执行状态
-            const skillStatusMatch = pathname.match(/^\/chatgpt\/skill\/status\/(.+)$/);
-            if (method === 'GET' && skillStatusMatch) {
-                const taskState = skillTasks.get(skillStatusMatch[1]);
-                if (!taskState) {
-                    sendApiError(res, { code: ERROR_CODES.NOT_FOUND, message: 'Task not found', status: 404 });
-                } else {
-                    const response = { ...taskState };
-                    // 清理已完成超过 5 分钟的任务
-                    if (taskState.status !== 'running' && Date.now() - (taskState.completedAt || 0) > 300000) {
-                        skillTasks.delete(skillStatusMatch[1]);
-                    }
-                    sendJson(res, 200, response);
-                }
                 return;
             }
 

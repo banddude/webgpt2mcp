@@ -1,11 +1,10 @@
 /**
  * @fileoverview API 路由总装配
- * @description 统一挂载 /v1 和 /admin 路由
+ * @description Authenticated website controls under /admin; no model API
  */
 
 import fs from 'fs';
 import path from 'path';
-import { createOpenAIRouter } from './openai/routes.js';
 import { createAdminRouter } from './admin/routes.js';
 import { createAuthMiddleware } from '../middlewares/auth.js';
 
@@ -32,18 +31,17 @@ const WEBUI_DIR = path.join(process.cwd(), 'webui', 'dist');
 /**
  * 创建全局路由处理器
  * @param {object} context - 路由上下文
- * @param {boolean} [context.loginMode] - 登录模式（禁用 OpenAI API）
+ * @param {boolean} [context.loginMode] - Login mode
  * @returns {Function} 请求处理函数
  */
 export function createGlobalRouter(context) {
-    const { authToken, config, queueManager, tempDir, loginMode, getSafeMode } = context;
+    const { authToken, config, queueManager, tempDir, getSafeMode } = context;
 
     // 创建鉴权中间件
     const checkAuth = createAuthMiddleware(authToken);
 
     // 创建子路由处理器
-    const handleOpenAIRequest = loginMode ? null : createOpenAIRouter(context);
-    const handleAdminRequest = createAdminRouter({ config, queueManager, tempDir, getSafeMode });
+    const handleAdminRequest = createAdminRouter({ config, queueManager, tempDir, getSafeMode, chatGptSession: context.chatGptSession });
 
     /**
      * 主路由处理函数
@@ -51,9 +49,10 @@ export function createGlobalRouter(context) {
     return async function handleRequest(req, res) {
         const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
         const pathname = parsedUrl.pathname;
+        const reservedApi = ['/v1', '/responses', '/chat/completions', '/models'].some(prefix => pathname === prefix || pathname.startsWith(prefix + '/'));
 
         // ==================== 静态文件服务 ====================
-        if (req.method === 'GET' && !pathname.startsWith('/v1') && !pathname.startsWith('/admin')) {
+        if (req.method === 'GET' && !reservedApi && !pathname.startsWith('/admin')) {
             let filePath = pathname === '/' ? '/index.html' : pathname;
             filePath = path.join(WEBUI_DIR, filePath);
 
@@ -95,33 +94,6 @@ export function createGlobalRouter(context) {
         if (pathname.startsWith('/admin')) {
             const adminPath = pathname.slice(6); // 去除 /admin 前缀
             await handleAdminRequest(req, res, adminPath);
-            return;
-        }
-
-        // OpenAI API (/v1)
-        if (pathname.startsWith('/v1')) {
-            // 安全模式下禁用 OpenAI API
-            const safeMode = getSafeMode?.();
-            if (safeMode?.enabled) {
-                res.writeHead(503, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({
-                    error: {
-                        message: `服务运行在安全模式，OpenAI API 不可用。原因: ${safeMode.reason}`,
-                        type: 'service_unavailable'
-                    }
-                }));
-                return;
-            }
-            // 登录模式下禁用 OpenAI API
-            if (!handleOpenAIRequest) {
-                res.writeHead(503, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({
-                    error: { message: '服务运行在登录模式，OpenAI API 不可用', type: 'service_unavailable' }
-                }));
-                return;
-            }
-            const v1Path = pathname.slice(3); // 去除 /v1 前缀
-            await handleOpenAIRequest(req, res, v1Path, parsedUrl);
             return;
         }
 

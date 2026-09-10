@@ -2,7 +2,7 @@
 /**
  * webgpt2mcp - ChatGPT Web to MCP Server
  * 将 WebAI2API 的 ChatGPT 网页端能力暴露为 MCP 工具
- * 支持会话管理：自动保存、列表查询、智能继续、Skill 注入
+ * Explicit website commands. Every send returns acceptance and an exact URL.
  */
 
 import fs from 'fs/promises';
@@ -39,13 +39,12 @@ async function loadSessions() {
 }
 
 async function saveSessions(store) {
-    // 只保留最近 50 个会话
+    // Retain historical session evidence.
     store.sessions.sort((a, b) => new Date(b.last_used) - new Date(a.last_used));
-    if (store.sessions.length > 50) store.sessions = store.sessions.slice(0, 50);
     await fs.writeFile(SESSIONS_FILE, JSON.stringify(store, null, 2));
 }
 
-async function recordSession({ conversation_url, model, prompt, response_content, topic }) {
+async function writeSessionRecord({ conversation_url, model, prompt, response_content, topic }) {
     if (!conversation_url) return;
     const store = await loadSessions();
     const existing = store.sessions.find(s => s.conversation_url === conversation_url);
@@ -85,20 +84,24 @@ async function recordSession({ conversation_url, model, prompt, response_content
     await saveSessions(store);
 }
 
+async function recordSession(record) {
+    try { await writeSessionRecord(record); }
+    catch { console.error('[chatgpt-web] Accepted send could not be saved in the local index; it was not resent.'); }
+}
+
 // ==========================================
 // API 调用
 // ==========================================
 
-async function dispatchExactConversation({ conversation_url, prompt, agent, project, timeout = 120000 }) {
+async function dispatchExactConversation({ conversation_url, prompt, timeout = 60000 }) {
     if (!conversation_url || !prompt) throw new Error('conversation_url and prompt are required');
     const body = { conversation_url, prompt };
-    if (typeof agent === 'string' && agent.trim()) body.agent = agent.trim();
-    if (typeof project === 'string' && project.trim()) body.project = project.trim();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
     try {
         const response = await fetch(`${API_URL}/admin/chatgpt/dispatch`, {
             method: 'POST',
+            redirect: 'error',
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${API_KEY}`,
@@ -108,25 +111,22 @@ async function dispatchExactConversation({ conversation_url, prompt, agent, proj
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data?.success || !data?.submitted) {
-            const rawReason = data?.error || `HTTP ${response.status}`;
+            const rawReason = data?.error || `HTTP ${response.status}: send acceptance is unconfirmed`;
             const reason = typeof rawReason === 'string' ? rawReason : (rawReason?.message || JSON.stringify(rawReason));
             const error = new Error(reason);
             error.status = response.status;
             error.data = data;
             throw error;
         }
-        await persistChatGptSession().catch(() => {});
         return data;
     } finally {
         clearTimeout(timer);
     }
 }
 
-async function dispatchNewConversation({ prompt, model = 'gpt-instant', agent, project, spawner, task, timeout = 120000 }) {
-    if (!prompt) throw new Error('prompt is required');
+async function dispatchNewConversation({ prompt, model = 'gpt-instant', spawner, task, timeout = 60000 }) {
+    if (!prompt.trim()) throw new Error('prompt is required');
     const body = { prompt, model };
-    if (typeof agent === 'string' && agent.trim()) body.agent = agent.trim();
-    if (typeof project === 'string' && project.trim()) body.project = project.trim();
     if (typeof spawner === 'string' && spawner.trim()) body.spawner = spawner.trim();
     if (typeof task === 'string' && task.trim()) body.task = task.trim();
     const controller = new AbortController();
@@ -134,6 +134,7 @@ async function dispatchNewConversation({ prompt, model = 'gpt-instant', agent, p
     try {
         const response = await fetch(`${API_URL}/admin/chatgpt/dispatch`, {
             method: 'POST',
+            redirect: 'error',
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${API_KEY}`,
@@ -143,14 +144,13 @@ async function dispatchNewConversation({ prompt, model = 'gpt-instant', agent, p
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data?.success || !data?.submitted || !data?.detached) {
-            const rawReason = data?.error || `HTTP ${response.status}`;
+            const rawReason = data?.error || `HTTP ${response.status}: send acceptance is unconfirmed`;
             const reason = typeof rawReason === 'string' ? rawReason : (rawReason?.message || JSON.stringify(rawReason));
             const error = new Error(reason);
             error.status = response.status;
             error.data = data;
             throw error;
         }
-        await persistChatGptSession().catch(() => {});
         return data;
     } finally {
         clearTimeout(timer);
@@ -159,14 +159,15 @@ async function dispatchNewConversation({ prompt, model = 'gpt-instant', agent, p
 
 const DISPATCH_MODELS = new Set(['gpt-instant', 'gpt-thinking', 'gpt-pro']);
 function allowedDispatchModel(value) {
-    return DISPATCH_MODELS.has(value) ? value : 'gpt-instant';
+    if (value !== undefined && !DISPATCH_MODELS.has(value)) throw new Error('Unsupported website model');
+    return value || 'gpt-instant';
 }
 
 // Fire-and-forget result. The tool returns the moment ChatGPT accepts the
 // message; the reply is never awaited or returned here (Mike, 2026-09-07).
 function acceptedResult({ conversationId, conversationUrl, model, mode, dispatched = {} }) {
     const text = `Accepted. ChatGPT received the message and is answering server-side; this tool does not wait for the reply.\n`
-        + `Read it later with conversation_read on the exact URL below, or have the agent report back with notify aiva.\n\n`
+        + `Read it later with conversation_read on the exact URL below only when explicitly requested.\n\n`
         + `[conversation: ${conversationUrl}${model ? ` | model: ${model}` : ''}]`;
     return {
         content: [{ type: 'text', text }],
@@ -174,6 +175,7 @@ function acceptedResult({ conversationId, conversationUrl, model, mode, dispatch
             conversation_id: conversationId || null,
             conversation_url: conversationUrl,
             model: model || null,
+            model_selected: dispatched.model_selected ?? null,
             mode,
             accepted: true,
             detached: true,
@@ -198,18 +200,11 @@ const server = new Server(
 // /g/g-p-.../c/... conversation URL form) lives in a pure module shared with
 // the test suite.
 
-async function persistChatGptSession() {
-    const response = await fetch(`${API_URL}/admin/chatgpt/session/persist`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${API_KEY}` },
-    });
-    if (!response.ok) throw new Error(`session persistence failed: HTTP ${response.status}`);
-    return response.json().catch(() => ({}));
-}
-
 async function adminJson(pathname, options = {}) {
     const response = await fetch(`${API_URL}${pathname}`, {
         ...options,
+        signal: AbortSignal.timeout(60000),
+        redirect: 'error',
         headers: {
             'Authorization': `Bearer ${API_KEY}`,
             ...(options.body ? { 'Content-Type': 'application/json' } : {}),
@@ -224,9 +219,6 @@ async function adminJson(pathname, options = {}) {
         error.status = response.status;
         error.data = data;
         throw error;
-    }
-    if (pathname !== '/admin/chatgpt/session/persist') {
-        await persistChatGptSession().catch(() => {});
     }
     return data;
 }
@@ -292,6 +284,7 @@ async function stopExactConversation({ conversation_url, timeout = 120000 }) {
     try {
         const response = await fetch(`${API_URL}/admin/chatgpt/stop`, {
             method: 'POST',
+            redirect: 'error',
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${API_KEY}`,
@@ -301,7 +294,7 @@ async function stopExactConversation({ conversation_url, timeout = 120000 }) {
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data?.success) {
-            const rawReason = data?.error || `HTTP ${response.status}`;
+            const rawReason = data?.error || `HTTP ${response.status}: send acceptance is unconfirmed`;
             const reason = typeof rawReason === 'string' ? rawReason : (rawReason?.message || JSON.stringify(rawReason));
             const error = new Error(reason);
             error.status = response.status;
@@ -323,19 +316,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: 'login',
-            description: 'Open the bridge browser on the ChatGPT login page. Optionally wait for authentication to complete.',
+            description: 'Open the existing browser on the ChatGPT login page and return its current authentication status once. Complete sign-in, then request status separately.',
             inputSchema: {
                 type: 'object',
-                properties: {
-                    wait_seconds: { type: 'number', minimum: 0, maximum: 300, default: 0, description: 'How long to wait for the browser session to become authenticated after opening login.' },
-                },
+                properties: {},
+                additionalProperties: false,
             },
         },
         {
             // Keep the published connector name working while clients migrate
             // to the explicit create/send surface below.
             name: 'chatgpt',
-            description: 'Compatibility entry point. Sends one message and returns as soon as ChatGPT accepts it, with the exact conversation URL. It never waits for or returns the reply: read it later with conversation_read on that URL, or have the agent report back with notify aiva. Creates a new conversation unless an exact conversation URL is supplied.',
+            description: 'Compatibility entry point. Sends one message and returns as soon as ChatGPT accepts it, with the exact conversation URL. It never waits for or returns the reply: read it later with conversation_read on that URL only when explicitly requested. Creates a new conversation unless an exact conversation URL is supplied.',
             inputSchema: {
                 type: 'object',
                 properties: {
@@ -347,9 +339,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                         description: 'ChatGPT model to use.',
                     },
                     conversation_url: { type: 'string', description: 'Optional exact conversation URL to continue.' },
-                    agent: { type: 'string', description: 'Optional project-routing agent key, such as dev or aiva.' },
-                    project: { type: 'string', description: 'Optional exact project ID or project URL; use none to leave the conversation unmapped.' },
-                    system_prompt: { type: 'string', description: 'Optional system instruction.' },
                     topic: { type: 'string', description: 'Optional local topic label.' },
                 },
                 required: ['prompt'],
@@ -390,14 +379,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: 'send',
-            description: 'Send a message to one exact existing ChatGPT conversation and return as soon as ChatGPT accepts it. Requires an exact conversation ID or URL and never creates a new chat. It never waits for or returns the reply: read it later with conversation_read on the URL, or have the agent report back with notify aiva. If the conversation is still generating, Stop is pressed and confirmed first, then the message is sent.',
+            description: 'Send a message to one exact existing ChatGPT conversation and return as soon as ChatGPT accepts it. Requires an exact conversation ID or URL and never creates a new chat. It never waits for or returns the reply: read it later with conversation_read on the URL only when explicitly requested. If the conversation is still generating, Stop is pressed and confirmed first, then the message is sent.',
             inputSchema: {
                 type: 'object',
                 properties: {
                     conversation: { type: 'string', description: 'Exact ChatGPT conversation UUID, exact https://chatgpt.com/c/... URL, or exact project-scoped https://chatgpt.com/g/g-p-.../c/... URL.' },
                     message: { type: 'string', description: 'Message to send to the exact conversation.' },
-                    agent: { type: 'string', description: 'Optional project-routing agent key, such as dev or aiva.' },
-                    project: { type: 'string', description: 'Optional exact project ID or project URL; use none to leave the conversation unmapped.' },
                 },
                 required: ['conversation', 'message'],
             },
@@ -415,8 +402,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                         default: 'gpt-instant',
                         description: 'ChatGPT model to use for the dispatched worker.',
                     },
-                    agent: { type: 'string', description: 'Optional project-routing agent key, such as dev or aiva.' },
-                    project: { type: 'string', description: 'Optional exact project ID or project URL; use none to leave the conversation unmapped.' },
                     spawner: { type: 'string', description: 'Optional worker-registry spawner attribution.' },
                     task: { type: 'string', description: 'Optional worker-registry task description.' },
                 },
@@ -425,13 +410,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: 'create',
-            description: 'Create a brand-new ChatGPT conversation and send its first message. This is the only tool in this MCP that is allowed to create a new conversation. Returns as soon as ChatGPT accepts the message, with the new exact conversation URL. It never waits for or returns the reply: read it later with conversation_read on that URL, or have the agent report back with notify aiva.',
+            description: 'Create a brand-new ChatGPT conversation and send its first message. Returns as soon as ChatGPT accepts the message, with the new exact conversation URL. It never waits for or returns the reply: read it later with conversation_read on that URL only when explicitly requested.',
             inputSchema: {
                 type: 'object',
                 properties: {
                     message: { type: 'string', description: 'First message for the new conversation.' },
-                    agent: { type: 'string', description: 'Optional project-routing agent key, such as dev or aiva.' },
-                    project: { type: 'string', description: 'Optional exact project ID or project URL; use none to leave the conversation unmapped.' },
                     model: {
                         type: 'string',
                         enum: ['gpt-instant', 'gpt-thinking', 'gpt-pro'],
@@ -576,6 +559,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
 
     try {
+        const sendKeys = {
+            chatgpt: ['prompt', 'model', 'conversation_url', 'topic'],
+            create: ['message', 'model'],
+            send: ['conversation', 'message'],
+            dispatch: ['prompt', 'model', 'spawner', 'task'],
+        };
+        if (sendKeys[name]) {
+            const unsupported = Object.keys(args).filter(key => !sendKeys[name].includes(key));
+            if (unsupported.length) throw new Error(`Unsupported send options: ${unsupported.join(', ')}. Send exact text only; use move separately for projects.`);
+        }
+
         if (name === 'status') {
             const status = await adminJson('/admin/chatgpt/status');
             const lines = [
@@ -591,34 +585,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         if (name === 'login') {
-            const waitSeconds = Math.max(0, Math.min(Number(args.wait_seconds || 0), 300));
+            if (Object.keys(args).length) throw new Error('Unsupported login options; request status separately after signing in.');
             const result = await adminJson('/admin/chatgpt/login', {
                 method: 'POST',
-                body: JSON.stringify({ wait_seconds: waitSeconds }),
+                body: JSON.stringify({}),
             });
             const text = result.authenticated
                 ? 'ChatGPT login is complete; the bridge session is authenticated and persisted.'
-                : 'ChatGPT login page is open in the bridge browser. Complete sign-in once, then call status.';
+                : `ChatGPT login page is open. Current session status: ${result.status?.state || 'unknown'}. ${result.loginRequired ? 'Complete sign-in once, then call status.' : 'Call status separately to check again.'}`;
             return { content: [{ type: 'text', text }], _meta: result };
         }
 
         if (name === 'chatgpt') {
-            const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
-            if (!prompt) return { content: [{ type: 'text', text: 'Error: prompt is required.' }], isError: true };
+            const prompt = typeof args.prompt === 'string' ? args.prompt : '';
+            if (!prompt.trim()) return { content: [{ type: 'text', text: 'Error: prompt is required.' }], isError: true };
 
             const model = allowedDispatchModel(args.model);
-            const systemPrompt = typeof args.system_prompt === 'string' ? args.system_prompt.trim() : '';
-            const fullPrompt = systemPrompt ? `System instructions:\n${systemPrompt}\n\nUser:\n${prompt}` : prompt;
-            const agent = typeof args.agent === 'string' ? args.agent.trim() : undefined;
-            const project = typeof args.project === 'string' ? args.project.trim() : undefined;
-            const continueRef = typeof args.conversation_url === 'string' && args.conversation_url.trim()
-                ? parseConversationRef(args.conversation_url.trim())
-                : null;
-            if (typeof args.conversation_url === 'string' && args.conversation_url.trim() && !continueRef) return exactRefError();
+            const hasConversation = Object.hasOwn(args, 'conversation_url');
+            const continueRef = hasConversation ? parseConversationRef(args.conversation_url) : null;
+            if (hasConversation && !continueRef) return exactRefError();
+            if (hasConversation && args.model !== undefined) throw new Error('Model selection is only supported for a new conversation');
 
             const dispatched = continueRef
-                ? await dispatchExactConversation({ conversation_url: continueRef.url, prompt: fullPrompt, agent, project })
-                : await dispatchNewConversation({ prompt: fullPrompt, model, agent, project });
+                ? await dispatchExactConversation({ conversation_url: continueRef.url, prompt })
+                : await dispatchNewConversation({ prompt, model });
             const convUrl = continueRef ? continueRef.url : (dispatched.conversation_url || '');
             const convId = continueRef ? continueRef.id : (dispatched.conversation_id || null);
             if (convUrl) {
@@ -630,7 +620,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     topic: typeof args.topic === 'string' ? args.topic.trim() : '',
                 });
             }
-            return acceptedResult({ conversationId: convId, conversationUrl: convUrl, model, mode: continueRef ? 'send' : 'create', dispatched });
+            return acceptedResult({ conversationId: convId, conversationUrl: convUrl, model: continueRef ? null : model, mode: continueRef ? 'send' : 'create', dispatched });
         }
 
         if (name === 'conversations_list') {
@@ -716,19 +706,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (name === 'send') {
             const ref = parseConversationRef(args.conversation);
             if (!ref) return exactRefError();
-            const message = typeof args.message === 'string' ? args.message.trim() : '';
-            if (!message) return { content: [{ type: 'text', text: 'Error: message is required.' }], isError: true };
+            const message = typeof args.message === 'string' ? args.message : '';
+            if (!message.trim()) return { content: [{ type: 'text', text: 'Error: message is required.' }], isError: true };
 
             const dispatched = await dispatchExactConversation({
                 conversation_url: ref.url,
                 prompt: message,
-                agent: typeof args.agent === 'string' ? args.agent.trim() : undefined,
-                project: typeof args.project === 'string' ? args.project.trim() : undefined,
             });
             await recordSession({ conversation_url: ref.url, model: 'unknown', prompt: message, response_content: '', topic: '' });
             const behavior = dispatched.active_before ? 'The previous active response was stopped first, then the message was sent.' : 'The message was sent to the idle conversation.';
             return {
-                content: [{ type: 'text', text: `${behavior} This tool did not wait for the reply; read it later with conversation_read on this URL, or have the agent report back with notify aiva.\n\n[conversation: ${ref.url}]` }],
+                content: [{ type: 'text', text: `${behavior} This tool did not wait for the reply; read it later with conversation_read on this URL only when explicitly requested.\n\n[conversation: ${ref.url}]` }],
                 _meta: {
                     conversation_id: ref.id,
                     conversation_url: ref.url,
@@ -743,15 +731,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         if (name === 'dispatch') {
-            const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
-            if (!prompt) return { content: [{ type: 'text', text: 'Error: prompt is required.' }], isError: true };
-            const allowedModels = new Set(['gpt-instant', 'gpt-thinking', 'gpt-pro']);
-            const model = allowedModels.has(args.model) ? args.model : 'gpt-instant';
+            const prompt = typeof args.prompt === 'string' ? args.prompt : '';
+            if (!prompt.trim()) return { content: [{ type: 'text', text: 'Error: prompt is required.' }], isError: true };
+            const model = allowedDispatchModel(args.model);
             const dispatched = await dispatchNewConversation({
                 prompt,
                 model,
-                agent: typeof args.agent === 'string' ? args.agent.trim() : undefined,
-                project: typeof args.project === 'string' ? args.project.trim() : undefined,
                 spawner: typeof args.spawner === 'string' ? args.spawner.trim() : undefined,
                 task: typeof args.task === 'string' ? args.task.trim() : undefined,
             });
@@ -781,14 +766,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         if (name === 'create') {
-            const message = typeof args.message === 'string' ? args.message.trim() : '';
-            if (!message) return { content: [{ type: 'text', text: 'Error: message is required.' }], isError: true };
+            const message = typeof args.message === 'string' ? args.message : '';
+            if (!message.trim()) return { content: [{ type: 'text', text: 'Error: message is required.' }], isError: true };
             const model = allowedDispatchModel(args.model);
             const dispatched = await dispatchNewConversation({
                 prompt: message,
                 model,
-                agent: typeof args.agent === 'string' ? args.agent.trim() : undefined,
-                project: typeof args.project === 'string' ? args.project.trim() : undefined,
             });
             const convUrl = dispatched.conversation_url || '';
             if (convUrl) {
@@ -997,7 +980,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: `Error: unknown tool "${name}".` }], isError: true };
     } catch (err) {
         const detail = err?.data?.actual_url ? ` Browser URL: ${err.data.actual_url}.` : '';
-        return { content: [{ type: 'text', text: `Error: ${err.message}.${detail}` }], isError: true };
+        return { content: [{ type: 'text', text: `Error: ${err.message}.${detail}${['chatgpt', 'create', 'send', 'dispatch'].includes(name) ? ' Do not resubmit automatically. If submission is uncertain, use an explicit read of the known URL.' : ''}` }], isError: true };
     }
 });
 

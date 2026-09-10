@@ -246,18 +246,21 @@ export function createChatGptSessionManager({
         return persistStorageState(page);
     }
 
-    async function openLogin({ waitSeconds = 0 } = {}) {
+    async function openLogin(options = {}) {
+        if (!options || typeof options !== 'object' || Array.isArray(options) || Object.keys(options).length) {
+            throw new Error('Login does not accept options; request status separately after signing in.');
+        }
         const page = await getPage();
         if (!page) return { opened: false, error: 'ChatGPT browser page unavailable' };
         await page.goto(DEFAULT_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        const deadline = now() + Math.max(0, Math.min(Number(waitSeconds || 0), 300)) * 1000;
-        do {
-            const status = await inspect({ allowRestore: false, alert: false, persist: true });
-            if (status.loggedIn) return { opened: true, authenticated: true, status };
-            if (now() >= deadline) break;
-            await page.waitForTimeout(1000);
-        } while (true);
-        return { opened: true, authenticated: false, loginRequired: true, url: page.url() };
+        const status = await inspect({ allowRestore: false, alert: false, persist: true });
+        return {
+            opened: true,
+            authenticated: status.loggedIn,
+            loginRequired: status.loginRequired ?? !status.loggedIn,
+            status,
+            url: page.url(),
+        };
     }
 
     return {
