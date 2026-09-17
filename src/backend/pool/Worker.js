@@ -33,6 +33,8 @@ export class Worker {
         // 运行时状态
         this.browser = null;
         this.page = null;
+        // ONESHOT: set by PoolManager.closeAll so the auto-heal handlers below do not relaunch a browser we are closing on purpose.
+        this.closing = false;
         this.busyCount = 0;
         this.initialized = false;
 
@@ -150,6 +152,7 @@ export class Worker {
         if (!this.page) return;
 
         this.page.on('close', async () => {
+            if (this.closing) return; // ONESHOT: deliberate close, do not recreate
             // 如果浏览器还在运行，说明只是标签页被关闭
             if (this.browser && !this.browser.isClosed?.()) {
                 logger.warn('工作池', `[${this.name}] 标签页已关闭，正在重新创建...`);
@@ -235,6 +238,7 @@ export class Worker {
         } else {
             // 非登录模式：注册断开事件，所有者负责重启并同步到共享者
             this.browser.on('close', async () => {
+                if (this.closing) return; // ONESHOT: deliberate close, do not relaunch
                 logger.warn('工作池', `[${this.name}] 浏览器已断开连接，正在自动重新初始化...`);
 
                 // 标记自己和所有共享者为未初始化

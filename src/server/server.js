@@ -1,6 +1,7 @@
 /** HTTP server for explicit authenticated website controls and saved history. */
 
 import http from 'http';
+import { execSync } from 'node:child_process';
 
 // ==================== 启动前自检 ====================
 import { runPreflight } from './preflight.js';
@@ -82,12 +83,26 @@ function oneshotScheduleClose(pathname) {
 }
 // ONESHOT backstop: whatever launched the browser (a path the hook does not match, a WebSocket
 // upgrade, an internal call), close it after ONESHOT_IDLE_MS with no browser-facing request.
+// ONESHOT orphan sweep: see the idle interval. Only runs when no pool exists and no init is in flight.
+function oneshotSweepOrphans() {
+    try {
+        const pids = execSync('pgrep -x camoufox-bin || true', { encoding: 'utf8' }).split(/\s+/).filter(Boolean);
+        if (pids.length === 0) return;
+        for (const pid of pids) { try { process.kill(Number(pid), 'SIGTERM'); } catch { /* already gone */ } }
+        logger.warn('服务器', `ONESHOT: killed ${pids.length} orphan browser process(es): ${pids.join(',')}`);
+    } catch (e) { logger.warn('服务器', `ONESHOT orphan sweep failed: ${e.message}`); }
+}
 const ONESHOT_IDLE_MS = Number(process.env.WEBGPT2MCP_IDLE_CLOSE_MS || 90000);
 let oneshotLastActivity = Date.now();
 setInterval(async () => {
     try {
         const pm = queueManager.getPoolContext?.()?.poolManager;
-        if (!pm || !pm.initialized) return;
+        if (!pm || !pm.initialized) {
+            // No pool and no init in flight: any camoufox process is an orphan from an abandoned
+            // launch (a client that timed out mid-init). Kill it so they cannot pile up.
+            if (!queueManager.isInitializing?.()) oneshotSweepOrphans();
+            return;
+        }
         if (Date.now() - oneshotLastActivity < ONESHOT_IDLE_MS) return;
         await queueManager.resetPool?.();
         logger.info('服务器', `ONESHOT: browser closed after ${Math.round(ONESHOT_IDLE_MS/1000)}s idle`);
@@ -97,7 +112,9 @@ function handleRequest(req, res) {
     let pathname = '';
     try { pathname = new URL(req.url, `http://${req.headers.host || 'localhost'}`).pathname; } catch (e) { /* ignore */ }
     if (pathname && (pathname.startsWith('/admin/chatgpt/') || pathname.startsWith('/v1/'))) { oneshotLastActivity = Date.now(); if (oneshotCloseTimer) { clearTimeout(oneshotCloseTimer); oneshotCloseTimer = null; } }
+    // 'finish' never fires when the client times out or aborts; 'close' does. Debounced, so both is safe.
     res.on('finish', () => oneshotScheduleClose(pathname));
+    res.on('close', () => oneshotScheduleClose(pathname));
     return routedRequest(req, res);
 }
 

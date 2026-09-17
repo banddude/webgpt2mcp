@@ -29,6 +29,7 @@ export class PoolManager {
      */
     async closeAll() {
         const workers = this.workers || [];
+        for (const w of workers) { w.closing = true; for (const sw of (w._sharedWorkers || [])) sw.closing = true; }
         for (const w of workers) {
             try { if (w.page && !w.page.isClosed?.()) await w.page.close(); } catch (e) { /* ignore */ }
             try { if (w.browser?.close) await w.browser.close(); } catch (e) { /* ignore */ }
