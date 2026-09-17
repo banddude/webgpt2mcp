@@ -23,6 +23,24 @@ export class PoolManager {
     /**
      * 初始化所有 Worker
      */
+    /**
+     * One-shot mode (Mike, 2026-09-17): close every browser after a call so nothing
+     * runs between calls. Safe to call when nothing is open.
+     */
+    async closeAll() {
+        const workers = this.workers || [];
+        for (const w of workers) {
+            try { if (w.page && !w.page.isClosed?.()) await w.page.close(); } catch (e) { /* ignore */ }
+            try { if (w.browser?.close) await w.browser.close(); } catch (e) { /* ignore */ }
+            try { w.page = null; w.browser = null; } catch (e) { /* ignore */ }
+        }
+        this.workers = [];
+        this.initialized = false;
+        try {
+            const { cleanup } = await import('../engine/launcher.js');
+            await cleanup();
+        } catch (e) { /* ignore */ }
+    }
     async initAll() {
         if (this.initialized) return;
 

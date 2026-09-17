@@ -20,6 +20,7 @@ export function createQueueManager(_queueConfig, { initBrowser, config, getCooki
         getDetailedStatus: () => ({ processing: [], waiting: [] }),
         initializePool: async () => { poolContext = await initBrowser(config); return poolContext; },
         getPoolContext: () => poolContext,
+        resetPool: async () => { const pm = poolContext?.poolManager; poolContext = null; if (pm?.closeAll) await pm.closeAll(); },
         getWorkerCookies: async (workerName, domain) => {
             if (!getCookies) throw new Error('Browser cookies unavailable');
             return getCookies(workerName, domain);

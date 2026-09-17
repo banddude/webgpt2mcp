@@ -58,7 +58,7 @@ const isLoginMode = process.argv.some(arg => arg.startsWith('-login'));
 let safeMode = false;
 let safeModeReason = null;
 
-const handleRequest = createGlobalRouter({
+const routedRequest = createGlobalRouter({
     authToken: AUTH_TOKEN,
     tempDir: TEMP_DIR,
     queueManager,
@@ -66,6 +66,26 @@ const handleRequest = createGlobalRouter({
     loginMode: isLoginMode,
     getSafeMode: () => ({ enabled: safeMode, reason: safeModeReason })
 });
+// ONESHOT: after any browser-facing request finishes, close the browser (debounced so a
+// burst of calls, e.g. dispatch then conversation_read, does not relaunch between them).
+const ONESHOT_CLOSE_DELAY_MS = Number(process.env.WEBGPT2MCP_CLOSE_DELAY_MS || 3000);
+let oneshotCloseTimer = null;
+function oneshotScheduleClose(pathname) {
+    if (!pathname || pathname.startsWith('/admin') || pathname === '/health') return;
+    if (oneshotCloseTimer) clearTimeout(oneshotCloseTimer);
+    oneshotCloseTimer = setTimeout(async () => {
+        oneshotCloseTimer = null;
+        try { await queueManager.resetPool?.(); logger.info('服务器', 'ONESHOT: browser closed after call'); }
+        catch (e) { logger.warn('服务器', `ONESHOT close failed: ${e.message}`); }
+    }, ONESHOT_CLOSE_DELAY_MS);
+}
+function handleRequest(req, res) {
+    let pathname = '';
+    try { pathname = new URL(req.url, `http://${req.headers.host || 'localhost'}`).pathname; } catch (e) { /* ignore */ }
+    if (oneshotCloseTimer && pathname && !pathname.startsWith('/admin') && pathname !== '/health') { clearTimeout(oneshotCloseTimer); oneshotCloseTimer = null; }
+    res.on('finish', () => oneshotScheduleClose(pathname));
+    return routedRequest(req, res);
+}
 
 // ==================== 启动服务器 ====================
 
@@ -90,9 +110,10 @@ async function startServer() {
         logger.info('服务器', '完成后可直接关闭浏览器窗口或按 Ctrl+C 退出');
     }
 
-    // 预先启动工作池（失败时进入安全模式）
+    // ONESHOT (Mike, 2026-09-17): the browser is launched on the first tool call and
+    // closed after each call, so nothing runs between calls. Eager launch only if asked.
     try {
-        await queueManager.initializePool();
+        if (process.env.WEBGPT2MCP_EAGER_BROWSER === '1') await queueManager.initializePool();
     } catch (err) {
         logger.error('服务器', '工作池初始化失败', { error: err.message });
         logger.warn('服务器', '进入安全模式：WebUI and Admin API remain available; browser commands require recovery');
