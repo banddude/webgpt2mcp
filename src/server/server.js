@@ -71,7 +71,8 @@ const routedRequest = createGlobalRouter({
 const ONESHOT_CLOSE_DELAY_MS = Number(process.env.WEBGPT2MCP_CLOSE_DELAY_MS || 3000);
 let oneshotCloseTimer = null;
 function oneshotScheduleClose(pathname) {
-    if (!pathname || pathname.startsWith('/admin') || pathname === '/health') return;
+    // Only browser-facing calls: the MCP tools go through /admin/chatgpt/* and the OpenAI-style /v1/*.
+    if (!pathname || !(pathname.startsWith('/admin/chatgpt/') || pathname.startsWith('/v1/'))) return;
     if (oneshotCloseTimer) clearTimeout(oneshotCloseTimer);
     oneshotCloseTimer = setTimeout(async () => {
         oneshotCloseTimer = null;
@@ -82,7 +83,7 @@ function oneshotScheduleClose(pathname) {
 function handleRequest(req, res) {
     let pathname = '';
     try { pathname = new URL(req.url, `http://${req.headers.host || 'localhost'}`).pathname; } catch (e) { /* ignore */ }
-    if (oneshotCloseTimer && pathname && !pathname.startsWith('/admin') && pathname !== '/health') { clearTimeout(oneshotCloseTimer); oneshotCloseTimer = null; }
+    if (oneshotCloseTimer && pathname && (pathname.startsWith('/admin/chatgpt/') || pathname.startsWith('/v1/'))) { clearTimeout(oneshotCloseTimer); oneshotCloseTimer = null; }
     res.on('finish', () => oneshotScheduleClose(pathname));
     return routedRequest(req, res);
 }
