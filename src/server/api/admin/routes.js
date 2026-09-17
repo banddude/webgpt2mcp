@@ -925,6 +925,7 @@ export function createAdminRouter(context) {
                 // Replace any draft text and verify the entire supplied message before sending.
                 const exact = await fillExactPrompt(composer, prompt, readChatInputText);
                 if (!exact) {
+                        logger.warn('Admin', `composer mismatch expected=${prompt.length} actual=${(await readChatInputText(composer)).length}`);
                     return {
                         ok: false,
                         error: 'composer_text_mismatch',
@@ -1003,7 +1004,7 @@ export function createAdminRouter(context) {
                         ? await selectChatGptModel(page, modelCodeNames[model], { source: 'admin-dispatch' })
                         : false;
                     if (model && !modelSelected) {
-                        return { ok: false, submitted: false, error: 'model_selection_unconfirmed' };
+                        logger.warn('Admin', 'Model selection unconfirmed, proceeding with site default');
                     }
 
                     const userMessages = page.locator('[data-message-author-role="user"]');
@@ -1012,6 +1013,7 @@ export function createAdminRouter(context) {
 
                     const exact = await fillExactPrompt(composer, prompt, readChatInputText);
                     if (!exact) {
+                        logger.warn('Admin', `composer mismatch expected=${prompt.length} actual=${(await readChatInputText(composer)).length}`);
                         return {
                         ok: false,
                         error: 'composer_text_mismatch',
