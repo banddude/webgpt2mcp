@@ -80,10 +80,23 @@ function oneshotScheduleClose(pathname) {
         catch (e) { logger.warn('服务器', `ONESHOT close failed: ${e.message}`); }
     }, ONESHOT_CLOSE_DELAY_MS);
 }
+// ONESHOT backstop: whatever launched the browser (a path the hook does not match, a WebSocket
+// upgrade, an internal call), close it after ONESHOT_IDLE_MS with no browser-facing request.
+const ONESHOT_IDLE_MS = Number(process.env.WEBGPT2MCP_IDLE_CLOSE_MS || 90000);
+let oneshotLastActivity = Date.now();
+setInterval(async () => {
+    try {
+        const pm = queueManager.getPoolContext?.()?.poolManager;
+        if (!pm || !pm.initialized) return;
+        if (Date.now() - oneshotLastActivity < ONESHOT_IDLE_MS) return;
+        await queueManager.resetPool?.();
+        logger.info('服务器', `ONESHOT: browser closed after ${Math.round(ONESHOT_IDLE_MS/1000)}s idle`);
+    } catch (e) { logger.warn('服务器', `ONESHOT idle close failed: ${e.message}`); }
+}, 15000).unref?.();
 function handleRequest(req, res) {
     let pathname = '';
     try { pathname = new URL(req.url, `http://${req.headers.host || 'localhost'}`).pathname; } catch (e) { /* ignore */ }
-    if (oneshotCloseTimer && pathname && (pathname.startsWith('/admin/chatgpt/') || pathname.startsWith('/v1/'))) { clearTimeout(oneshotCloseTimer); oneshotCloseTimer = null; }
+    if (pathname && (pathname.startsWith('/admin/chatgpt/') || pathname.startsWith('/v1/'))) { oneshotLastActivity = Date.now(); if (oneshotCloseTimer) { clearTimeout(oneshotCloseTimer); oneshotCloseTimer = null; } }
     res.on('finish', () => oneshotScheduleClose(pathname));
     return routedRequest(req, res);
 }
