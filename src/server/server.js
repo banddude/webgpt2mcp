@@ -77,6 +77,11 @@ function oneshotScheduleClose(pathname) {
     if (oneshotCloseTimer) clearTimeout(oneshotCloseTimer);
     oneshotCloseTimer = setTimeout(async () => {
         oneshotCloseTimer = null;
+        // A queued control caller (dispatch/steer/stop) may be mid-turn even though an
+        // earlier response already finished; skip this tick — the still-running response
+        // schedules its own close on finish/close, so one-shot still lands 3s after the
+        // last browser work instead of under it.
+        if (queueManager.isControlLocked?.()) return;
         try { await queueManager.resetPool?.(); logger.info('服务器', 'ONESHOT: browser closed after call'); }
         catch (e) { logger.warn('服务器', `ONESHOT close failed: ${e.message}`); }
     }, ONESHOT_CLOSE_DELAY_MS);
@@ -104,6 +109,10 @@ setInterval(async () => {
             return;
         }
         if (Date.now() - oneshotLastActivity < ONESHOT_IDLE_MS) return;
+        // Same deal: a queued or in-flight control caller is live activity even when its
+        // request arrived longer ago than ONESHOT_IDLE_MS; the last response to finish
+        // schedules the normal debounced close.
+        if (queueManager.isControlLocked?.()) return;
         await queueManager.resetPool?.();
         logger.info('服务器', `ONESHOT: browser closed after ${Math.round(ONESHOT_IDLE_MS/1000)}s idle`);
     } catch (e) { logger.warn('服务器', `ONESHOT idle close failed: ${e.message}`); }

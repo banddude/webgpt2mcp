@@ -68,9 +68,13 @@ test('browser ownership keeps authentication controls but exposes no model queue
     const queue = createQueueManager({}, { initBrowser: async () => ({ fake: true }), getCookies: async () => ({ cookies: [] }) });
     assert.equal(queue.addTask, undefined);
     assert.equal(queue.canAcceptNonStreaming, undefined);
-    const release = queue.acquireControlLock('one command');
-    assert.equal(queue.acquireControlLock('another'), null);
-    release(); release();
+    const release = await queue.acquireControlLock('one command');
+    // Now a FIFO mutex: a second caller waits for the browser instead of getting null.
+    const second = queue.acquireControlLock('another');
+    await Promise.resolve();
+    release(); release(); // double release stays idempotent and hands over exactly once
+    const releaseSecond = await second;
+    releaseSecond();
     assert.equal(queue.isControlLocked(), false);
     const api = await fixture({ queueManager: queue });
     try {
@@ -105,6 +109,10 @@ function fakePage({ throwAfterClick = false } = {}) {
 }
 
 test('actual HTTP dispatch fills exact text once and returns a URL while the fake website has no answer', async () => {
+    // The busy-409 below now comes from the FIFO wait cap instead of a boolean refusal;
+    // the cap is read at queue creation, so shrink it here to keep the timeout instant.
+    const previousControlWaitMs = process.env.WEBGPT2MCP_CONTROL_WAIT_MS;
+    process.env.WEBGPT2MCP_CONTROL_WAIT_MS = '1';
     const { page, state } = fakePage();
     const queue = createQueueManager({}, { initBrowser: async () => ({ poolManager: { getFirstPage: () => page } }) });
     let inspectCalls = 0;
@@ -120,12 +128,17 @@ test('actual HTTP dispatch fills exact text once and returns a URL while the fak
         assert.equal(state.enters, 0);
         assert.equal(state.reads, 0);
         assert.equal(queue.isControlLocked(), false);
-        // Busy commands are rejected before even inspecting auth; nothing gets queued.
-        const release = queue.acquireControlLock('busy');
-        assert.equal((await api.call('/admin/chatgpt/dispatch', { body: { prompt: 'must not send later' } })).status, 409);
+        // A busy dispatch now queues on the FIFO, answers 409 once the wait cap passes,
+        // and never reaches the composer. Auth is inspected while it waits in line.
+        const release = await queue.acquireControlLock('busy');
+        const busy = await api.call('/admin/chatgpt/dispatch', { body: { prompt: 'must not send later' } });
+        assert.equal(busy.status, 409);
+        assert.equal(busy.body.error, 'browser_control_locked');
+        assert.equal(busy.body.queue_position, 1);
+        assert.ok(busy.body.waited_ms >= 1);
         release();
         assert.equal(state.clicks, 1);
-        assert.equal(inspectCalls, 1);
+        assert.equal(inspectCalls, 2);
         for (const forbidden of ['system_prompt', 'messages', 'tools', 'input', 'instructions', 'agent', 'project', 'stream']) {
             assert.equal((await api.call('/admin/chatgpt/dispatch', { body: { prompt: PROMPT, [forbidden]: 'hidden' } })).status, 400);
         }
@@ -133,7 +146,11 @@ test('actual HTTP dispatch fills exact text once and returns a URL while the fak
             assert.equal((await api.call('/admin/chatgpt/dispatch', { body: { prompt: PROMPT, conversation_url } })).status, 400);
         }
         assert.equal(state.clicks, 1);
-    } finally { await api.close(); }
+    } finally {
+        if (previousControlWaitMs === undefined) delete process.env.WEBGPT2MCP_CONTROL_WAIT_MS;
+        else process.env.WEBGPT2MCP_CONTROL_WAIT_MS = previousControlWaitMs;
+        await api.close();
+    }
 });
 
 test('a click accepted before a DOM error is uncertain and never replayed by HTTP dispatch', async () => {
