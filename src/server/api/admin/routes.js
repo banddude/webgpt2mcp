@@ -191,6 +191,34 @@ export function createAdminRouter(context) {
     const recentDispatchDomReadUntil = new Map();
     const recentDispatchDomReadTtlMs = 3 * 60 * 1000;
 
+    // Mike (2026-09-17): browser control used to fail fast with 409 when another task held
+    // the browser ("I can't take over the browser right now because another ChatGPT Web
+    // task is using it"). The dispatch/steer/stop routes now await the FIFO mutex in
+    // queue.js and take the browser in arrival order. Resolves to the release function,
+    // or null when this request must not touch the browser: either its wait cap passed
+    // (a 409 with queue_position/waited_ms was already sent) or the client hung up while
+    // queued (nothing left to answer).
+    async function acquireBrowserControl(res, reason, extraBody = {}) {
+        const sendLocked409 = (error) => sendJson(res, 409, {
+            success: false,
+            error: 'browser_control_locked',
+            queue_position: error?.queuePosition ?? null,
+            waited_ms: error?.waitedMs ?? 0,
+            ...extraBody,
+        });
+        if (typeof queueManager?.acquireControlLock !== 'function') { sendLocked409(null); return null; }
+        const clientGone = new AbortController();
+        res.on('close', () => { if (!res.writableEnded) clientGone.abort(); });
+        try {
+            return await queueManager.acquireControlLock(reason, { signal: clientGone.signal });
+        } catch (error) {
+            if (error?.code === 'BROWSER_CONTROL_WAIT_ABORTED') return null;
+            if (error?.code !== 'BROWSER_CONTROL_WAIT_TIMEOUT') throw error;
+            sendLocked409(error);
+            return null;
+        }
+    }
+
     return async function handleAdminRequest(req, res, pathname) {
         const method = req.method;
         let sendAttempted = false;
@@ -206,10 +234,9 @@ export function createAdminRouter(context) {
                 return;
             }
 
-            if (method === 'POST' && ['/chatgpt/dispatch', '/chatgpt/steer'].includes(pathname) && queueManager?.isControlLocked?.()) {
-                sendJson(res, 409, { success: false, submitted: false, error: 'browser_control_locked', retry_automatically: false });
-                return;
-            }
+            // The old browser_control_locked fast-fail for dispatch/steer is gone on
+            // purpose: both routes now wait on the browser-control FIFO (see
+            // acquireBrowserControl) instead of refusing while another task holds it.
             const isChatGptOperation = pathname.startsWith('/chatgpt/')
                 && !['/chatgpt/status', '/chatgpt/login', '/chatgpt/session/persist'].includes(pathname);
             if (isChatGptOperation) {
@@ -1107,11 +1134,8 @@ export function createAdminRouter(context) {
                     return;
                 }
 
-                const releaseControlLock = queueManager?.acquireControlLock?.('chatgpt-stop');
-                if (typeof releaseControlLock !== 'function') {
-                    sendJson(res, 409, { success: false, error: 'browser_control_locked', conversation_url: conversationUrl });
-                    return;
-                }
+                const releaseControlLock = await acquireBrowserControl(res, 'chatgpt-stop', { conversation_url: conversationUrl });
+                if (!releaseControlLock) return;
 
                 try {
                     let poolContext = queueManager?.getPoolContext?.();
@@ -1196,11 +1220,8 @@ export function createAdminRouter(context) {
                     return;
                 }
 
-                const releaseControlLock = queueManager?.acquireControlLock?.('chatgpt-steer');
-                if (typeof releaseControlLock !== 'function') {
-                    sendJson(res, 409, { success: false, active: null, error: 'browser_control_locked' });
-                    return;
-                }
+                const releaseControlLock = await acquireBrowserControl(res, 'chatgpt-steer', { active: null });
+                if (!releaseControlLock) return;
                 try {
 
                 let poolContext = queueManager?.getPoolContext?.();
@@ -1312,11 +1333,8 @@ export function createAdminRouter(context) {
                     return;
                 }
                 try {
-                    const releaseControlLock = queueManager?.acquireControlLock?.('chatgpt-dispatch');
-                    if (typeof releaseControlLock !== 'function') {
-                        sendJson(res, 409, { success: false, submitted: false, error: 'browser_control_locked', retry_automatically: false });
-                        return;
-                    }
+                    const releaseControlLock = await acquireBrowserControl(res, 'chatgpt-dispatch', { submitted: false, retry_automatically: false });
+                    if (!releaseControlLock) return;
                     try {
                         let poolContext = queueManager?.getPoolContext?.();
                         if (!poolContext) poolContext = await queueManager?.initializePool?.();
