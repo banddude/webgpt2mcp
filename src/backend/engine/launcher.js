@@ -18,6 +18,7 @@ import { createCursor } from 'ghost-cursor-playwright-port';
 import { getRealViewport, clamp, random, sleep } from './utils.js';
 import { logger } from '../../utils/logger.js';
 import { getBrowserProxy, cleanupProxy } from '../../utils/proxy.js';
+import { cleanupStaleFirefoxProfileLock } from './profile-lock.js';
 
 // 全局状态：用于在登录模式下管理残留进程与复用上下文
 let globalBrowserProcess = null;
@@ -276,6 +277,18 @@ export async function initBrowserBase(config, options = {}) {
     logger.info('浏览器', `[${markLabel}] 启动浏览器实例...`);
 
     const browserConfig = config?.browser || {};
+
+    // One-shot browser exits can leave Firefox's profile lock behind after
+    // the owning process is already gone. Clean only locks whose PID is
+    // definitively dead; never touch an active or unrecognized lock.
+    try {
+        const lockCleanup = cleanupStaleFirefoxProfileLock(userDataDir);
+        if (lockCleanup.removed) {
+            logger.warn('浏览器', `[${markLabel}] 已清理残留的浏览器 Profile 锁 (PID ${lockCleanup.pid})`);
+        }
+    } catch (error) {
+        logger.warn('浏览器', `[${markLabel}] 检查浏览器 Profile 锁失败: ${error.message}`);
+    }
 
     // 获取指纹对象（指纹文件放在对应的 userDataDir 内）
     const fingerprintPath = path.join(userDataDir, 'fingerprint.json');
