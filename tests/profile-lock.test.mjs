@@ -61,7 +61,7 @@ test('does not delete malformed or non-symlink locks', () => {
         let result = cleanupStaleFirefoxProfileLock(dir, { isPidAlive: () => false });
         assert.equal(result.removed, false);
         assert.equal(result.reason, 'unrecognized-lock-target');
-        assert.equal(fs.existsSync(lock), true);
+        assert.equal(fs.readlinkSync(lock), 'unexpected-target');
 
         fs.unlinkSync(lock);
         fs.writeFileSync(lock, 'not-a-firefox-symlink');
