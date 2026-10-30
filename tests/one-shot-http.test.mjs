@@ -89,10 +89,13 @@ test('browser ownership keeps authentication controls but exposes no model queue
     }
 });
 
-function fakePage({ throwAfterClick = false } = {}) {
+function fakePage({ throwAfterClick = false, detachFirstFocus = false } = {}) {
     const state = { url: 'https://chatgpt.com/', prompt: '', clicks: 0, enters: 0, reads: 0, fills: [] };
     const hidden = { first() { return this; }, count: async () => 0, isVisible: async () => false };
-    const composer = { first() { return this; }, isVisible: async () => true, focus: async () => {}, waitFor: async () => {},
+    let focusAttempts = 0;
+    const composer = { first() { return this; }, isVisible: async () => true, focus: async () => {
+        focusAttempts++; if (detachFirstFocus && focusAttempts === 1) throw new Error('textarea detached from the DOM');
+    }, waitFor: async () => {},
         fill: async value => { state.prompt = value; state.fills.push(value); }, evaluate: async () => state.prompt };
     const submit = () => { state.clicks++; state.url = URL; if (throwAfterClick) throw new Error('Element is not visible after click'); };
     const button = { first() { return this; }, nth() { return this; }, count: async () => 1, isVisible: async () => true,
@@ -151,6 +154,19 @@ test('actual HTTP dispatch fills exact text once and returns a URL while the fak
         else process.env.WEBGPT2MCP_CONTROL_WAIT_MS = previousControlWaitMs;
         await api.close();
     }
+});
+
+test('new dispatch reacquires a detached composer before sending once', async () => {
+    const { page, state } = fakePage({ detachFirstFocus: true });
+    const queue = createQueueManager({}, { initBrowser: async () => ({ poolManager: { getFirstPage: () => page } }) });
+    const api = await fixture({ queueManager: queue, chatGptSession: { inspect: async () => ({ loggedIn: true }) } });
+    try {
+        const result = await api.call('/admin/chatgpt/dispatch', { body: { prompt: PROMPT } });
+        assert.equal(result.status, 200, JSON.stringify(result.body));
+        assert.deepEqual(state.fills, [PROMPT]);
+        assert.equal(state.clicks, 1);
+        assert.equal(state.enters, 0);
+    } finally { await api.close(); }
 });
 
 test('a click accepted before a DOM error is uncertain and never replayed by HTTP dispatch', async () => {

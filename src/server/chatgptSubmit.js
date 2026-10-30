@@ -18,6 +18,24 @@ export async function fillExactPrompt(composer, prompt, readText) {
     return a === p || squash(a) === squash(p);
 }
 
+/** Reacquire a rerendered composer only before the one submission attempt. */
+export async function prepareNewChatPrompt(locateAndFocus, prompt, readText) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const composer = await locateAndFocus();
+            const exact = await fillExactPrompt(composer, prompt, readText);
+            // The normal reader returns empty text when its node disappears.
+            if (!exact && typeof composer.isVisible === 'function'
+                && !(await composer.isVisible().catch(() => false))) {
+                throw new Error('composer detached during verification');
+            }
+            return { composer, exact };
+        } catch (error) {
+            if (attempt || !/detach|not attached/i.test(String(error?.message || error))) throw error;
+        }
+    }
+}
+
 export async function submitTurnOnce({ page, findSendButton, clickControl, clearModal, waitForComposer, cancelled = () => false, onAttempt = () => {} }) {
     const button = await findSendButton(page);
     if (cancelled()) return { ok: false, submitted: false, error: 'caller_disconnected' };

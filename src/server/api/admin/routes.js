@@ -81,7 +81,7 @@ import {
 import { getBackend } from '../../../backend/index.js';
 import { gotoWithCheck } from '../../../backend/utils/page.js';
 import { safeClick } from '../../../backend/engine/utils.js';
-import { fillExactPrompt, submitTurnOnce } from '../../chatgptSubmit.js';
+import { fillExactPrompt, prepareNewChatPrompt, submitTurnOnce } from '../../chatgptSubmit.js';
 import { createChatGptSessionManager } from '../../chatgptSession.js';
 import { selectChatGptControlPage } from '../../chatgptPageSelector.js';
 
@@ -1038,9 +1038,8 @@ export function createAdminRouter(context) {
 
                     const userMessages = page.locator('[data-message-author-role="user"]');
                     const userCountBefore = await userMessages.count().catch(() => 0);
-                    const composer = await focusChatGptInput(page, { timeout: 15000 });
-
-                    const exact = await fillExactPrompt(composer, prompt, readChatInputText);
+                    const { composer, exact } = await prepareNewChatPrompt(
+                        () => focusChatGptInput(page, { timeout: 15000 }), prompt, readChatInputText);
                     if (!exact) {
                         logger.warn('Admin', `composer mismatch expected=${prompt.length} actual=${(await readChatInputText(composer)).length}`);
                         return {
