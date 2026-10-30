@@ -160,7 +160,7 @@ export async function focusChatGptInput(page, options = {}) {
                 // Keep focus as a Locator operation. ChatGPT frequently replaces
                 // the composer node during React rerenders; converting the locator
                 // to an ElementHandle makes that normal rerender fatal.
-                await input.focus({ timeout: Math.max(deadline - Date.now(), 500) });
+                await input.focus({ timeout: Math.min(Math.max(deadline - Date.now(), 1), 1500) });
                 if (await input.isVisible().catch(() => false)) return input;
             } catch (error) {
                 lastError = error;
