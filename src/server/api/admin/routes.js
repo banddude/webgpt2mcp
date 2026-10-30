@@ -1,4 +1,4 @@
-import { confirmNewUserTurnFromCloud } from '../../chatgptNewTurnConfirmation.js';
+import { confirmNewUserTurnWithRetry } from '../../chatgptNewTurnConfirmation.js';
 /**
  * @fileoverview Admin API 路由模块
  * @description 提供管理接口，包括系统状态、配置管理、适配器元数据等
@@ -1106,11 +1106,14 @@ export function createAdminRouter(context) {
                             await page.waitForTimeout(200);
                         }
                         // UI state can lag even when the exact turn was saved.
-                        // Take one bounded read-only snapshot of this new chat;
-                        // a failure or mismatch stays uncertain and is never retried.
+                        // Take bounded read-only snapshots of this new chat;
+                        // a failure or mismatch stays uncertain and no send is retried.
                         if (capturedConversationId
                             && conversationIdFromPageUrl(page.url()) === capturedConversationId
-                            && await confirmNewUserTurnFromCloud(page, capturedConversationId, prompt)) {
+                            && await confirmNewUserTurnWithRetry(page, capturedConversationId, prompt, {
+                                sleep: ms => page.waitForTimeout(ms),
+                                log: (reason, status) => logger.warn('Admin', `New chat snapshot check: reason=${reason}${status === null ? '' : ` status=${status}`}`),
+                            })) {
                             return {
                                 ok: true, submitted: true,
                                 conversation_id: capturedConversationId,

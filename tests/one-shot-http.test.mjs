@@ -198,7 +198,7 @@ test('new dispatch confirms an exact cloud user turn after UI confirmation times
     page.locator = selector => selector === '[data-message-author-role="user"]'
         ? { count: async () => 0 } : originalLocator(selector);
     page.waitForTimeout = async () => new Promise(resolve => setTimeout(resolve, 10));
-    page.evaluate = async () => true; // exact snapshot matcher is tested separately
+    page.evaluate = async () => JSON.stringify({ reason: 'confirmed', status: null }); // matcher tested separately
     const queue = createQueueManager({}, { initBrowser: async () => ({ poolManager: { getFirstPage: () => page } }) });
     const api = await fixture({ queueManager: queue, chatGptSession: { inspect: async () => ({ loggedIn: true }) } });
     try {
