@@ -14,7 +14,9 @@ export async function confirmNewUserTurnFromCloud(page, conversationId, prompt) 
                 });
                 if (!res.ok) return result('http_status', res.status);
                 const data = await res.json();
-                if (data.id !== id || !data.mapping || typeof data.mapping !== 'object' || Array.isArray(data.mapping)) return result('schema_mismatch');
+                if ((data.id ?? data.conversation_id) !== id
+                    || (data.id != null && data.conversation_id != null && data.id !== data.conversation_id)
+                    || !data.mapping || typeof data.mapping !== 'object' || Array.isArray(data.mapping)) return result('schema_mismatch');
                 const users = Object.values(data.mapping).map(node => node?.message)
                     .filter(message => message?.author?.role === 'user');
                 if (users.length === 0) return result('turn_not_found');
