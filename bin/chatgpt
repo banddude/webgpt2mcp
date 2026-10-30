@@ -817,6 +817,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(exc.data, indent=2, ensure_ascii=False), file=sys.stderr)
         else:
             print(f"chatgpt: {exc}", file=sys.stderr)
+            if isinstance(exc.data, dict) and exc.data.get("submission_attempted"):
+                url = exc.data.get("conversation_url")
+                if isinstance(url, str) and _conversation_ref(url):
+                    print(f"Conversation to inspect: {url}", file=sys.stderr)
+                print("Submission outcome may be unknown; inspect before retrying. No automatic retry.", file=sys.stderr)
         return 1
 
 

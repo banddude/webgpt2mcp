@@ -163,6 +163,13 @@ test('a click accepted before a DOM error is uncertain and never replayed by HTT
         assert.equal(result.body.submitted, null);
         assert.equal(result.body.submission_attempted, true);
         assert.equal(result.body.actual_url, URL);
+        assert.equal(result.body.conversation_url, URL);
+        assert.equal(result.body.retry_automatically, false);
+        page.evaluate = async () => ({ items: [] });
+        const listed = await api.call('/admin/chatgpt/conversations', { method: 'GET' });
+        assert.equal(listed.body.items[0].id, ID);
+        assert.equal(listed.body.items[0].submission_confirmed, false);
+        assert.equal(listed.body.items[0].source, 'local_dispatch_observation');
         assert.equal(state.clicks, 1);
         assert.equal(state.enters, 0);
         assert.equal(queue.isControlLocked(), false);

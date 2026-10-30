@@ -1,3 +1,6 @@
+import contextlib
+import io
+from unittest.mock import patch
 import importlib.machinery
 import importlib.util
 import json
@@ -88,6 +91,16 @@ class ChatGptCliTests(unittest.TestCase):
             empty="",
         )
         self.assertTrue(any("Status: UNKNOWN" in line for line in listed))
+
+    def test_uncertain_dispatch_prints_recovery_url_without_claiming_success(self):
+        url = "https://chatgpt.com/c/12345678-1234-1234-1234-1234567890ab"
+        error = cli.ChatGPTError("send_outcome_unknown", data={
+            "submission_attempted": True, "conversation_url": url})
+        output = io.StringIO()
+        with patch.object(cli, "ApiClient", side_effect=error), contextlib.redirect_stderr(output):
+            self.assertEqual(cli.main(["dispatch", "hello"]), 1)
+        self.assertIn(url, output.getvalue())
+        self.assertIn("inspect before retrying", output.getvalue())
 
     def test_dispatch_command_passes_spawner_task_and_model(self):
         args = cli._parse_args(
