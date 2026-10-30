@@ -9,6 +9,11 @@ const user = text => ({ message: { author: { role: 'user' }, content: { parts: [
 
 for (const [name, data, expected] of [
     ['matching exact turn', { id, mapping: { one: user(prompt) } }, 'confirmed'],
+    ['real snapshot shape with conversation_id and no id', { conversation_id: id, mapping: { one: user(prompt) } }, 'confirmed'],
+    ['wrong conversation_id without id', { conversation_id: 'wrong', mapping: { one: user(prompt) } }, 'schema_mismatch'],
+    ['wrong id even with matching conversation_id', { id: 'wrong', conversation_id: id, mapping: { one: user(prompt) } }, 'schema_mismatch'],
+    ['matching id with conflicting conversation_id', { id, conversation_id: 'wrong', mapping: { one: user(prompt) } }, 'schema_mismatch'],
+    ['conversation_id with different user turn', { conversation_id: id, mapping: { one: user('different') } }, 'turn_not_found'],
     ['different conversation', { id: 'wrong', mapping: { one: user(prompt) } }, 'schema_mismatch'],
     ['different text', { id, mapping: { one: user('different') } }, 'turn_not_found'],
     ['no user turn', { id, mapping: {} }, 'turn_not_found'],
