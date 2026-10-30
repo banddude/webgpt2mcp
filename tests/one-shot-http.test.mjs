@@ -25,10 +25,10 @@ async function fixture(context) {
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${server.address().port}`;
     return {
-        async call(path, { method = 'POST', body = { input: 'retired input' }, auth = true } = {}) {
+        async call(path, { method = 'POST', body = { input: 'retired input' }, auth = true, timeoutMs = 3000 } = {}) {
             const response = await fetch(base + path, { method,
                 headers: { 'content-type': 'application/json', ...(auth ? { authorization: 'Bearer test-token' } : {}) },
-                body: method === 'GET' ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(3000) });
+                body: method === 'GET' ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
             const raw = await response.text();
             return { status: response.status, body: raw ? JSON.parse(raw) : null };
         },
@@ -173,6 +173,25 @@ test('a click accepted before a DOM error is uncertain and never replayed by HTT
         assert.equal(state.clicks, 1);
         assert.equal(state.enters, 0);
         assert.equal(queue.isControlLocked(), false);
+    } finally { await api.close(); }
+});
+
+test('new dispatch confirms an exact cloud user turn after UI confirmation times out', async () => {
+    const { page, state } = fakePage();
+    const originalLocator = page.locator;
+    page.locator = selector => selector === '[data-message-author-role="user"]'
+        ? { count: async () => 0 } : originalLocator(selector);
+    page.waitForTimeout = async () => new Promise(resolve => setTimeout(resolve, 10));
+    page.evaluate = async () => true; // exact snapshot matcher is tested separately
+    const queue = createQueueManager({}, { initBrowser: async () => ({ poolManager: { getFirstPage: () => page } }) });
+    const api = await fixture({ queueManager: queue, chatGptSession: { inspect: async () => ({ loggedIn: true }) } });
+    try {
+        const result = await api.call('/admin/chatgpt/dispatch', { body: { prompt: PROMPT }, timeoutMs: 15000 });
+        assert.equal(result.status, 200, JSON.stringify(result.body));
+        assert.equal(result.body.conversation_url, URL);
+        assert.equal(result.body.acceptance_confirmed_by, 'cloud_exact_user_turn');
+        assert.equal(state.clicks, 1);
+        assert.equal(state.enters, 0);
     } finally { await api.close(); }
 });
 
