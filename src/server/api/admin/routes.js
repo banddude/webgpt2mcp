@@ -189,6 +189,7 @@ export function createAdminRouter(context) {
     const { config, queueManager, tempDir, getSafeMode } = context;
     const chatGptSession = context.chatGptSession ?? createChatGptSessionManager({ queueManager });
     const recentDispatchDomReadUntil = new Map();
+    const recentDispatchObservations = new Map();
     const recentDispatchDomReadTtlMs = 3 * 60 * 1000;
 
     // Mike (2026-09-17): browser control used to fail fast with 409 when another task held
@@ -1111,6 +1112,7 @@ export function createAdminRouter(context) {
                             retry_automatically: false,
                             error: 'new_conversation_user_turn_not_confirmed',
                             conversation_id: capturedConversationId,
+                            conversation_url: capturedConversationId ? `https://chatgpt.com/c/${capturedConversationId}` : null,
                             last_user_text: latestUserText,
                             actual_url: page.url(),
                         };
@@ -1357,6 +1359,14 @@ export function createAdminRouter(context) {
                         if (isNewConversation) {
                             sent = await sendNewTurn(page, prompt, { model: body.model });
                             if (!sent.ok || !sent.conversation_id) {
+                                // A post-click URL identifies a conversation, not proof that
+                                // the turn was accepted. Expose it for inspection without retry.
+                                const observedId = sent.conversation_id || (sendAttempted ? conversationIdFromPageUrl(sent.actual_url || page.url()) : null);
+                                if (sendAttempted && observedId) {
+                                    sent.conversation_id = observedId;
+                                    sent.conversation_url = `https://chatgpt.com/c/${observedId}`;
+                                    recentDispatchObservations.set(observedId, { time: Date.now(), confirmed: false });
+                                }
                                 logger.warn('Admin', `New ChatGPT dispatch failed during submission (${sent.error || 'conversation ID unavailable'})`);
                                 sendJson(res, sent.submitted ? 502 : 503, {
                                     success: false,
@@ -1369,6 +1379,7 @@ export function createAdminRouter(context) {
                             convId = sent.conversation_id;
                             conversationUrl = sent.conversation_url;
                             recentDispatchDomReadUntil.set(convId, Date.now() + recentDispatchDomReadTtlMs);
+                            recentDispatchObservations.set(convId, { time: Date.now(), confirmed: true });
                         } else {
 
                             const nav = await navigateExactChat(page, conversationUrl);
@@ -1588,6 +1599,21 @@ export function createAdminRouter(context) {
                 if (result.error) {
                     sendApiError(res, { code: ERROR_CODES.INTERNAL_ERROR, message: result.error });
                 } else {
+                    // The upstream recent list can lag a new dispatch. Surface
+                    // bounded local observations with their confirmation status on the
+                    // first page without hiding upstream entries or claiming send.
+                    const now = Date.now();
+                    for (const [id, observed] of recentDispatchObservations) {
+                        if (now - observed.time > recentDispatchDomReadTtlMs) recentDispatchObservations.delete(id);
+                    }
+                    if (offset === 0) {
+                        const present = new Set(result.items.map(item => item.id));
+                        const observed = [...recentDispatchObservations].filter(([id]) => !present.has(id))
+                            .map(([id, observation]) => ({ id, title: null, conversation_url: `https://chatgpt.com/c/${id}`,
+                                update_time: new Date(observation.time).toISOString(), submission_confirmed: observation.confirmed, source: 'local_dispatch_observation' }));
+                        result.items = [...observed, ...result.items];
+                        result.local_observations_added = observed.length;
+                    }
                     sendJson(res, 200, result);
                 }
                 return;
